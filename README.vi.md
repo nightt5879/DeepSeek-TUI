@@ -407,17 +407,21 @@ Các biến môi trường chính:
 | `DEEPSEEK_HTTP_HEADERS` | Các header tùy chỉnh gửi kèm yêu cầu API, ví dụ `X-Model-Provider-Id=your-model-provider` |
 | `DEEPSEEK_MODEL` | Mô hình mặc định |
 | `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` | Thời gian chờ tối đa khi stream bị rảnh (giây), mặc định là `300`, giới hạn trong khoảng `1..=3600` |
-| `CODEWHALE_PROVIDER` / `DEEPSEEK_PROVIDER` | Các nhà cung cấp: `deepseek` (mặc định), `nvidia-nim`, `openai`, `atlascloud`, `wanjie-ark`, `openrouter`, `novita`, `fireworks`, `moonshot`, `sglang`, `vllm`, `ollama` |
+| `CODEWHALE_PROVIDER` / `DEEPSEEK_PROVIDER` | Các nhà cung cấp: `deepseek` (mặc định), `nvidia-nim`, `openai`, `atlascloud`, `wanjie-ark`, `volcengine`, `openrouter`, `xiaomi-mimo`, `novita`, `fireworks`, `siliconflow`, `moonshot`, `sglang`, `vllm`, `ollama` |
 | `DEEPSEEK_PROFILE` | Tên cấu hình profile sử dụng |
 | `DEEPSEEK_MEMORY` | Thiết lập là `on` để kích hoạt tính năng tự ghi nhớ thông tin người dùng |
 | `DEEPSEEK_ALLOW_INSECURE_HTTP=1` | Cho phép sử dụng các đường dẫn API dạng `http://` không mã hóa trong các mạng LAN tin cậy |
-| `NVIDIA_API_KEY` / `OPENAI_API_KEY` / `ATLASCLOUD_API_KEY` / `WANJIE_ARK_API_KEY` / `OPENROUTER_API_KEY` / `NOVITA_API_KEY` / `FIREWORKS_API_KEY` / `MOONSHOT_API_KEY` / `KIMI_API_KEY` / `SGLANG_API_KEY` / `VLLM_API_KEY` / `OLLAMA_API_KEY` | Thông tin đăng nhập theo từng nhà cung cấp tương ứng |
+| `NVIDIA_API_KEY` / `OPENAI_API_KEY` / `ATLASCLOUD_API_KEY` / `WANJIE_ARK_API_KEY` / `VOLCENGINE_API_KEY` / `ARK_API_KEY` / `OPENROUTER_API_KEY` / `XIAOMI_MIMO_API_KEY` / `MIMO_API_KEY` / `NOVITA_API_KEY` / `FIREWORKS_API_KEY` / `SILICONFLOW_API_KEY` / `MOONSHOT_API_KEY` / `KIMI_API_KEY` / `SGLANG_API_KEY` / `VLLM_API_KEY` / `OLLAMA_API_KEY` | Thông tin đăng nhập theo từng nhà cung cấp tương ứng |
 | `OPENAI_BASE_URL` / `OPENAI_MODEL` | Điểm cuối (endpoint) và mã mô hình cho nhà cung cấp tương thích định dạng OpenAI chung |
 | `ATLASCLOUD_BASE_URL` / `ATLASCLOUD_MODEL` | Endpoint và mô hình ghi đè cho AtlasCloud |
 | `WANJIE_ARK_BASE_URL` / `WANJIE_ARK_MODEL` | Endpoint và mô hình ghi đè cho Wanjie Ark |
+| `VOLCENGINE_BASE_URL` / `ARK_BASE_URL` / `VOLCENGINE_MODEL` / `ARK_MODEL` | Endpoint và mô hình ghi đè cho Volcengine Ark |
 | `OPENROUTER_BASE_URL` | Endpoint ghi đè cho OpenRouter |
+| `XIAOMI_MIMO_BASE_URL` / `MIMO_BASE_URL` / `XIAOMI_MIMO_MODEL` / `MIMO_MODEL` | Endpoint và mô hình ghi đè cho Xiaomi MiMo |
 | `NOVITA_BASE_URL` | Endpoint ghi đè cho Novita |
 | `FIREWORKS_BASE_URL` | Endpoint ghi đè cho Fireworks |
+| `SILICONFLOW_BASE_URL` / `SILICONFLOW_MODEL` | Endpoint và mô hình ghi đè cho SiliconFlow |
+| `MOONSHOT_BASE_URL` / `MOONSHOT_MODEL` / `KIMI_BASE_URL` / `KIMI_MODEL` | Endpoint và mô hình ghi đè cho Moonshot/Kimi |
 | `SGLANG_BASE_URL` | Endpoint cho máy chủ SGLang tự host |
 | `SGLANG_MODEL` | Mã mô hình cho máy chủ SGLang tự host |
 | `VLLM_BASE_URL` | Endpoint cho máy chủ vLLM tự host |

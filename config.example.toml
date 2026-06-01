@@ -14,12 +14,12 @@
 # this file — keeping both stored at once means `/provider deepseek` and
 # `/provider nvidia-nim` (or `--provider openai`, `--provider wanjie-ark`,
 # `--provider volcengine`, `--provider xiaomi-mimo`, `--provider fireworks`,
-# `--provider siliconflow`, `/provider sglang`, `/provider vllm`,
-# `/provider ollama`) toggle without having to re-enter keys. Top-level
+# `--provider siliconflow`, `/provider moonshot`, `/provider sglang`,
+# `/provider vllm`, `/provider ollama`) toggle without having to re-enter keys. Top-level
 # `api_key` / `base_url` are
 # still read as DeepSeek defaults when `[providers.deepseek]` is absent
 # (backward compatibility).
-provider = "deepseek" # deepseek | deepseek-cn | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | xiaomi-mimo | novita | fireworks | siliconflow | sglang | vllm | ollama
+provider = "deepseek" # deepseek | deepseek-cn | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | xiaomi-mimo | novita | fireworks | siliconflow | moonshot | sglang | vllm | ollama
 api_key = "YOUR_DEEPSEEK_API_KEY" # must be non-empty
 base_url = "https://api.deepseek.com/beta"
 # provider = "deepseek-cn"                       # legacy alias (official host is still https://api.deepseek.com)
@@ -84,13 +84,16 @@ check_for_updates = true
 # ─────────────────────────────────────────────────────────────────────────────────
 # Paths
 # ─────────────────────────────────────────────────────────────────────────────────
-skills_dir = "~/.deepseek/skills"
-mcp_config_path = "~/.deepseek/mcp.json"
-notes_path = "~/.deepseek/notes.txt"
+# New installs write product state under ~/.codewhale/. Existing ~/.deepseek/
+# files are still read as compatibility fallbacks when the .codewhale file is
+# absent.
+skills_dir = "~/.codewhale/skills"
+mcp_config_path = "~/.codewhale/mcp.json"
+notes_path = "~/.codewhale/notes.txt"
 
-memory_path = "~/.deepseek/memory.md"
+memory_path = "~/.codewhale/memory.md"
 
-# instructions = ["./AGENTS.md", "~/.deepseek/global.md"]
+# instructions = ["./AGENTS.md", "~/.codewhale/global.md"]
 #
 # Optional list of additional instruction files concatenated into the
 # system prompt in declared order (#454). Useful for layering
@@ -98,7 +101,7 @@ memory_path = "~/.deepseek/memory.md"
 # is expanded so `~` and env vars work; missing files are skipped with
 # a tracing warning. Files are capped at 100 KiB per entry.
 #
-# Project-level config (.deepseek/config.toml in the workspace) replaces
+# Project-level config (.codewhale/config.toml in the workspace) replaces
 # the user-level array wholesale rather than merging — list `~/global.md`
 # inside the project array if you want both. An explicit empty array
 # (`instructions = []`) clears the user list for the current repo.
@@ -198,18 +201,21 @@ max_subagents = 10 # optional (1-20)
 # ─────────────────────────────────────────────────────────────────────────────────
 # Providers can be stored at once; `provider = "..."` (top of file) or
 # `/provider deepseek` / `/provider nvidia-nim` / `--provider openai` /
-# `--provider wanjie-ark` / `/provider fireworks` / `--provider siliconflow`
+# `--provider wanjie-ark` / `/provider volcengine` / `/provider fireworks` /
+# `--provider siliconflow` / `/provider moonshot`
 # switches between them without having to re-enter keys. Env vars override anything set here:
 #   DeepSeek: DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
 #   NIM:      NVIDIA_API_KEY (or NVIDIA_NIM_API_KEY), NIM_BASE_URL
 #             (or NVIDIA_NIM_BASE_URL / NVIDIA_BASE_URL), NVIDIA_NIM_MODEL
 #   OpenAI-compatible: OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
 #   Wanjie Ark: WANJIE_ARK_API_KEY (or WANJIE_API_KEY), WANJIE_ARK_BASE_URL, WANJIE_ARK_MODEL
+#   Volcengine Ark: VOLCENGINE_API_KEY (or VOLCENGINE_ARK_API_KEY / ARK_API_KEY), VOLCENGINE_BASE_URL, VOLCENGINE_MODEL
 #   OpenRouter: OPENROUTER_API_KEY, OPENROUTER_BASE_URL, OPENROUTER_MODEL
 #   Xiaomi MiMo: XIAOMI_MIMO_API_KEY (or XIAOMI_API_KEY / MIMO_API_KEY), XIAOMI_MIMO_BASE_URL, XIAOMI_MIMO_MODEL
 #   Novita:     NOVITA_API_KEY, NOVITA_BASE_URL, NOVITA_MODEL
 #   Fireworks:  FIREWORKS_API_KEY, FIREWORKS_BASE_URL
 #   SiliconFlow: SILICONFLOW_API_KEY, SILICONFLOW_BASE_URL, SILICONFLOW_MODEL
+#   Moonshot/Kimi: MOONSHOT_API_KEY (or KIMI_API_KEY), MOONSHOT_BASE_URL, MOONSHOT_MODEL
 #   SGLang:    SGLANG_BASE_URL, SGLANG_MODEL, optional SGLANG_API_KEY
 #   vLLM:      VLLM_BASE_URL, VLLM_MODEL, optional VLLM_API_KEY
 #   Ollama:    OLLAMA_BASE_URL, OLLAMA_MODEL, optional OLLAMA_API_KEY
@@ -369,7 +375,7 @@ max_subagents = 10 # optional (1-20)
 # default = "prompt"     # allow | deny | prompt
 # allow = ["api.deepseek.com", "github.com", ".githubusercontent.com"]
 # deny = []
-# audit = true            # one line per call to ~/.deepseek/audit.log
+# audit = true            # one line per call to ~/.codewhale/audit.log
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Skills (#140)
@@ -557,7 +563,7 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 # Each turn the TUI takes a `pre-turn:<seq>` and `post-turn:<seq>` snapshot of
 # your workspace into a side-git repo at:
 #
-#     ~/.deepseek/snapshots/<project_hash>/<worktree_hash>/.git
+#     ~/.codewhale/snapshots/<project_hash>/<worktree_hash>/.git
 #
 # Your own `.git` is never touched — `--git-dir` and `--work-tree` are always
 # set together when shelling out to git. Use `/restore N` (slash command) or
@@ -631,7 +637,7 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 # Those vars are merged into the spawned process environment (later hooks
 # override earlier ones). Use this for ephemeral credentials, per-skill
 # PATH adjustments, or short-lived tokens. The resolved KEY names (NEVER
-# values) are written to `~/.deepseek/audit.log` so each session can be
+# values) are written to `~/.codewhale/audit.log` so each session can be
 # reconciled later. Hook failure / timeout simply contributes no vars —
 # it does not abort the shell call.
 #

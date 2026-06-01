@@ -261,7 +261,7 @@ pub fn open_url(url: &str) -> Result<()> {
 ///
 /// Wraps the future in `AssertUnwindSafe` + `catch_unwind`. On panic:
 /// 1. Logs the panic with the task name and caller location via `tracing::error!`.
-/// 2. Writes a crash dump to `~/.deepseek/crashes/<timestamp>-<name>.log`.
+/// 2. Writes a crash dump to `~/.codewhale/crashes/<timestamp>-<name>.log`.
 ///
 /// The returned `JoinHandle` resolves to `()` — the panic is caught and
 /// handled internally so the parent process stays alive.
@@ -295,7 +295,7 @@ where
     })
 }
 
-/// Write a panic dump file to `~/.deepseek/crashes/`.
+/// Write a panic dump file to `~/.codewhale/crashes/`.
 ///
 /// Creates the directory if needed and writes a timestamped log
 /// with the task name, caller location, and panic message.
@@ -346,7 +346,7 @@ fn write_panic_dump_to(
 /// CPU-bound or blocking-I/O task must run off the async runtime and its
 /// completion is *not* awaited — for example a post-turn disk snapshot or a
 /// file-tree build polled later via a shared data structure.  If the closure
-/// panics, a crash dump is written to `~/.deepseek/crashes/` and the panic
+/// panics, a crash dump is written to `~/.codewhale/crashes/` and the panic
 /// is logged at ERROR level rather than being silently swallowed.
 #[track_caller]
 pub fn spawn_blocking_supervised<F>(name: &'static str, f: F) -> tokio::task::JoinHandle<()>

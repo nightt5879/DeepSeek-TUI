@@ -186,7 +186,7 @@ struct Cli {
     #[arg(long = "fresh")]
     fresh: bool,
 
-    /// Skip loading project-level config from $WORKSPACE/.deepseek/config.toml
+    /// Skip loading project-level config from $WORKSPACE/.codewhale/config.toml
     #[arg(long = "no-project-config")]
     no_project_config: bool,
 }
@@ -710,13 +710,13 @@ enum McpCommand {
     },
     /// Validate MCP config and required servers
     Validate,
-    /// Register this DeepSeek binary as a local MCP stdio server.
+    /// Register this CodeWhale binary as a local MCP stdio server.
     ///
     /// This adds a config entry that runs `codewhale serve --mcp` (stdio protocol).
     /// For the HTTP/SSE runtime API, use `codewhale serve --http` directly instead.
     #[command(
         name = "add-self",
-        long_about = "Register this DeepSeek binary as a local MCP stdio server.\n\nAdds a config entry to ~/.deepseek/mcp.json that launches `codewhale serve --mcp`\nvia the stdio transport. Other DeepSeek sessions (or any MCP client) can then\ndiscover and call tools exposed by this server.\n\nUse `codewhale serve --http` instead if you need the HTTP/SSE runtime API."
+        long_about = "Register this CodeWhale binary as a local MCP stdio server.\n\nAdds a config entry to ~/.codewhale/mcp.json that launches `codewhale serve --mcp`\nvia the stdio transport. Other CodeWhale sessions (or any MCP client) can then\ndiscover and call tools exposed by this server.\n\nUse `codewhale serve --http` instead if you need the HTTP/SSE runtime API."
     )]
     AddSelf {
         /// Server name in mcp.json (default: "codewhale")
@@ -1573,7 +1573,7 @@ fn plugins_readme_template() -> &'static str {
      Plugins are richer than tools: each one lives in its own subdirectory\n\
      with a `PLUGIN.md` describing what it does and how to enable it. The\n\
      directory is created so users have a documented place to drop\n\
-     experiments without touching `~/.deepseek/skills/`.\n\n\
+     experiments without touching `~/.codewhale/skills/`.\n\n\
      A plugin layout looks like:\n\n\
      ```\n\
      plugins/\n\
@@ -4676,7 +4676,7 @@ fn should_use_mouse_capture_with(
 /// Off elsewhere only for JetBrains' JediTerm, which advertises mouse
 /// support but forwards the same SGR escape sequences as raw input. The
 /// user can still opt back in with `[tui] mouse_capture = true` in
-/// `~/.deepseek/config.toml` or `--mouse-capture`.
+/// `~/.codewhale/config.toml` or `--mouse-capture`.
 fn default_mouse_capture_enabled(
     terminal_emulator: Option<&str>,
     wt_session: Option<&str>,
@@ -4809,8 +4809,9 @@ fn preserve_interrupted_checkpoint_for_explicit_resume(launch_workspace: &Path) 
     }
 }
 
-/// Load project-level config from `$WORKSPACE/.deepseek/config.toml` and
-/// apply its fields as overrides on top of the global config (#485).
+/// Load project-level config from `$WORKSPACE/.codewhale/config.toml`, with
+/// legacy `$WORKSPACE/.deepseek/config.toml` fallback, then apply its fields as
+/// overrides on top of the global config (#485).
 /// Only explicitly set fields in the project file are applied; everything
 /// else falls back to the global value.
 fn merge_project_config(config: &mut Config, workspace: &Path) {
@@ -4958,7 +4959,8 @@ async fn run_interactive(
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    // Merge project-level config from $WORKSPACE/.deepseek/config.toml
+    // Merge project-level config from $WORKSPACE/.codewhale/config.toml
+    // or legacy $WORKSPACE/.deepseek/config.toml
     // unless --no-project-config was passed (#485).
     let mut merged_config = config.clone();
     if !cli.no_project_config {

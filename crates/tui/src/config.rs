@@ -2591,7 +2591,11 @@ fn home_config_path() -> Option<PathBuf> {
         if primary.exists() {
             return primary;
         }
-        home.join(".deepseek").join("config.toml")
+        let legacy = home.join(".deepseek").join("config.toml");
+        if legacy.exists() {
+            return legacy;
+        }
+        primary
     })
 }
 
@@ -2673,6 +2677,12 @@ fn canonicalize_or_keep(path: &Path) -> PathBuf {
 }
 
 fn env_config_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("CODEWHALE_CONFIG_PATH") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Some(expand_path(trimmed));
+        }
+    }
     if let Ok(path) = std::env::var("DEEPSEEK_CONFIG_PATH") {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
@@ -2813,7 +2823,11 @@ fn default_mcp_config_path() -> Option<PathBuf> {
         if primary.exists() {
             return primary;
         }
-        home.join(".deepseek").join("mcp.json")
+        let legacy = home.join(".deepseek").join("mcp.json");
+        if legacy.exists() {
+            return legacy;
+        }
+        primary
     })
 }
 
@@ -2823,7 +2837,11 @@ fn default_notes_path() -> Option<PathBuf> {
         if primary.exists() {
             return primary;
         }
-        home.join(".deepseek").join("notes.txt")
+        let legacy = home.join(".deepseek").join("notes.txt");
+        if legacy.exists() {
+            return legacy;
+        }
+        primary
     })
 }
 
@@ -2833,7 +2851,11 @@ fn default_memory_path() -> Option<PathBuf> {
         if primary.exists() {
             return primary;
         }
-        home.join(".deepseek").join("memory.md")
+        let legacy = home.join(".deepseek").join("memory.md");
+        if legacy.exists() {
+            return legacy;
+        }
+        primary
     })
 }
 
@@ -5013,6 +5035,7 @@ mod tests {
         home: Option<OsString>,
         userprofile: Option<OsString>,
         codewhale_home: Option<OsString>,
+        codewhale_config_path: Option<OsString>,
         deepseek_config_path: Option<OsString>,
         codewhale_secret_backend: Option<OsString>,
         deepseek_secret_backend: Option<OsString>,
@@ -5091,6 +5114,7 @@ mod tests {
             let home_prev = env::var_os("HOME");
             let userprofile_prev = env::var_os("USERPROFILE");
             let codewhale_home_prev = env::var_os("CODEWHALE_HOME");
+            let codewhale_config_prev = env::var_os("CODEWHALE_CONFIG_PATH");
             let deepseek_config_prev = env::var_os("DEEPSEEK_CONFIG_PATH");
             let codewhale_secret_backend_prev = env::var_os("CODEWHALE_SECRET_BACKEND");
             let deepseek_secret_backend_prev = env::var_os("DEEPSEEK_SECRET_BACKEND");
@@ -5164,6 +5188,7 @@ mod tests {
                 env::set_var("HOME", &home_str);
                 env::set_var("USERPROFILE", &home_str);
                 env::remove_var("CODEWHALE_HOME");
+                env::remove_var("CODEWHALE_CONFIG_PATH");
                 env::set_var("DEEPSEEK_CONFIG_PATH", &config_str);
                 env::remove_var("CODEWHALE_SECRET_BACKEND");
                 env::remove_var("DEEPSEEK_SECRET_BACKEND");
@@ -5237,6 +5262,7 @@ mod tests {
                 home: home_prev,
                 userprofile: userprofile_prev,
                 codewhale_home: codewhale_home_prev,
+                codewhale_config_path: codewhale_config_prev,
                 deepseek_config_path: deepseek_config_prev,
                 codewhale_secret_backend: codewhale_secret_backend_prev,
                 deepseek_secret_backend: deepseek_secret_backend_prev,
@@ -5316,6 +5342,7 @@ mod tests {
                 Self::restore_var("HOME", self.home.take());
                 Self::restore_var("USERPROFILE", self.userprofile.take());
                 Self::restore_var("CODEWHALE_HOME", self.codewhale_home.take());
+                Self::restore_var("CODEWHALE_CONFIG_PATH", self.codewhale_config_path.take());
                 Self::restore_var("DEEPSEEK_CONFIG_PATH", self.deepseek_config_path.take());
                 Self::restore_var(
                     "CODEWHALE_SECRET_BACKEND",
@@ -5970,6 +5997,115 @@ api_key = "old-openrouter-key"
         let _err = config
             .deepseek_api_key()
             .expect_err("sentinel placeholder must not satisfy the API key check");
+        Ok(())
+    }
+
+    #[test]
+    fn default_user_paths_use_codewhale_home_for_fresh_installs() -> Result<()> {
+        let _lock = lock_test_env();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-fresh-home-test-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&temp_root)?;
+        let _guard = EnvGuard::new(&temp_root);
+
+        // EnvGuard pins DEEPSEEK_CONFIG_PATH for older tests; this test wants
+        // the no-explicit-path startup behavior.
+        unsafe {
+            env::remove_var("DEEPSEEK_CONFIG_PATH");
+        }
+
+        let config = Config::default();
+        assert_eq!(
+            default_config_path().unwrap(),
+            temp_root.join(".codewhale").join("config.toml")
+        );
+        assert_eq!(
+            config.mcp_config_path(),
+            temp_root.join(".codewhale").join("mcp.json")
+        );
+        assert_eq!(
+            config.notes_path(),
+            temp_root.join(".codewhale").join("notes.txt")
+        );
+        assert_eq!(
+            config.memory_path(),
+            temp_root.join(".codewhale").join("memory.md")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn default_user_paths_preserve_existing_legacy_files() -> Result<()> {
+        let _lock = lock_test_env();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-legacy-home-test-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        let legacy_home = temp_root.join(".deepseek");
+        fs::create_dir_all(&legacy_home)?;
+        for name in ["config.toml", "mcp.json", "notes.txt", "memory.md"] {
+            fs::write(legacy_home.join(name), "")?;
+        }
+        let _guard = EnvGuard::new(&temp_root);
+
+        unsafe {
+            env::remove_var("DEEPSEEK_CONFIG_PATH");
+        }
+
+        let config = Config::default();
+        assert_eq!(
+            default_config_path().unwrap(),
+            legacy_home.join("config.toml")
+        );
+        assert_eq!(config.mcp_config_path(), legacy_home.join("mcp.json"));
+        assert_eq!(config.notes_path(), legacy_home.join("notes.txt"));
+        assert_eq!(config.memory_path(), legacy_home.join("memory.md"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn codewhale_config_path_env_wins_over_legacy_env() -> Result<()> {
+        let _lock = lock_test_env();
+        let prev_codewhale = env::var_os("CODEWHALE_CONFIG_PATH");
+        let prev_deepseek = env::var_os("DEEPSEEK_CONFIG_PATH");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-config-env-test-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        let preferred = temp_root.join("preferred.toml");
+        let legacy = temp_root.join("legacy.toml");
+
+        unsafe {
+            env::set_var("CODEWHALE_CONFIG_PATH", &preferred);
+            env::set_var("DEEPSEEK_CONFIG_PATH", &legacy);
+        }
+
+        assert_eq!(env_config_path().unwrap(), preferred);
+
+        unsafe {
+            EnvGuard::restore_var("CODEWHALE_CONFIG_PATH", prev_codewhale);
+            EnvGuard::restore_var("DEEPSEEK_CONFIG_PATH", prev_deepseek);
+        }
+
         Ok(())
     }
 

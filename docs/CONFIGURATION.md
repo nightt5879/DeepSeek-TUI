@@ -68,8 +68,9 @@ provider's keyring entry.
 
 For hosted, generic OpenAI-compatible, or self-hosted providers, set
 `provider = "nvidia-nim"`, `"openai"`, `"atlascloud"`, `"wanjie-ark"`,
-`"openrouter"`, `"xiaomi-mimo"`, `"novita"`, `"fireworks"`, `"siliconflow"`, `"moonshot"`,
-`"sglang"`, `"vllm"`, or `"ollama"` or pass `codewhale --provider <name>`.
+`"volcengine"`, `"openrouter"`, `"xiaomi-mimo"`, `"novita"`, `"fireworks"`,
+`"siliconflow"`, `"moonshot"`, `"sglang"`, `"vllm"`, or `"ollama"` or pass
+`codewhale --provider <name>`.
 For the provider-by-provider registry, including auth variables, default base
 URLs, model IDs, and capability metadata, see [PROVIDERS.md](PROVIDERS.md).
 The facade saves provider credentials to the shared user config and forwards
@@ -298,6 +299,9 @@ Remaining variables:
 - `WANJIE_ARK_API_KEY`, `WANJIE_API_KEY`, or `WANJIE_MAAS_API_KEY`
 - `WANJIE_ARK_BASE_URL`, `WANJIE_BASE_URL`, or `WANJIE_MAAS_BASE_URL`
 - `WANJIE_ARK_MODEL`, `WANJIE_MODEL`, or `WANJIE_MAAS_MODEL`
+- `VOLCENGINE_API_KEY`, `VOLCENGINE_ARK_API_KEY`, or `ARK_API_KEY`
+- `VOLCENGINE_BASE_URL`, `VOLCENGINE_ARK_BASE_URL`, or `ARK_BASE_URL`
+- `VOLCENGINE_MODEL` or `VOLCENGINE_ARK_MODEL`
 - `OPENROUTER_API_KEY`
 - `OPENROUTER_BASE_URL`
 - `XIAOMI_MIMO_API_KEY`, `XIAOMI_API_KEY`, or `MIMO_API_KEY`
@@ -346,8 +350,8 @@ Remaining variables:
   and by TUI startup update checks when `[update].update_uri` is not set, or as
   a fallback when that configured URI cannot be fetched)
 - `DEEPSEEK_AUTOMATIONS_DIR` (override the automations storage directory; uses
-  `~/.codewhale/automations` when that directory exists, otherwise the legacy
-  `~/.deepseek/automations` path)
+  `~/.codewhale/automations` by default, with legacy `~/.deepseek/automations`
+  fallback when only the legacy directory exists)
 - `DEEPSEEK_CAPACITY_ENABLED`
 - `DEEPSEEK_CAPACITY_LOW_RISK_MAX`
 - `DEEPSEEK_CAPACITY_MEDIUM_RISK_MAX`
@@ -465,7 +469,7 @@ the JSON stdout contract applies only to `message_submit`.
 ### Composer stash (`/stash`, Ctrl+S)
 
 Press **Ctrl+S** in the composer to park the current draft to
-`~/.deepseek/composer_stash.jsonl`. `/stash list` shows parked
+`~/.codewhale/composer_stash.jsonl`. `/stash list` shows parked
 drafts with one-line previews and timestamps; `/stash pop`
 restores the most recently parked draft (LIFO); `/stash clear`
 wipes the file. Capped at 200 entries; multiline drafts
