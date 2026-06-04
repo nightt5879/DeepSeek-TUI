@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added `/restore list [N]` so users can inspect more side-git rollback
+  snapshots with UTC timestamps before choosing a restore point. Plain
+  `/restore` now shows the 20 most recent snapshots, numeric restore targets can
+  reach beyond that default listing up to a bounded index, and list requests
+  above the visible cap fail explicitly instead of silently truncating.
+
+### Community
+
+Thanks to **@cyq1017** for the restore-listing implementation (#2513) and
+**@wywsoor** for the broader macOS/iTerm rollback UX report (#2494).
+
 ## [0.8.53] - 2026-06-03
 
 ### Added
