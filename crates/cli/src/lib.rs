@@ -93,6 +93,12 @@ struct Cli {
     model: Option<String>,
     #[arg(long = "output-mode")]
     output_mode: Option<String>,
+    #[arg(
+        long = "verbosity",
+        value_name = "LEVEL",
+        help = "Controls transcript and output verbosity (normal, concise)"
+    )]
+    verbosity: Option<String>,
     #[arg(long = "log-level")]
     log_level: Option<String>,
     #[arg(long)]
@@ -518,6 +524,7 @@ fn run() -> Result<()> {
         approval_policy: cli.approval_policy.clone(),
         sandbox_mode: cli.sandbox_mode.clone(),
         yolo: Some(cli.yolo),
+        verbosity: cli.verbosity.clone(),
     };
     let command = cli.command.take();
 
@@ -1685,6 +1692,14 @@ fn build_tui_command(
     passthrough: Vec<String>,
 ) -> Result<Command> {
     let tui = locate_sibling_tui_binary()?;
+    let mut verbosity = resolved_runtime.verbosity.clone();
+    if verbosity.is_none()
+        && passthrough
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "exec" | "swebench" | "eval"))
+    {
+        verbosity = Some("concise".to_string());
+    }
 
     let mut cmd = Command::new(&tui);
     if let Some(config) = cli.config.as_ref() {
@@ -1789,6 +1804,10 @@ fn build_tui_command(
     }
     if let Some(output_mode) = cli.output_mode.as_ref() {
         cmd.env("DEEPSEEK_OUTPUT_MODE", output_mode);
+    }
+    if let Some(v) = verbosity.as_ref() {
+        cmd.env("CODEWHALE_VERBOSITY", v);
+        cmd.env("DEEPSEEK_VERBOSITY", v);
     }
     if let Some(log_level) = cli.log_level.as_ref() {
         cmd.env("DEEPSEEK_LOG_LEVEL", log_level);
@@ -2052,6 +2071,7 @@ mod tests {
             approval_policy: None,
             sandbox_mode: None,
             yolo: None,
+            verbosity: None,
             http_headers: std::collections::BTreeMap::new(),
         }
     }
@@ -3120,6 +3140,8 @@ mod tests {
             "deepseek-v4-pro",
             "--output-mode",
             "json",
+            "--verbosity",
+            "concise",
             "--log-level",
             "debug",
             "--telemetry",
@@ -3147,6 +3169,7 @@ mod tests {
         assert_eq!(cli.profile.as_deref(), Some("work"));
         assert_eq!(cli.model.as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(cli.output_mode.as_deref(), Some("json"));
+        assert_eq!(cli.verbosity.as_deref(), Some("concise"));
         assert_eq!(cli.log_level.as_deref(), Some("debug"));
         assert_eq!(cli.telemetry, Some(true));
         assert_eq!(cli.approval_policy.as_deref(), Some("on-request"));
@@ -3196,6 +3219,7 @@ mod tests {
             approval_policy: None,
             sandbox_mode: None,
             yolo: None,
+            verbosity: None,
             http_headers: std::collections::BTreeMap::new(),
         };
 
@@ -3255,6 +3279,7 @@ mod tests {
             approval_policy: None,
             sandbox_mode: None,
             yolo: None,
+            verbosity: None,
             http_headers: std::collections::BTreeMap::new(),
         };
 
@@ -3295,6 +3320,7 @@ mod tests {
             approval_policy: None,
             sandbox_mode: None,
             yolo: None,
+            verbosity: None,
             http_headers: std::collections::BTreeMap::new(),
         };
 
@@ -3395,6 +3421,7 @@ mod tests {
             approval_policy: None,
             sandbox_mode: None,
             yolo: None,
+            verbosity: None,
             http_headers: resolved_headers,
         };
 
@@ -3414,6 +3441,53 @@ mod tests {
         assert!(
             args.windows(2).any(|pair| pair == ["--profile", "google"]),
             "expected profile forwarding in args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_tui_command_defaults_noninteractive_to_concise_verbosity() {
+        let _lock = env_lock();
+        let (_dir, _bin) = install_fake_tui_binary();
+
+        let cli = parse_ok(&["codewhale"]);
+        let resolved = resolved_runtime_for_test(ProviderKind::Deepseek, ProviderSource::Config);
+
+        let cmd = build_tui_command(
+            &cli,
+            &resolved,
+            vec!["exec".to_string(), "summarize".to_string()],
+        )
+        .expect("command");
+
+        assert_eq!(
+            command_env(&cmd, "CODEWHALE_VERBOSITY").as_deref(),
+            Some("concise")
+        );
+        assert_eq!(
+            command_env(&cmd, "DEEPSEEK_VERBOSITY").as_deref(),
+            Some("concise")
+        );
+    }
+
+    #[test]
+    fn build_tui_command_respects_resolved_verbosity_override() {
+        let _lock = env_lock();
+        let (_dir, _bin) = install_fake_tui_binary();
+
+        let cli = parse_ok(&["codewhale"]);
+        let mut resolved =
+            resolved_runtime_for_test(ProviderKind::Deepseek, ProviderSource::Config);
+        resolved.verbosity = Some("normal".to_string());
+
+        let cmd = build_tui_command(&cli, &resolved, vec!["exec".to_string()]).expect("command");
+
+        assert_eq!(
+            command_env(&cmd, "CODEWHALE_VERBOSITY").as_deref(),
+            Some("normal")
+        );
+        assert_eq!(
+            command_env(&cmd, "DEEPSEEK_VERBOSITY").as_deref(),
+            Some("normal")
         );
     }
 
@@ -3452,6 +3526,7 @@ mod tests {
             approval_policy: None,
             sandbox_mode: None,
             yolo: None,
+            verbosity: None,
             http_headers: std::collections::BTreeMap::new(),
         };
 
@@ -3518,6 +3593,7 @@ mod tests {
             approval_policy: None,
             sandbox_mode: None,
             yolo: None,
+            verbosity: None,
             http_headers: std::collections::BTreeMap::new(),
         };
 
@@ -3585,6 +3661,7 @@ mod tests {
             approval_policy: None,
             sandbox_mode: None,
             yolo: None,
+            verbosity: None,
             http_headers: std::collections::BTreeMap::new(),
         };
 
@@ -3682,6 +3759,7 @@ mod tests {
                 approval_policy: None,
                 sandbox_mode: None,
                 yolo: None,
+                verbosity: None,
                 http_headers: std::collections::BTreeMap::new(),
             };
 

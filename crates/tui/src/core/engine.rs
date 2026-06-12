@@ -274,6 +274,7 @@ pub struct EngineConfig {
     /// Whether user-visible transcript rendering shows thinking blocks.
     /// Prompt assembly uses this to avoid localizing hidden reasoning.
     pub show_thinking: bool,
+    pub verbosity: Option<String>,
     /// Maximum number of assistant steps before stopping.
     pub max_steps: u32,
     /// Maximum number of concurrently active subagents.
@@ -439,6 +440,7 @@ impl Default for EngineConfig {
             ),
             tools_always_load: HashSet::new(),
             prefer_bwrap: false,
+            verbosity: None,
             tools: None,
         }
     }
@@ -714,6 +716,7 @@ impl Engine {
                     translation_enabled: config.translation_enabled,
                     model_id: &config.model,
                     show_thinking: config.show_thinking,
+                    verbosity: config.verbosity.as_deref(),
                 },
             );
         let stable_prompt = Some(system_prompt);
@@ -1121,6 +1124,7 @@ impl Engine {
                     show_thinking,
                     allowed_tools,
                     hook_executor,
+                    verbosity,
                 } => {
                     self.handle_send_message(
                         content,
@@ -1140,6 +1144,7 @@ impl Engine {
                         show_thinking,
                         allowed_tools,
                         hook_executor,
+                        verbosity,
                     )
                     .await;
                 }
@@ -1399,6 +1404,7 @@ impl Engine {
                         self.config.show_thinking,
                         self.config.allowed_tools.clone(),
                         self.config.hook_executor.clone(),
+                        self.config.verbosity.clone(),
                     )
                     .await;
                 }
@@ -1574,6 +1580,7 @@ impl Engine {
         show_thinking: bool,
         allowed_tools: Option<Vec<String>>,
         hook_executor: Option<std::sync::Arc<crate::hooks::HookExecutor>>,
+        verbosity: Option<String>,
     ) {
         // Reset cancel token for fresh turn (in case previous was cancelled)
         self.reset_cancel_token();
@@ -1708,6 +1715,7 @@ impl Engine {
         self.config.trust_mode = trust_mode;
         self.config.translation_enabled = translation_enabled;
         self.config.show_thinking = show_thinking;
+        self.config.verbosity = verbosity;
 
         // Refresh stable prompt context. Current mode is carried by the
         // request-time runtime prompt projection.
@@ -2497,6 +2505,7 @@ impl Engine {
                 translation_enabled: self.config.translation_enabled,
                 model_id: &self.config.model,
                 show_thinking: self.config.show_thinking,
+                verbosity: self.config.verbosity.as_deref(),
             },
         );
         let mut stable_prompt =

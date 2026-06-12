@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `kimi-k2.7-code`, recognizes `kimi`/`kimi-k2` aliases for that model, keeps
   explicit `kimi-k2.6` selectable, and adds the OpenRouter
   `moonshotai/kimi-k2.7-code` registry row.
+- **Concise verbosity mode (#3052).** CLI noninteractive launches now default
+  to concise prompt/output discipline unless overridden by config, env, or
+  `--verbosity`, while interactive TUI launches remain normal by default.
+  Thanks @cyq1017 for the PR.
 - **Ephemeral generated project context (#3058).** Opening CodeWhale in a
   directory with no instruction files now keeps the bounded generated project
   overview in memory instead of creating `.codewhale/instructions.md`.
