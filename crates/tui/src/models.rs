@@ -286,6 +286,13 @@ fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
         | "kimi-k2.7-code"
         | "kimi-k2.6"
         | "kimi-for-coding" => Some(262_144),
+        "minimax-m2.7"
+        | "minimax-m2.7-highspeed"
+        | "minimax-m2.5"
+        | "minimax-m2.5-highspeed"
+        | "minimax-m2.1"
+        | "minimax-m2.1-highspeed"
+        | "minimax-m2" => Some(204_800),
         "z-ai/glm-5.1" | "z-ai/glm-5v-turbo" | "glm-5.1" | "glm-5v-turbo" => Some(202_752),
         "minimax/minimax-m3" | "minimax-m3" | "qwen/qwen3.6-flash" | "qwen/qwen3.6-plus" => {
             Some(1_000_000)
@@ -349,10 +356,10 @@ pub fn model_supports_reasoning(model: &str) -> bool {
     if lower.contains("deepseek") && lower.contains("v4") {
         return true;
     }
-    // #3016: Moonshot-native Kimi IDs also emit reasoning_content.
-    // `kimi-for-coding` is Moonshot's documented non-thinking model — it
-    // must not be classified as reasoning-capable by the prefix rule.
-    if lower.starts_with("kimi-") && lower != "kimi-for-coding" {
+    // #3016 plus the 2026 Kimi Code K2.7 update: Moonshot-native Kimi IDs,
+    // including the stable `kimi-for-coding` coding route, emit
+    // reasoning_content that must stay out of answer prose.
+    if lower.starts_with("kimi-") {
         return true;
     }
     matches!(
@@ -376,8 +383,16 @@ pub fn model_supports_reasoning(model: &str) -> bool {
             | "moonshotai/kimi-k2.6:free"
             | "kimi-k2.7-code"
             | "kimi-k2.6"
+            | "kimi-for-coding"
             | "minimax/minimax-m3"
             | "minimax-m3"
+            | "minimax-m2.7"
+            | "minimax-m2.7-highspeed"
+            | "minimax-m2.5"
+            | "minimax-m2.5-highspeed"
+            | "minimax-m2.1"
+            | "minimax-m2.1-highspeed"
+            | "minimax-m2"
             | "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
             | "nvidia/nemotron-3-ultra-550b-a55b"
             | "nvidia/nemotron-3-ultra-550b-a55b:free"
@@ -628,13 +643,13 @@ mod tests {
     }
 
     #[test]
-    fn moonshot_native_kimi_ids_support_reasoning_except_for_coding() {
+    fn moonshot_native_kimi_ids_support_reasoning_including_coding_route() {
         // #3016: bare Moonshot ids (no moonshotai/ prefix) emit
-        // reasoning_content; kimi-for-coding is the non-thinking exception.
+        // reasoning_content; kimi-for-coding currently rides the K2.7 Code path.
         assert!(model_supports_reasoning("kimi-k2.7-code"));
         assert!(model_supports_reasoning("kimi-k2.6"));
+        assert!(model_supports_reasoning("kimi-for-coding"));
         assert!(model_supports_reasoning("kimi-k2.5"));
-        assert!(!model_supports_reasoning("kimi-for-coding"));
     }
 
     #[test]
@@ -691,13 +706,16 @@ mod tests {
             ("kimi-k2.7-code", 262_144),
             ("kimi-k2.6", 262_144),
             ("minimax-m3", 1_000_000),
+            ("minimax-m2.7", 204_800),
+            ("minimax-m2.5-highspeed", 204_800),
+            ("minimax-m2", 204_800),
             ("glm-5.1", 202_752),
         ] {
             assert_eq!(context_window_for_model(model), Some(expected_window));
             assert!(model_supports_reasoning(model));
         }
         assert_eq!(context_window_for_model("kimi-for-coding"), Some(262_144));
-        assert!(!model_supports_reasoning("kimi-for-coding"));
+        assert!(model_supports_reasoning("kimi-for-coding"));
         assert_eq!(context_window_for_model("glm-5v-turbo"), Some(202_752));
         assert!(!model_supports_reasoning("glm-5v-turbo"));
         assert_eq!(max_output_tokens_for_model("kimi-k2.7-code"), Some(262_144));

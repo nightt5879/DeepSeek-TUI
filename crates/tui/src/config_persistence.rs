@@ -223,6 +223,7 @@ fn provider_base_url_table_key(provider: ApiProvider) -> anyhow::Result<&'static
         ApiProvider::OpenaiCodex => Ok("openai_codex"),
         ApiProvider::Zai => Ok("zai"),
         ApiProvider::Stepfun => Ok("stepfun"),
+        ApiProvider::Minimax => Ok("minimax"),
     }
 }
 

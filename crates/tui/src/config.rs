@@ -179,6 +179,15 @@ pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
 pub const ANTHROPIC_OPUS_MODEL: &str = "claude-opus-4-8";
 pub const ANTHROPIC_HAIKU_MODEL: &str = "claude-haiku-4-5";
 pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+pub const DEFAULT_MINIMAX_MODEL: &str = "MiniMax-M3";
+pub const MINIMAX_M2_7_MODEL: &str = "MiniMax-M2.7";
+pub const MINIMAX_M2_7_HIGHSPEED_MODEL: &str = "MiniMax-M2.7-highspeed";
+pub const MINIMAX_M2_5_MODEL: &str = "MiniMax-M2.5";
+pub const MINIMAX_M2_5_HIGHSPEED_MODEL: &str = "MiniMax-M2.5-highspeed";
+pub const MINIMAX_M2_1_MODEL: &str = "MiniMax-M2.1";
+pub const MINIMAX_M2_1_HIGHSPEED_MODEL: &str = "MiniMax-M2.1-highspeed";
+pub const MINIMAX_M2_MODEL: &str = "MiniMax-M2";
+pub const DEFAULT_MINIMAX_BASE_URL: &str = "https://api.minimax.io/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -207,6 +216,7 @@ pub enum ApiProvider {
     Anthropic,
     Zai,
     Stepfun,
+    Minimax,
 }
 
 impl ApiProvider {
@@ -264,7 +274,7 @@ impl ApiProvider {
 
     /// `ApiProvider` discriminant → `ProviderKind` lookup.
     /// Index 1 is `None` for the legacy `DeepseekCN` variant.
-    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 24] = [
+    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 25] = [
         Some(codewhale_config::ProviderKind::Deepseek),
         None, // DeepseekCN
         Some(codewhale_config::ProviderKind::NvidiaNim),
@@ -289,10 +299,11 @@ impl ApiProvider {
         Some(codewhale_config::ProviderKind::Anthropic),
         Some(codewhale_config::ProviderKind::Zai),
         Some(codewhale_config::ProviderKind::Stepfun),
+        Some(codewhale_config::ProviderKind::Minimax),
     ];
 
     /// `ProviderKind` discriminant → `ApiProvider` lookup.
-    const FROM_KIND_LOOKUP: [Self; 23] = [
+    const FROM_KIND_LOOKUP: [Self; 24] = [
         Self::Deepseek,
         Self::NvidiaNim,
         Self::Openai,
@@ -316,6 +327,7 @@ impl ApiProvider {
         Self::Anthropic,
         Self::Zai,
         Self::Stepfun,
+        Self::Minimax,
     ];
 
     /// Map to the config-level `ProviderKind`.
@@ -785,6 +797,39 @@ fn canonical_moonshot_model_id(model: &str) -> Option<&'static str> {
     }
 }
 
+fn canonical_minimax_model_id(model: &str) -> Option<&'static str> {
+    let normalized = model.trim().to_ascii_lowercase();
+    let normalized = normalized.replace(['_', ' '], "-");
+    match normalized.as_str() {
+        "minimax" | "minimax-m3" | "minimax-m-3" | "minimax-m-3-thinking" => {
+            Some(DEFAULT_MINIMAX_MODEL)
+        }
+        "minimax-m2.7" | "minimax-m2-7" | "minimax-m-2.7" | "minimax-m-2-7" => {
+            Some(MINIMAX_M2_7_MODEL)
+        }
+        "minimax-m2.7-highspeed"
+        | "minimax-m2-7-highspeed"
+        | "minimax-m-2.7-highspeed"
+        | "minimax-m-2-7-highspeed" => Some(MINIMAX_M2_7_HIGHSPEED_MODEL),
+        "minimax-m2.5" | "minimax-m2-5" | "minimax-m-2.5" | "minimax-m-2-5" => {
+            Some(MINIMAX_M2_5_MODEL)
+        }
+        "minimax-m2.5-highspeed"
+        | "minimax-m2-5-highspeed"
+        | "minimax-m-2.5-highspeed"
+        | "minimax-m-2-5-highspeed" => Some(MINIMAX_M2_5_HIGHSPEED_MODEL),
+        "minimax-m2.1" | "minimax-m2-1" | "minimax-m-2.1" | "minimax-m-2-1" => {
+            Some(MINIMAX_M2_1_MODEL)
+        }
+        "minimax-m2.1-highspeed"
+        | "minimax-m2-1-highspeed"
+        | "minimax-m-2.1-highspeed"
+        | "minimax-m-2-1-highspeed" => Some(MINIMAX_M2_1_HIGHSPEED_MODEL),
+        "minimax-m2" | "minimax-m-2" => Some(MINIMAX_M2_MODEL),
+        _ => None,
+    }
+}
+
 /// Normalize a model selected through the TUI for the active provider.
 ///
 /// Official DeepSeek endpoints require bare model IDs. Provider-prefixed
@@ -817,6 +862,12 @@ pub fn normalize_model_name_for_provider(provider: ApiProvider, model: &str) -> 
 
     if matches!(provider, ApiProvider::Moonshot) {
         return canonical_moonshot_model_id(model)
+            .map(ToString::to_string)
+            .or_else(|| normalize_custom_model_id(model));
+    }
+
+    if matches!(provider, ApiProvider::Minimax) {
+        return canonical_minimax_model_id(model)
             .map(ToString::to_string)
             .or_else(|| normalize_custom_model_id(model));
     }
@@ -905,6 +956,16 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
             ANTHROPIC_OPUS_MODEL,
             DEFAULT_ANTHROPIC_MODEL,
             ANTHROPIC_HAIKU_MODEL,
+        ],
+        ApiProvider::Minimax => vec![
+            DEFAULT_MINIMAX_MODEL,
+            MINIMAX_M2_7_MODEL,
+            MINIMAX_M2_7_HIGHSPEED_MODEL,
+            MINIMAX_M2_5_MODEL,
+            MINIMAX_M2_5_HIGHSPEED_MODEL,
+            MINIMAX_M2_1_MODEL,
+            MINIMAX_M2_1_HIGHSPEED_MODEL,
+            MINIMAX_M2_MODEL,
         ],
     }
 }
@@ -2066,6 +2127,8 @@ pub struct ProvidersConfig {
     pub zai: ProviderConfig,
     #[serde(default)]
     pub stepfun: ProviderConfig,
+    #[serde(default)]
+    pub minimax: ProviderConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -2235,6 +2298,7 @@ impl Config {
             ApiProvider::Anthropic => "providers.anthropic",
             ApiProvider::Zai => "providers.zai",
             ApiProvider::Stepfun => "providers.stepfun",
+            ApiProvider::Minimax => "providers.minimax",
             ApiProvider::Deepseek | ApiProvider::DeepseekCN => return,
         };
         tracing::warn!(
@@ -2394,6 +2458,7 @@ impl Config {
             ApiProvider::Anthropic => &providers.anthropic,
             ApiProvider::Zai => &providers.zai,
             ApiProvider::Stepfun => &providers.stepfun,
+            ApiProvider::Minimax => &providers.minimax,
         })
     }
 
@@ -2424,6 +2489,7 @@ impl Config {
             ApiProvider::Anthropic => &mut providers.anthropic,
             ApiProvider::Zai => &mut providers.zai,
             ApiProvider::Stepfun => &mut providers.stepfun,
+            ApiProvider::Minimax => &mut providers.minimax,
         }
     }
 
@@ -2568,6 +2634,7 @@ impl Config {
             ApiProvider::Zai => DEFAULT_ZAI_MODEL,
             ApiProvider::Stepfun => DEFAULT_STEPFUN_MODEL,
             ApiProvider::Anthropic => DEFAULT_ANTHROPIC_MODEL,
+            ApiProvider::Minimax => DEFAULT_MINIMAX_MODEL,
         }
         .to_string()
     }
@@ -2609,7 +2676,8 @@ impl Config {
             | ApiProvider::Together
             | ApiProvider::OpenaiCodex
             | ApiProvider::Zai
-            | ApiProvider::Stepfun => None,
+            | ApiProvider::Stepfun
+            | ApiProvider::Minimax => None,
         };
         let configured_base_url = provider_base.or(root_base);
         let base = if provider == ApiProvider::XiaomiMimo {
@@ -2659,6 +2727,7 @@ impl Config {
                     ApiProvider::Zai => DEFAULT_ZAI_BASE_URL,
                     ApiProvider::Stepfun => DEFAULT_STEPFUN_BASE_URL,
                     ApiProvider::Anthropic => DEFAULT_ANTHROPIC_BASE_URL,
+                    ApiProvider::Minimax => DEFAULT_MINIMAX_BASE_URL,
                 }
                 .to_string()
             })
@@ -2711,6 +2780,7 @@ impl Config {
             ApiProvider::Zai => "zai",
             ApiProvider::Stepfun => "stepfun",
             ApiProvider::Anthropic => "anthropic",
+            ApiProvider::Minimax => "minimax",
         };
 
         // 0. DeepSeek compatibility slot. The legacy top-level `api_key`
@@ -2906,6 +2976,10 @@ impl Config {
             ),
             // Self-hosted deployments commonly run without auth on localhost.
             // Return an empty key and let the client omit the Authorization header.
+            ApiProvider::Minimax => anyhow::bail!(
+                "MiniMax API key not found. Run 'codewhale auth set --provider minimax', \
+                 set MINIMAX_API_KEY, or add [providers.minimax] api_key in ~/.codewhale/config.toml."
+            ),
             ApiProvider::Sglang | ApiProvider::Vllm | ApiProvider::Ollama => Ok(String::new()),
         }
     }
@@ -3759,6 +3833,13 @@ fn apply_env_overrides(config: &mut Config) {
                     .stepfun
                     .base_url = Some(value);
             }
+            ApiProvider::Minimax => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .minimax
+                    .base_url = Some(value);
+            }
         }
     }
     if matches!(config.api_provider(), ApiProvider::NvidiaNim)
@@ -3968,6 +4049,7 @@ fn apply_env_overrides(config: &mut Config) {
             ApiProvider::Anthropic => &mut providers.anthropic,
             ApiProvider::Zai => &mut providers.zai,
             ApiProvider::Stepfun => &mut providers.stepfun,
+            ApiProvider::Minimax => &mut providers.minimax,
         };
         let mut provider_headers = entry.http_headers.clone().unwrap_or_default();
         provider_headers.extend(headers);
@@ -4165,6 +4247,7 @@ fn apply_env_overrides(config: &mut Config) {
                 ApiProvider::Anthropic => &mut providers.anthropic,
                 ApiProvider::Zai => &mut providers.zai,
                 ApiProvider::Stepfun => &mut providers.stepfun,
+                ApiProvider::Minimax => &mut providers.minimax,
             };
             entry.model = Some(value);
         }
@@ -4507,6 +4590,7 @@ fn default_base_url_for_provider(provider: ApiProvider) -> &'static str {
         ApiProvider::Zai => DEFAULT_ZAI_BASE_URL,
         ApiProvider::Stepfun => DEFAULT_STEPFUN_BASE_URL,
         ApiProvider::Anthropic => DEFAULT_ANTHROPIC_BASE_URL,
+        ApiProvider::Minimax => DEFAULT_MINIMAX_BASE_URL,
     }
 }
 
@@ -4954,6 +5038,7 @@ fn merge_providers(
             openai_codex: merge_provider_config(base.openai_codex, override_cfg.openai_codex),
             zai: merge_provider_config(base.zai, override_cfg.zai),
             stepfun: merge_provider_config(base.stepfun, override_cfg.stepfun),
+            minimax: merge_provider_config(base.minimax, override_cfg.minimax),
         }),
     }
 }
@@ -5468,6 +5553,9 @@ pub fn active_provider_has_env_api_key(config: &Config) -> bool {
             std::env::var("STEPFUN_API_KEY").is_ok_and(|k| !k.trim().is_empty())
                 || std::env::var("STEP_API_KEY").is_ok_and(|k| !k.trim().is_empty())
         }
+        ApiProvider::Minimax => {
+            std::env::var("MINIMAX_API_KEY").is_ok_and(|k| !k.trim().is_empty())
+        }
     }
 }
 
@@ -5504,6 +5592,7 @@ pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
         ApiProvider::Volcengine => "VOLCENGINE_API_KEY",
         ApiProvider::Zai => "ZAI_API_KEY",
         ApiProvider::Stepfun => "STEPFUN_API_KEY",
+        ApiProvider::Minimax => "MINIMAX_API_KEY",
     };
     if std::env::var(env_var).is_ok_and(|k| !k.trim().is_empty()) {
         return true;
@@ -5633,6 +5722,7 @@ pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf>
         ApiProvider::OpenaiCodex => "providers.openai_codex",
         ApiProvider::Zai => "providers.zai",
         ApiProvider::Stepfun => "providers.stepfun",
+        ApiProvider::Minimax => "providers.minimax",
     };
 
     // Parse existing TOML (or start fresh) so we can edit the right table
@@ -5681,6 +5771,7 @@ pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf>
         ApiProvider::OpenaiCodex => "openai_codex",
         ApiProvider::Zai => "zai",
         ApiProvider::Stepfun => "stepfun",
+        ApiProvider::Minimax => "minimax",
     };
     let entry = providers
         .entry(key_inside.to_string())
@@ -5781,6 +5872,7 @@ fn provider_config_key(provider: ApiProvider) -> Result<&'static str> {
         ApiProvider::OpenaiCodex => Ok("openai_codex"),
         ApiProvider::Zai => Ok("zai"),
         ApiProvider::Stepfun => Ok("stepfun"),
+        ApiProvider::Minimax => Ok("minimax"),
     }
 }
 
@@ -8362,6 +8454,26 @@ api_key = "old-openrouter-key"
     }
 
     #[test]
+    fn normalize_model_name_for_provider_maps_minimax_direct_aliases() {
+        for (alias, expected) in [
+            ("minimax", DEFAULT_MINIMAX_MODEL),
+            ("minimax-m3", DEFAULT_MINIMAX_MODEL),
+            ("minimax-m2.7", MINIMAX_M2_7_MODEL),
+            ("minimax-m2-7-highspeed", MINIMAX_M2_7_HIGHSPEED_MODEL),
+            ("minimax-m2.5", MINIMAX_M2_5_MODEL),
+            ("minimax-m2-5-highspeed", MINIMAX_M2_5_HIGHSPEED_MODEL),
+            ("minimax-m2.1", MINIMAX_M2_1_MODEL),
+            ("minimax-m2-1-highspeed", MINIMAX_M2_1_HIGHSPEED_MODEL),
+            ("minimax-m2", MINIMAX_M2_MODEL),
+        ] {
+            assert_eq!(
+                normalize_model_name_for_provider(ApiProvider::Minimax, alias).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
     fn normalize_model_name_for_provider_maps_arcee_direct_aliases() {
         for (alias, expected) in [
             ("trinity", DEFAULT_ARCEE_MODEL),
@@ -8469,6 +8581,28 @@ api_key = "old-openrouter-key"
         assert_eq!(
             model_completion_names_for_provider(ApiProvider::Moonshot),
             vec![DEFAULT_MOONSHOT_MODEL]
+        );
+    }
+
+    #[test]
+    fn model_completion_names_for_minimax_include_direct_chat_models() {
+        let models = model_completion_names_for_provider(ApiProvider::Minimax);
+
+        for expected in [
+            DEFAULT_MINIMAX_MODEL,
+            MINIMAX_M2_7_MODEL,
+            MINIMAX_M2_7_HIGHSPEED_MODEL,
+            MINIMAX_M2_5_MODEL,
+            MINIMAX_M2_5_HIGHSPEED_MODEL,
+            MINIMAX_M2_1_MODEL,
+            MINIMAX_M2_1_HIGHSPEED_MODEL,
+            MINIMAX_M2_MODEL,
+        ] {
+            assert!(models.contains(&expected), "missing {expected}");
+        }
+        assert!(
+            !models.contains(&OPENROUTER_MINIMAX_M3_MODEL),
+            "direct MiniMax picker must not expose OpenRouter namespaced IDs"
         );
     }
 
@@ -11403,6 +11537,35 @@ model = "deepseek-ai/deepseek-v4-pro"
             cap.request_payload_mode,
             RequestPayloadMode::ChatCompletions
         );
+    }
+
+    #[test]
+    fn provider_capability_minimax_direct_models_use_api_docs_shape() {
+        let m3 = provider_capability(ApiProvider::Minimax, DEFAULT_MINIMAX_MODEL);
+        assert_eq!(m3.context_window, 1_000_000);
+        assert_eq!(m3.max_output, 524_288);
+        assert!(m3.thinking_supported);
+        assert!(!m3.cache_telemetry_supported);
+        assert_eq!(m3.request_payload_mode, RequestPayloadMode::ChatCompletions);
+
+        for model in [
+            MINIMAX_M2_7_MODEL,
+            MINIMAX_M2_7_HIGHSPEED_MODEL,
+            MINIMAX_M2_5_MODEL,
+            MINIMAX_M2_5_HIGHSPEED_MODEL,
+            MINIMAX_M2_1_MODEL,
+            MINIMAX_M2_1_HIGHSPEED_MODEL,
+            MINIMAX_M2_MODEL,
+        ] {
+            let cap = provider_capability(ApiProvider::Minimax, model);
+            assert_eq!(cap.context_window, 204_800, "{model}");
+            assert!(cap.thinking_supported, "{model}");
+            assert!(!cap.cache_telemetry_supported, "{model}");
+            assert_eq!(
+                cap.request_payload_mode,
+                RequestPayloadMode::ChatCompletions
+            );
+        }
     }
 
     #[test]

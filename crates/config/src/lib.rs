@@ -108,6 +108,16 @@ const DEFAULT_ZAI_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 // StepFun / StepFlash defaults
 const DEFAULT_STEPFUN_MODEL: &str = "step-3.7-flash";
 const DEFAULT_STEPFUN_BASE_URL: &str = "https://api.stepfun.ai/v1";
+// MiniMax defaults
+const DEFAULT_MINIMAX_MODEL: &str = "MiniMax-M3";
+const MINIMAX_M2_7_MODEL: &str = "MiniMax-M2.7";
+const MINIMAX_M2_7_HIGHSPEED_MODEL: &str = "MiniMax-M2.7-highspeed";
+const MINIMAX_M2_5_MODEL: &str = "MiniMax-M2.5";
+const MINIMAX_M2_5_HIGHSPEED_MODEL: &str = "MiniMax-M2.5-highspeed";
+const MINIMAX_M2_1_MODEL: &str = "MiniMax-M2.1";
+const MINIMAX_M2_1_HIGHSPEED_MODEL: &str = "MiniMax-M2.1-highspeed";
+const MINIMAX_M2_MODEL: &str = "MiniMax-M2";
+const DEFAULT_MINIMAX_BASE_URL: &str = "https://api.minimax.io/v1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -165,11 +175,7 @@ pub enum ProviderKind {
     OpenaiCodex,
     #[serde(alias = "claude")]
     Anthropic,
-    #[serde(
-        alias = "z-ai",
-        alias = "z_ai",
-        alias = "z.ai"
-    )]
+    #[serde(alias = "z-ai", alias = "z_ai", alias = "z.ai")]
     Zai,
     #[serde(
         alias = "step-fun",
@@ -180,10 +186,12 @@ pub enum ProviderKind {
         alias = "step_flash"
     )]
     Stepfun,
+    #[serde(alias = "mini-max", alias = "mini_max", alias = "minimax")]
+    Minimax,
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::Deepseek,
         Self::NvidiaNim,
         Self::Openai,
@@ -207,6 +215,7 @@ impl ProviderKind {
         Self::Anthropic,
         Self::Zai,
         Self::Stepfun,
+        Self::Minimax,
     ];
 
     #[must_use]
@@ -235,6 +244,7 @@ impl ProviderKind {
             Self::Anthropic,
             Self::Zai,
             Self::Stepfun,
+            Self::Minimax,
         ]
     }
 
@@ -343,12 +353,7 @@ pub struct ProvidersToml {
     pub openai_codex: ProviderConfigToml,
     #[serde(default)]
     pub anthropic: ProviderConfigToml,
-    #[serde(
-        default,
-        alias = "z-ai",
-        alias = "z_ai",
-        alias = "z.ai"
-    )]
+    #[serde(default, alias = "z-ai", alias = "z_ai", alias = "z.ai")]
     pub zai: ProviderConfigToml,
     #[serde(
         default,
@@ -360,6 +365,8 @@ pub struct ProvidersToml {
         alias = "step_flash"
     )]
     pub stepfun: ProviderConfigToml,
+    #[serde(default, alias = "mini-max", alias = "mini_max", alias = "minimax")]
+    pub minimax: ProviderConfigToml,
 }
 
 /// Sibling `permissions.toml` schema.
@@ -413,6 +420,7 @@ impl ProvidersToml {
             ProviderKind::Anthropic => &self.anthropic,
             ProviderKind::Zai => &self.zai,
             ProviderKind::Stepfun => &self.stepfun,
+            ProviderKind::Minimax => &self.minimax,
         }
     }
 
@@ -441,6 +449,7 @@ impl ProvidersToml {
             ProviderKind::Anthropic => &mut self.anthropic,
             ProviderKind::Zai => &mut self.zai,
             ProviderKind::Stepfun => &mut self.stepfun,
+            ProviderKind::Minimax => &mut self.minimax,
         }
     }
 }
@@ -2166,6 +2175,7 @@ impl ConfigToml {
                 ProviderKind::Anthropic => DEFAULT_ANTHROPIC_BASE_URL.to_string(),
                 ProviderKind::Zai => DEFAULT_ZAI_BASE_URL.to_string(),
                 ProviderKind::Stepfun => DEFAULT_STEPFUN_BASE_URL.to_string(),
+                ProviderKind::Minimax => DEFAULT_MINIMAX_BASE_URL.to_string(),
             })
         };
         // CLI flag wins outright. Otherwise: config-file → injected secrets/env.
@@ -2379,6 +2389,11 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
     {
         return canonical.to_string();
     }
+    if matches!(provider, ProviderKind::Minimax)
+        && let Some(canonical) = canonical_minimax_model_id(model)
+    {
+        return canonical.to_string();
+    }
 
     if matches!(
         provider,
@@ -2386,6 +2401,9 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
             | ProviderKind::WanjieArk
             | ProviderKind::Volcengine
             | ProviderKind::XiaomiMimo
+            | ProviderKind::Zai
+            | ProviderKind::Stepfun
+            | ProviderKind::Minimax
             | ProviderKind::Ollama
     ) {
         return model.to_string();
@@ -2539,6 +2557,39 @@ fn canonical_xiaomi_mimo_model_id(model: &str) -> Option<&'static str> {
     }
 }
 
+fn canonical_minimax_model_id(model: &str) -> Option<&'static str> {
+    let normalized = model.trim().to_ascii_lowercase();
+    let normalized = normalized.replace(['_', ' '], "-");
+    match normalized.as_str() {
+        "minimax" | "minimax-m3" | "minimax-m-3" | "minimax-m-3-thinking" => {
+            Some(DEFAULT_MINIMAX_MODEL)
+        }
+        "minimax-m2.7" | "minimax-m2-7" | "minimax-m-2.7" | "minimax-m-2-7" => {
+            Some(MINIMAX_M2_7_MODEL)
+        }
+        "minimax-m2.7-highspeed"
+        | "minimax-m2-7-highspeed"
+        | "minimax-m-2.7-highspeed"
+        | "minimax-m-2-7-highspeed" => Some(MINIMAX_M2_7_HIGHSPEED_MODEL),
+        "minimax-m2.5" | "minimax-m2-5" | "minimax-m-2.5" | "minimax-m-2-5" => {
+            Some(MINIMAX_M2_5_MODEL)
+        }
+        "minimax-m2.5-highspeed"
+        | "minimax-m2-5-highspeed"
+        | "minimax-m-2.5-highspeed"
+        | "minimax-m-2-5-highspeed" => Some(MINIMAX_M2_5_HIGHSPEED_MODEL),
+        "minimax-m2.1" | "minimax-m2-1" | "minimax-m-2.1" | "minimax-m-2-1" => {
+            Some(MINIMAX_M2_1_MODEL)
+        }
+        "minimax-m2.1-highspeed"
+        | "minimax-m2-1-highspeed"
+        | "minimax-m-2.1-highspeed"
+        | "minimax-m-2-1-highspeed" => Some(MINIMAX_M2_1_HIGHSPEED_MODEL),
+        "minimax-m2" | "minimax-m-2" => Some(MINIMAX_M2_MODEL),
+        _ => None,
+    }
+}
+
 fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
     let normalized = model.trim().to_ascii_lowercase();
     let normalized = normalized.replace(['_', ' '], "-");
@@ -2634,6 +2685,7 @@ fn default_model_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Anthropic => DEFAULT_ANTHROPIC_MODEL,
         ProviderKind::Zai => DEFAULT_ZAI_MODEL,
         ProviderKind::Stepfun => DEFAULT_STEPFUN_MODEL,
+        ProviderKind::Minimax => DEFAULT_MINIMAX_MODEL,
     }
 }
 
@@ -2662,6 +2714,7 @@ fn default_base_url_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Anthropic => DEFAULT_ANTHROPIC_BASE_URL,
         ProviderKind::Zai => DEFAULT_ZAI_BASE_URL,
         ProviderKind::Stepfun => DEFAULT_STEPFUN_BASE_URL,
+        ProviderKind::Minimax => DEFAULT_MINIMAX_BASE_URL,
     }
 }
 
@@ -3447,6 +3500,8 @@ struct EnvRuntimeOverrides {
     zai_model: Option<String>,
     stepfun_base_url: Option<String>,
     stepfun_model: Option<String>,
+    minimax_base_url: Option<String>,
+    minimax_model: Option<String>,
 }
 
 impl EnvRuntimeOverrides {
@@ -3634,6 +3689,12 @@ impl EnvRuntimeOverrides {
                 .or_else(|_| std::env::var("STEP_MODEL"))
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+            minimax_base_url: std::env::var("MINIMAX_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            minimax_model: std::env::var("MINIMAX_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
         }
     }
 
@@ -3679,6 +3740,7 @@ impl EnvRuntimeOverrides {
             ProviderKind::Anthropic => self.anthropic_base_url.clone(),
             ProviderKind::Zai => self.zai_base_url.clone(),
             ProviderKind::Stepfun => self.stepfun_base_url.clone(),
+            ProviderKind::Minimax => self.minimax_base_url.clone(),
         }
     }
 
@@ -3699,6 +3761,9 @@ impl EnvRuntimeOverrides {
             ProviderKind::Together => self.together_model.clone(),
             ProviderKind::OpenaiCodex => self.openai_codex_model.clone(),
             ProviderKind::Anthropic => self.anthropic_model.clone(),
+            ProviderKind::Zai => self.zai_model.clone(),
+            ProviderKind::Stepfun => self.stepfun_model.clone(),
+            ProviderKind::Minimax => self.minimax_model.clone(),
             _ => None,
         }?;
 
@@ -4096,6 +4161,17 @@ action = "mode.agent"
         kimi_base_url: Option<OsString>,
         kimi_model: Option<OsString>,
         kimi_model_name: Option<OsString>,
+        zai_api_key: Option<OsString>,
+        z_ai_api_key: Option<OsString>,
+        zai_base_url: Option<OsString>,
+        zai_model: Option<OsString>,
+        stepfun_api_key: Option<OsString>,
+        step_api_key: Option<OsString>,
+        stepfun_base_url: Option<OsString>,
+        stepfun_model: Option<OsString>,
+        minimax_api_key: Option<OsString>,
+        minimax_base_url: Option<OsString>,
+        minimax_model: Option<OsString>,
         sglang_api_key: Option<OsString>,
         sglang_base_url: Option<OsString>,
         vllm_api_key: Option<OsString>,
@@ -4179,6 +4255,17 @@ action = "mode.agent"
                 kimi_base_url: env::var_os("KIMI_BASE_URL"),
                 kimi_model: env::var_os("KIMI_MODEL"),
                 kimi_model_name: env::var_os("KIMI_MODEL_NAME"),
+                zai_api_key: env::var_os("ZAI_API_KEY"),
+                z_ai_api_key: env::var_os("Z_AI_API_KEY"),
+                zai_base_url: env::var_os("ZAI_BASE_URL"),
+                zai_model: env::var_os("ZAI_MODEL"),
+                stepfun_api_key: env::var_os("STEPFUN_API_KEY"),
+                step_api_key: env::var_os("STEP_API_KEY"),
+                stepfun_base_url: env::var_os("STEPFUN_BASE_URL"),
+                stepfun_model: env::var_os("STEPFUN_MODEL"),
+                minimax_api_key: env::var_os("MINIMAX_API_KEY"),
+                minimax_base_url: env::var_os("MINIMAX_BASE_URL"),
+                minimax_model: env::var_os("MINIMAX_MODEL"),
                 sglang_api_key: env::var_os("SGLANG_API_KEY"),
                 sglang_base_url: env::var_os("SGLANG_BASE_URL"),
                 vllm_api_key: env::var_os("VLLM_API_KEY"),
@@ -4257,6 +4344,17 @@ action = "mode.agent"
                 env::remove_var("KIMI_BASE_URL");
                 env::remove_var("KIMI_MODEL");
                 env::remove_var("KIMI_MODEL_NAME");
+                env::remove_var("ZAI_API_KEY");
+                env::remove_var("Z_AI_API_KEY");
+                env::remove_var("ZAI_BASE_URL");
+                env::remove_var("ZAI_MODEL");
+                env::remove_var("STEPFUN_API_KEY");
+                env::remove_var("STEP_API_KEY");
+                env::remove_var("STEPFUN_BASE_URL");
+                env::remove_var("STEPFUN_MODEL");
+                env::remove_var("MINIMAX_API_KEY");
+                env::remove_var("MINIMAX_BASE_URL");
+                env::remove_var("MINIMAX_MODEL");
                 env::remove_var("SGLANG_API_KEY");
                 env::remove_var("SGLANG_BASE_URL");
                 env::remove_var("VLLM_API_KEY");
@@ -4361,6 +4459,17 @@ action = "mode.agent"
                 Self::restore_var("KIMI_BASE_URL", self.kimi_base_url.take());
                 Self::restore_var("KIMI_MODEL", self.kimi_model.take());
                 Self::restore_var("KIMI_MODEL_NAME", self.kimi_model_name.take());
+                Self::restore_var("ZAI_API_KEY", self.zai_api_key.take());
+                Self::restore_var("Z_AI_API_KEY", self.z_ai_api_key.take());
+                Self::restore_var("ZAI_BASE_URL", self.zai_base_url.take());
+                Self::restore_var("ZAI_MODEL", self.zai_model.take());
+                Self::restore_var("STEPFUN_API_KEY", self.stepfun_api_key.take());
+                Self::restore_var("STEP_API_KEY", self.step_api_key.take());
+                Self::restore_var("STEPFUN_BASE_URL", self.stepfun_base_url.take());
+                Self::restore_var("STEPFUN_MODEL", self.stepfun_model.take());
+                Self::restore_var("MINIMAX_API_KEY", self.minimax_api_key.take());
+                Self::restore_var("MINIMAX_BASE_URL", self.minimax_base_url.take());
+                Self::restore_var("MINIMAX_MODEL", self.minimax_model.take());
                 Self::restore_var("SGLANG_API_KEY", self.sglang_api_key.take());
                 Self::restore_var("SGLANG_BASE_URL", self.sglang_base_url.take());
                 Self::restore_var("VLLM_API_KEY", self.vllm_api_key.take());
@@ -5728,6 +5837,70 @@ mode = "token-plan-usa"
         assert_eq!(resolved.provider, ProviderKind::Moonshot);
         assert_eq!(resolved.base_url, DEFAULT_MOONSHOT_BASE_URL);
         assert_eq!(resolved.model, DEFAULT_MOONSHOT_MODEL);
+    }
+
+    #[test]
+    fn zai_stepfun_and_minimax_default_to_first_party_routes() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+
+        for (provider, expected_base_url, expected_model) in [
+            (ProviderKind::Zai, DEFAULT_ZAI_BASE_URL, DEFAULT_ZAI_MODEL),
+            (
+                ProviderKind::Stepfun,
+                DEFAULT_STEPFUN_BASE_URL,
+                DEFAULT_STEPFUN_MODEL,
+            ),
+            (
+                ProviderKind::Minimax,
+                DEFAULT_MINIMAX_BASE_URL,
+                DEFAULT_MINIMAX_MODEL,
+            ),
+        ] {
+            let config = ConfigToml {
+                provider,
+                ..ConfigToml::default()
+            };
+            let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+
+            assert_eq!(resolved.provider, provider);
+            assert_eq!(resolved.base_url, expected_base_url);
+            assert_eq!(resolved.model, expected_model);
+        }
+    }
+
+    #[test]
+    fn first_party_provider_env_model_overrides_pass_through() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        unsafe {
+            env::set_var("CODEWHALE_PROVIDER", "minimax");
+            env::set_var("MINIMAX_MODEL", "MiniMax-M2.7-highspeed");
+            env::set_var("MINIMAX_BASE_URL", "https://minimax.example/v1");
+        }
+
+        let resolved =
+            ConfigToml::default().resolve_runtime_options(&CliRuntimeOverrides::default());
+
+        assert_eq!(resolved.provider, ProviderKind::Minimax);
+        assert_eq!(resolved.base_url, "https://minimax.example/v1");
+        assert_eq!(resolved.model, "MiniMax-M2.7-highspeed");
+    }
+
+    #[test]
+    fn minimax_env_model_override_canonicalizes_known_aliases() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        unsafe {
+            env::set_var("CODEWHALE_PROVIDER", "minimax");
+            env::set_var("MINIMAX_MODEL", "minimax-m2-5-highspeed");
+        }
+
+        let resolved =
+            ConfigToml::default().resolve_runtime_options(&CliRuntimeOverrides::default());
+
+        assert_eq!(resolved.provider, ProviderKind::Minimax);
+        assert_eq!(resolved.model, "MiniMax-M2.5-highspeed");
     }
 
     #[test]

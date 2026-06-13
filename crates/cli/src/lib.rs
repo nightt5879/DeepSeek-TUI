@@ -782,6 +782,7 @@ fn provider_slot(provider: ProviderKind) -> &'static str {
         ProviderKind::Anthropic => "anthropic",
         ProviderKind::Zai => "zai",
         ProviderKind::Stepfun => "stepfun",
+        ProviderKind::Minimax => "minimax",
     }
 }
 
@@ -919,6 +920,7 @@ fn provider_env_vars(provider: ProviderKind) -> &'static [&'static str] {
         ProviderKind::Anthropic => &["ANTHROPIC_API_KEY"],
         ProviderKind::Zai => &["ZAI_API_KEY", "Z_AI_API_KEY"],
         ProviderKind::Stepfun => &["STEPFUN_API_KEY", "STEP_API_KEY"],
+        ProviderKind::Minimax => &["MINIMAX_API_KEY"],
     }
 }
 

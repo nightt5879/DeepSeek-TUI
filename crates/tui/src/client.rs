@@ -1235,6 +1235,13 @@ pub(super) fn apply_reasoning_effort(
     effort: Option<&str>,
     provider: ApiProvider,
 ) {
+    if matches!(provider, ApiProvider::Minimax) {
+        // MiniMax's OpenAI-compatible API keeps thinking inside `content`
+        // unless reasoning_split is enabled. Always request the split shape
+        // so private thinking renders as Thinking cells rather than answer
+        // prose.
+        body["reasoning_split"] = json!(true);
+    }
     let Some(effort) = effort else {
         return;
     };
@@ -1293,6 +1300,9 @@ pub(super) fn apply_reasoning_effort(
                 body["chat_template_kwargs"] = json!({
                     "thinking": false,
                 });
+            }
+            ApiProvider::Minimax => {
+                body["thinking"] = json!({ "type": "disabled" });
             }
             ApiProvider::Zai | ApiProvider::Stepfun => {}
         },
@@ -1368,6 +1378,9 @@ pub(super) fn apply_reasoning_effort(
                     "reasoning_effort": "high",
                 });
             }
+            ApiProvider::Minimax => {
+                body["thinking"] = json!({ "type": "adaptive" });
+            }
             ApiProvider::Zai | ApiProvider::Stepfun => {}
         },
         "xhigh" | "max" | "highest" => match provider {
@@ -1421,6 +1434,9 @@ pub(super) fn apply_reasoning_effort(
                     "thinking": true,
                     "reasoning_effort": "max",
                 });
+            }
+            ApiProvider::Minimax => {
+                body["thinking"] = json!({ "type": "adaptive" });
             }
             ApiProvider::Zai | ApiProvider::Stepfun => {}
         },
@@ -2837,6 +2853,36 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_minimax_splits_reasoning_from_content() {
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("high"), ApiProvider::Minimax);
+        assert_eq!(
+            body.get("reasoning_split").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            body.pointer("/thinking/type").and_then(Value::as_str),
+            Some("adaptive")
+        );
+        assert!(body.get("reasoning_effort").is_none());
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("off"), ApiProvider::Minimax);
+        assert_eq!(
+            body.get("reasoning_split").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            body.pointer("/thinking/type").and_then(Value::as_str),
+            Some("disabled")
+        );
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, None, ApiProvider::Minimax);
+        assert_eq!(body, json!({ "reasoning_split": true }));
+    }
+
+    #[test]
     fn chat_parser_accepts_nvidia_nim_reasoning_field() -> Result<()> {
         let response = parse_chat_message(&json!({
             "id": "chatcmpl-test",
@@ -2872,6 +2918,7 @@ mod tests {
         let mut text_started = false;
         let mut thinking_started = false;
         let mut tool_indices = std::collections::HashMap::new();
+        let mut reasoning_detail_buffers = std::collections::HashMap::new();
         let events = parse_sse_chunk(
             &json!({
                 "choices": [{
@@ -2884,6 +2931,7 @@ mod tests {
             &mut text_started,
             &mut thinking_started,
             &mut tool_indices,
+            &mut reasoning_detail_buffers,
             true,
         );
 
@@ -3038,12 +3086,14 @@ mod tests {
         let mut thinking_started = false;
         let mut tool_indices: std::collections::HashMap<u32, u32> =
             std::collections::HashMap::new();
+        let mut reasoning_detail_buffers = std::collections::HashMap::new();
         let events = parse_sse_chunk(
             &chunk,
             &mut content_index,
             &mut text_started,
             &mut thinking_started,
             &mut tool_indices,
+            &mut reasoning_detail_buffers,
             false,
         );
 
@@ -3097,12 +3147,14 @@ mod tests {
         let mut thinking_started = false;
         let mut tool_indices: std::collections::HashMap<u32, u32> =
             std::collections::HashMap::new();
+        let mut reasoning_detail_buffers = std::collections::HashMap::new();
         let events = parse_sse_chunk(
             &chunk,
             &mut content_index,
             &mut text_started,
             &mut thinking_started,
             &mut tool_indices,
+            &mut reasoning_detail_buffers,
             false,
         );
 

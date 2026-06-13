@@ -614,7 +614,9 @@ impl Engine {
         let env_var = match provider {
             ApiProvider::Deepseek | ApiProvider::DeepseekCN => "DEEPSEEK_API_KEY",
             ApiProvider::NvidiaNim => "NVIDIA_API_KEY/NVIDIA_NIM_API_KEY",
-            ApiProvider::Openai | ApiProvider::Zai | ApiProvider::Stepfun => "OPENAI_API_KEY",
+            ApiProvider::Openai => "OPENAI_API_KEY",
+            ApiProvider::Zai => "ZAI_API_KEY/Z_AI_API_KEY",
+            ApiProvider::Stepfun => "STEPFUN_API_KEY/STEP_API_KEY",
             ApiProvider::Anthropic => "ANTHROPIC_API_KEY",
             ApiProvider::Atlascloud => "ATLASCLOUD_API_KEY",
             ApiProvider::WanjieArk => "WANJIE_ARK_API_KEY/WANJIE_API_KEY/WANJIE_MAAS_API_KEY",
@@ -632,6 +634,7 @@ impl Engine {
             ApiProvider::Huggingface => "HUGGINGFACE_API_KEY/HF_TOKEN",
             ApiProvider::Together => "TOGETHER_API_KEY",
             ApiProvider::OpenaiCodex => "OPENAI_CODEX_ACCESS_TOKEN/CODEX_ACCESS_TOKEN",
+            ApiProvider::Minimax => "MINIMAX_API_KEY",
         };
 
         Some(format!(

@@ -2601,12 +2601,16 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
                     ("DEEPSEEK_API_KEY", "codewhale auth set --provider deepseek")
                 }
                 crate::config::ApiProvider::Zai => (
-                    "OPENAI_API_KEY",
+                    "ZAI_API_KEY/Z_AI_API_KEY",
                     "codewhale auth set --provider zai --api-key \"...\"",
                 ),
                 crate::config::ApiProvider::Stepfun => (
-                    "OPENAI_API_KEY",
+                    "STEPFUN_API_KEY/STEP_API_KEY",
                     "codewhale auth set --provider stepfun --api-key \"...\"",
+                ),
+                crate::config::ApiProvider::Minimax => (
+                    "MINIMAX_API_KEY",
+                    "codewhale auth set --provider minimax --api-key \"...\"",
                 ),
             };
             println!(
@@ -2637,6 +2641,7 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
                     | crate::config::ApiProvider::DeepseekCN => "deepseek",
                     crate::config::ApiProvider::Zai => "zai",
                     crate::config::ApiProvider::Stepfun => "stepfun",
+                    crate::config::ApiProvider::Minimax => "minimax",
                 }
             );
         }
