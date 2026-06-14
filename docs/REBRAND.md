@@ -114,6 +114,19 @@ cargo install --path crates/cli --locked --force
 cargo install --path crates/tui --locked --force
 ```
 
+### Legacy `deepseek update`
+
+Current v0.8.x compatibility binaries recognize when they are running under a
+legacy `deepseek` or `deepseek-tui` filename. In that case, `deepseek update`
+or `deepseek-tui update` downloads the canonical CodeWhale release assets and
+installs them beside the legacy binary as `codewhale` and `codewhale-tui` when
+the install directory is writable.
+
+If that update path cannot write to the install directory, use the npm, Cargo,
+Homebrew, or manual reinstall commands above. The legacy npm package
+`deepseek-tui` remains deprecated and is not republished; npm users should move
+to `npm install -g codewhale`.
+
 ### Homebrew
 
 The tap formula still installs through the legacy `deepseek-tui` name for

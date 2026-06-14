@@ -29,9 +29,7 @@ pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Re
 
     let current_exe =
         std::env::current_exe().context("failed to determine current executable path")?;
-    if is_legacy_binary(&current_exe) {
-        bail!("{}", legacy_binary_message(&current_exe));
-    }
+    let legacy_binary = is_legacy_binary(&current_exe);
 
     let targets = update_targets_for_exe(&current_exe);
     let channel = ReleaseChannel::from_beta_flag(beta);
@@ -44,6 +42,10 @@ pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Re
     println!("Checking for {} updates...", channel.label());
     println!("Current binary: {}", current_exe.display());
     println!("Current version: v{current_version}");
+    if legacy_binary {
+        println!();
+        println!("{}", legacy_binary_message(&current_exe));
+    }
 
     if check_only {
         let latest_tag = latest_release_tag(channel, proxy.as_ref())
@@ -208,10 +210,13 @@ fn legacy_binary_message(current_exe: &Path) -> String {
         "\
 this binary ({exe}) is using the legacy deepseek/deepseek-tui command name.
 
-The package has been renamed to `codewhale`. Self-update cannot continue from
-the old binary name, but DeepSeek provider support is unchanged.
+The package has been renamed to `codewhale`. This update will install canonical
+CodeWhale binaries (`codewhale` and, when present, `codewhale-tui`) beside the
+legacy command when the install directory is writable. DeepSeek provider support
+is unchanged.
 
-Reinstall using your original install method:
+If this update cannot write to the install directory, reinstall using your
+original install method:
 
   npm:
     npm uninstall -g deepseek-tui
@@ -260,6 +265,40 @@ fn sibling_binary_path(current_exe: &Path, sibling_prefix: &str) -> PathBuf {
     current_exe.with_file_name(format!("{sibling_prefix}{}", std::env::consts::EXE_SUFFIX))
 }
 
+fn canonical_binary_path_for_prefix(current_exe: &Path, prefix: &str) -> PathBuf {
+    if is_legacy_binary(current_exe) {
+        current_exe.with_file_name(format!("{prefix}{}", std::env::consts::EXE_SUFFIX))
+    } else {
+        current_exe.to_path_buf()
+    }
+}
+
+fn legacy_binary_name_for_prefix(prefix: &str) -> &'static str {
+    if prefix == "codewhale-tui" {
+        "deepseek-tui"
+    } else {
+        "deepseek"
+    }
+}
+
+fn legacy_sibling_binary_path(current_exe: &Path, sibling_prefix: &str) -> PathBuf {
+    current_exe.with_file_name(format!(
+        "{}{}",
+        legacy_binary_name_for_prefix(sibling_prefix),
+        std::env::consts::EXE_SUFFIX
+    ))
+}
+
+fn should_update_sibling(
+    current_exe: &Path,
+    canonical_sibling: &Path,
+    sibling_prefix: &str,
+) -> bool {
+    canonical_sibling.exists()
+        || (is_legacy_binary(current_exe)
+            && legacy_sibling_binary_path(current_exe, sibling_prefix).exists())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UpdateTarget {
     path: PathBuf,
@@ -269,7 +308,7 @@ struct UpdateTarget {
 fn update_targets_for_exe(current_exe: &Path) -> Vec<UpdateTarget> {
     let current_prefix = binary_prefix_for_exe(current_exe);
     let mut targets = vec![UpdateTarget {
-        path: current_exe.to_path_buf(),
+        path: canonical_binary_path_for_prefix(current_exe, current_prefix),
         asset_stem: release_asset_stem_for_prefix(
             current_prefix,
             std::env::consts::OS,
@@ -279,7 +318,7 @@ fn update_targets_for_exe(current_exe: &Path) -> Vec<UpdateTarget> {
 
     let sibling_prefix = sibling_prefix_for(current_prefix);
     let sibling = sibling_binary_path(current_exe, sibling_prefix);
-    if sibling.exists() {
+    if should_update_sibling(current_exe, &sibling, sibling_prefix) {
         targets.push(UpdateTarget {
             path: sibling,
             asset_stem: release_asset_stem_for_prefix(
@@ -887,7 +926,9 @@ mod tests {
         let message = legacy_binary_message(Path::new("/usr/local/bin/deepseek-tui"));
 
         assert!(message.contains("legacy deepseek/deepseek-tui command name"));
-        assert!(message.contains("DeepSeek provider support is unchanged"));
+        assert!(message.contains("install canonical"));
+        assert!(message.contains("DeepSeek provider support"));
+        assert!(message.contains("is unchanged"));
         assert!(message.contains("npm uninstall -g deepseek-tui"));
         assert!(message.contains("npm install -g codewhale"));
         assert!(message.contains("cargo uninstall deepseek-tui-cli 2>/dev/null || true"));
@@ -896,6 +937,68 @@ mod tests {
         assert!(message.contains("cargo install codewhale-tui --locked"));
         assert!(message.contains("brew upgrade deepseek-tui"));
         assert!(message.contains("https://github.com/Hmbown/CodeWhale/releases/latest"));
+    }
+
+    #[test]
+    fn legacy_dispatcher_update_targets_canonical_codewhale_pair() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dispatcher = dir
+            .path()
+            .join(format!("deepseek{}", std::env::consts::EXE_SUFFIX));
+        let tui = dir
+            .path()
+            .join(format!("deepseek-tui{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&dispatcher, b"legacy dispatcher").unwrap();
+        std::fs::write(&tui, b"legacy tui").unwrap();
+
+        let targets = update_targets_for_exe(&dispatcher);
+        let paths = targets
+            .iter()
+            .map(|target| target.path.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            vec![
+                dir.path()
+                    .join(format!("codewhale{}", std::env::consts::EXE_SUFFIX)),
+                dir.path()
+                    .join(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX))
+            ]
+        );
+        assert!(targets[0].asset_stem.starts_with("codewhale-"));
+        assert!(targets[1].asset_stem.starts_with("codewhale-tui-"));
+    }
+
+    #[test]
+    fn legacy_tui_update_targets_canonical_tui_pair() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dispatcher = dir
+            .path()
+            .join(format!("deepseek{}", std::env::consts::EXE_SUFFIX));
+        let tui = dir
+            .path()
+            .join(format!("deepseek-tui{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&dispatcher, b"legacy dispatcher").unwrap();
+        std::fs::write(&tui, b"legacy tui").unwrap();
+
+        let targets = update_targets_for_exe(&tui);
+        let paths = targets
+            .iter()
+            .map(|target| target.path.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            vec![
+                dir.path()
+                    .join(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX)),
+                dir.path()
+                    .join(format!("codewhale{}", std::env::consts::EXE_SUFFIX))
+            ]
+        );
+        assert!(targets[0].asset_stem.starts_with("codewhale-tui-"));
+        assert!(targets[1].asset_stem.starts_with("codewhale-"));
     }
 
     #[test]
