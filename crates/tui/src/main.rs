@@ -91,6 +91,7 @@ mod tools;
 mod tui;
 mod utils;
 mod vision;
+mod worker_profile;
 mod working_set;
 mod workspace_discovery;
 mod workspace_trust;
