@@ -989,7 +989,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         // human-noticeable; we trust the operator over a hard step cap.
         max_steps: u32::MAX,
         max_subagents: app.max_subagents,
-        interactive_launch_limit: config.interactive_launch_limit(),
+        launch_concurrency: config.launch_concurrency(),
         features: config.features(),
         compaction: app.compaction_config(),
         todos: app.todos.clone(),
@@ -1535,6 +1535,11 @@ async fn run_event_loop(
         // First, poll for engine events (non-blocking)
         let mut received_engine_event = false;
         let mut transcript_batch_updated = false;
+        // #freeze: coalesce per-event `Op::ListSubAgents` sends into a single
+        // trailing-edge refresh per drain. At high fanout, many spawn/complete/
+        // mailbox events in one drain otherwise each take the manager write
+        // lock and trigger a full O(N) list reconcile.
+        let mut subagent_list_refresh_requested = false;
         let mut queued_to_send: Option<QueuedMessage> = None;
         let mut respawn_after_provider_rollback: Option<String> = None;
         let mut fallback_after_engine_error: Option<ApiProvider> = None;
@@ -1857,13 +1862,15 @@ async fn run_event_loop(
                         // Tasks panel stays in sync with tool execution
                         // rather than waiting up to 2.5 s for the periodic
                         // poll. Also merge shell jobs (#373).
+                        // Only tools that actually change durable tasks or
+                        // background shell jobs force a jobs-panel refresh.
+                        // Checklist/todo/plan tools drive the To-do panel,
+                        // which reads `app.todos` directly and repaints on the
+                        // normal redraw — no forced refresh needed (avoids the
+                        // old per-checklist Tasks-panel churn).
                         if matches!(
                             name.as_str(),
                             "agent"
-                                | "todo_write"
-                                | "checklist_write"
-                                | "checklist_update"
-                                | "update_plan"
                                 | "task_shell_start"
                                 | "exec_shell"
                                 | "exec_shell_cancel"
@@ -1874,7 +1881,7 @@ async fn run_event_loop(
                             last_task_refresh = Instant::now();
                         }
                         if matches!(name.as_str(), "agent") {
-                            let _ = engine_handle.send(Op::ListSubAgents).await;
+                            subagent_list_refresh_requested = true;
                         }
                     }
                     EngineEvent::TurnStarted { turn_id } => {
@@ -1996,7 +2003,7 @@ async fn run_event_loop(
                             crate::core::events::TurnOutcomeStatus::Interrupted
                                 | crate::core::events::TurnOutcomeStatus::Failed
                         ) {
-                            let _ = engine_handle.send(Op::ListSubAgents).await;
+                            subagent_list_refresh_requested = true;
                         }
                         crate::tui::notifications::clear_taskbar_progress();
                         if status != crate::core::events::TurnOutcomeStatus::Completed {
@@ -2414,7 +2421,7 @@ async fn run_event_loop(
                         // agent and keep the raw id out of the status bar.
                         let label = app.ensure_agent_label(&id);
                         app.status_message = Some(format!("{label} starting: {prompt_summary}"));
-                        let _ = engine_handle.send(Op::ListSubAgents).await;
+                        subagent_list_refresh_requested = true;
                     }
                     EngineEvent::AgentProgress { id, status } => {
                         let display = friendly_subagent_progress(app, &id, &status);
@@ -2512,7 +2519,7 @@ async fn run_event_loop(
                             terminal_paused_at = None;
                             app.needs_redraw = true;
                         }
-                        let _ = engine_handle.send(Op::ListSubAgents).await;
+                        subagent_list_refresh_requested = true;
                     }
                     EngineEvent::AgentList { agents } => {
                         let mut sorted = agents.clone();
@@ -2533,7 +2540,7 @@ async fn run_event_loop(
                             subagent_message_refreshes_workspace_context(&message);
                         let updated_transcript = handle_subagent_mailbox(app, seq, &message);
                         if should_refresh_subagents {
-                            let _ = engine_handle.send(Op::ListSubAgents).await;
+                            subagent_list_refresh_requested = true;
                         }
                         if updated_transcript {
                             transcript_batch_updated = true;
@@ -2769,6 +2776,11 @@ async fn run_event_loop(
         }
         if received_engine_event {
             app.needs_redraw = true;
+        }
+        // #freeze: one trailing-edge sub-agent list refresh per drain, no
+        // matter how many spawn/complete/mailbox events arrived this batch.
+        if subagent_list_refresh_requested {
+            let _ = engine_handle.send(Op::ListSubAgents).await;
         }
 
         if let Some(next) = queued_to_send {
@@ -8022,7 +8034,13 @@ fn render(f: &mut Frame, app: &mut App) {
                 body_chunks[0]
             };
 
-        if let Some(sidebar_width) = sidebar_width_for_chat_area(app, chat_area.width) {
+        // Auto-reveal: in Auto focus mode, collapse the sidebar to a
+        // full-width transcript when nothing is active; bring it back the
+        // moment there is a To-do, a live fleet, or background jobs.
+        let sidebar_auto_collapsed = crate::tui::sidebar::sidebar_auto_idle(app);
+        if !sidebar_auto_collapsed
+            && let Some(sidebar_width) = sidebar_width_for_chat_area(app, chat_area.width)
+        {
             // Record total width for drag-to-resize percentage calculation.
             app.sidebar_resize_total_width = chat_area.width;
             let split = Layout::default()

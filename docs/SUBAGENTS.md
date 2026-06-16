@@ -130,20 +130,18 @@ the next turn.
 
 ## Concurrency cap
 
-The current compatibility dispatcher caps concurrent sub-agents at 10 by default
-(configurable via `[subagents].max_concurrent` in `~/.codewhale/config.toml`,
-hard ceiling 20). When the parent hits the cap, `agent` returns an error with
-the cap value; the parent should wait for background completion events before
-opening more agents.
+Up to **20** sub-agents run concurrently by default (configurable via
+`[subagents].max_concurrent` in `~/.codewhale/config.toml`; the default equals
+the hard ceiling of 20). When the parent hits the cap, `agent` returns an error
+with the cap value; the parent should wait for background completion events
+before opening more agents, or ask the user.
 
-That `max_concurrent` value is a ceiling on **tracked** agents, not a measure of
-how many execute at once. Direct children are additionally gated by
-`[subagents].interactive_max_launch` (default **4**): only about four run
-concurrently and the rest **queue** for a slot. The practical guidance for the
-model is therefore to open a small batch (up to about four), keep working, and
-consume completion events as slots free. Do not fire a large burst of `agent`
-calls in one turn. (See the freeze-fix work for why a big simultaneous fanout
-previously wedged the TUI: #3216 / #2211.)
+By default every admitted child may start immediately — there is no artificial
+throttle. If you want gentler fan-out, lower `[subagents].launch_concurrency`
+(how many direct children start at once); children beyond that limit **queue**
+for a launch slot rather than bursting. `launch_concurrency` defaults to the
+resolved `max_subagents` cap. (The pre-v0.8.61 `interactive_max_launch` key is
+still accepted as a deprecated alias; the new key wins when both are set.)
 
 The cap counts only **running** agents — completed / failed /
 cancelled records persist for inspection but don't occupy a slot.

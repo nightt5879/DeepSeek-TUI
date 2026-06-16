@@ -3682,6 +3682,31 @@ fn hidden_sidebar_focus_suppresses_sidebar_split_even_when_wide() {
     assert_eq!(sidebar_width_for_chat_area(&app, 120), None);
 }
 
+#[test]
+fn sidebar_auto_idle_collapses_when_nothing_active() {
+    let mut app = create_test_app();
+    app.sidebar_focus = SidebarFocus::Auto;
+    // A fresh session has no To-do, no fleet, no background jobs, no context.
+    assert!(crate::tui::sidebar::sidebar_auto_idle(&mut app));
+}
+
+#[test]
+fn sidebar_auto_idle_false_when_fleet_active() {
+    let mut app = create_test_app();
+    app.sidebar_focus = SidebarFocus::Auto;
+    app.agent_progress
+        .insert("agent_1".to_string(), "running".to_string());
+    assert!(!crate::tui::sidebar::sidebar_auto_idle(&mut app));
+}
+
+#[test]
+fn sidebar_auto_idle_false_for_explicit_focus() {
+    let mut app = create_test_app();
+    // An explicit panel pin is never auto-collapsed.
+    app.sidebar_focus = SidebarFocus::Agents;
+    assert!(!crate::tui::sidebar::sidebar_auto_idle(&mut app));
+}
+
 // ── Sidebar resize-handle mouse tests ──────────────────────────────
 
 fn setup_resize_handle(app: &mut App, handle_x: u16, sidebar_width: u16, total_width: u16) {

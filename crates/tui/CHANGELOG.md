@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Sub-agents — v0.8.61 stabilization (WIP)
+
+- Default concurrent sub-agent cap raised 10 → 20; direct-launch concurrency now
+  defaults to the full cap instead of 4. Configure via `[subagents] max_concurrent`
+  and the new `[subagents] launch_concurrency` (the old `interactive_max_launch`
+  key remains as a deprecated alias; the new key wins when both are set).
+- Retired the misleading "interactive fanout slot" terminology from model- and
+  user-facing copy (now "queued: waiting for a sub-agent launch slot").
+- Fixed a high-fanout TUI freeze: per-step full-fleet state persistence is now
+  coalesced (debounced) off the hot path, and per-event sub-agent list refreshes
+  collapse to one per UI drain.
+- Per-role tool posture is now authoritative: read-only roles
+  (`explore`/`review`/`plan`/`verifier`) cannot write or run shell even under an
+  auto-approved parent.
+- Sidebar: the per-turn "Tasks" activity panel is content-gated (only shows for
+  real background jobs / durable tasks); the "Work" panel is renamed "To-do";
+  the Auto sidebar auto-collapses to a full-width transcript when idle.
+- Sub-agents are framed as background workers; the completion event carries the
+  child's whale `name` so the orchestrator can refer to it.
+
 ### Retroactive credits
 
 A credit-reconciliation pass found shipped community fixes that were never

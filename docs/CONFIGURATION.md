@@ -980,14 +980,19 @@ If you are upgrading from older releases:
   typed allow/deny records, glob expansion, or approval UI persistence yet.
 - `managed_config_path` (string, optional): managed config file loaded after user/env config.
 - `requirements_path` (string, optional): requirements file used to enforce allowed approval/sandbox values.
-- `max_subagents` (int, optional): defaults to `10` and is clamped to `1..=20`.
+- `max_subagents` (int, optional): defaults to `20` and is clamped to `1..=20`.
 - `subagents.*` (optional): per-role/type model defaults for `agent`.
   Explicit tool `model` values win, then role/type
   overrides, then the parent runtime model. Supported convenience keys are
   `default_model`, `worker_model`, `explorer_model`, `awaiter_model`,
-  `review_model`, `custom_model`, `max_concurrent`, `api_timeout_secs`, and
-  `heartbeat_timeout_secs`. The `[subagents] max_concurrent` value overrides
-  top-level `max_subagents` and is also clamped to `1..=20`; `[subagents]
+  `review_model`, `custom_model`, `max_concurrent`, `launch_concurrency`,
+  `api_timeout_secs`, and `heartbeat_timeout_secs`. The `[subagents]
+  max_concurrent` value overrides top-level `max_subagents` and is also clamped
+  to `1..=20`. `[subagents] launch_concurrency` sets how many direct children
+  start at once before the rest queue for a launch slot; it defaults to the
+  resolved `max_subagents` cap and is clamped to `1..=max_subagents` (the
+  deprecated `interactive_max_launch` key is accepted as an alias, with the new
+  key winning when both are set). `[subagents]
   api_timeout_secs` controls the per-step API timeout for sub-agent model calls
   and is clamped to `1..=1800`, with `0` or unset preserving the legacy 120
   second default. `[subagents] heartbeat_timeout_secs` controls stale running

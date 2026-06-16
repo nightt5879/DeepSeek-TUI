@@ -107,8 +107,32 @@ const MAX_AGENT_WORKER_EVENTS_PER_RECORD: usize = 128;
 const SUBAGENT_STATE_SCHEMA_VERSION: u32 = 1;
 const SUBAGENT_STATE_FILE: &str = "subagents.v1.json";
 const SUBAGENT_RESTART_REASON: &str = "Interrupted by process restart";
-const SUBAGENT_QUEUED_LAUNCH_REASON: &str = "queued: waiting for an interactive fanout slot";
+const SUBAGENT_QUEUED_LAUNCH_REASON: &str = "queued: waiting for a sub-agent launch slot";
 const SUBAGENT_MODEL_WAIT_REASON: &str = "waiting for model response";
+/// #freeze: minimum spacing between hot-path (per-step checkpoint) state
+/// persists. `update_checkpoint` fires on every step of every agent; at high
+/// fanout an unconditional full-fleet rewrite under the manager write lock
+/// wedges the UI. Hot-path writes coalesce to at most one per this interval;
+/// terminal/structural changes still persist immediately, and any terminal
+/// write flushes the full in-memory fleet (including other agents' pending
+/// checkpoints) to disk.
+const SUBAGENT_PERSIST_DEBOUNCE: Duration = Duration::from_millis(1500);
+
+/// #freeze: lightweight perf counters for the sub-agent persist hot path,
+/// gated behind `CODEWHALE_SUBAGENT_PERF_TRACE=1`. The atomic increments are
+/// always cheap; only the structured `subagent_perf` log line is gated.
+static SUBAGENT_PERSIST_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUBAGENT_PERSIST_SKIPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn subagent_perf_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CODEWHALE_SUBAGENT_PERF_TRACE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
 
 const VALID_SUBAGENT_TYPES: &str = "general (aliases: general-purpose, general_purpose, worker, default), \
      explore (aliases: exploration, explorer), plan (aliases: planning, planner, awaiter), \
@@ -1670,13 +1694,20 @@ pub struct SubAgentManager {
     /// agents whose `session_boot_id` doesn't match this value as
     /// "from prior session" so listings can hide them by default.
     current_session_boot_id: String,
-    /// Launch gate for direct (depth-1) interactive fanout (#3095). Each
+    /// Launch gate for direct (depth-1) sub-agent launches (#3095). Each
     /// permit is one actively executing direct child; further direct
     /// children spawn immediately but queue for a permit before starting,
     /// publishing a visible "queued" reason instead of bursting. Deeper
     /// descendants bypass the gate so a permit-holding parent waiting on
     /// its own children cannot deadlock the tree.
     launch_gate: Arc<Semaphore>,
+    /// #freeze: hot-path persist debounce bookkeeping (see
+    /// `SUBAGENT_PERSIST_DEBOUNCE`). `last_persist_at` is the last time any
+    /// state persist ran; `persist_pending` records that a hot-path write was
+    /// coalesced away so a later flush (terminal write or shutdown) can
+    /// capture the most recent checkpoint.
+    last_persist_at: Option<Instant>,
+    persist_pending: bool,
 }
 
 impl SubAgentManager {
@@ -1697,16 +1728,18 @@ impl SubAgentManager {
             // Fresh boot id per manager. Used by #405 to classify
             // re-loaded persisted agents as "prior session".
             current_session_boot_id: format!("boot_{}", &Uuid::new_v4().to_string()[..12]),
-            launch_gate: Arc::new(Semaphore::new(
-                crate::config::DEFAULT_INTERACTIVE_LAUNCH_LIMIT.min(max_agents),
-            )),
+            // Default launch concurrency = the full agent cap; the gate only
+            // throttles when a lower `launch_concurrency` is configured.
+            launch_gate: Arc::new(Semaphore::new(max_agents.max(1))),
+            last_persist_at: None,
+            persist_pending: false,
         }
     }
 
     /// Set the number of direct children that may execute concurrently
     /// before further launches queue (#3095). Clamped to `1..=max_agents`.
     #[must_use]
-    pub fn with_interactive_launch_limit(mut self, limit: usize) -> Self {
+    pub fn with_launch_concurrency(mut self, limit: usize) -> Self {
         self.launch_gate = Arc::new(Semaphore::new(limit.clamp(1, self.max_agents)));
         self
     }
@@ -1790,6 +1823,49 @@ impl SubAgentManager {
             // regression (#1085). Routed through tracing so the
             // file-backed subscriber in `runtime_log` captures it.
             tracing::warn!(target: "subagent", ?err, "failed to persist sub-agent state");
+        }
+    }
+
+    /// #freeze: persist on the hot per-step checkpoint path, coalesced to at
+    /// most one disk write per `SUBAGENT_PERSIST_DEBOUNCE`. A skipped write
+    /// sets `persist_pending` so the next terminal persist (which always
+    /// rewrites the full fleet) or `flush_pending_persist` captures it.
+    fn persist_state_debounced(&mut self) {
+        let now = Instant::now();
+        let due = match self.last_persist_at {
+            Some(last) => now.duration_since(last) >= SUBAGENT_PERSIST_DEBOUNCE,
+            None => true,
+        };
+        if due {
+            self.last_persist_at = Some(now);
+            self.persist_pending = false;
+            self.persist_state_best_effort();
+            let writes =
+                SUBAGENT_PERSIST_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if subagent_perf_enabled() {
+                let skipped = SUBAGENT_PERSIST_SKIPPED.load(std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    target: "subagent_perf",
+                    writes,
+                    skipped,
+                    agents = self.agents.len(),
+                    "checkpoint persist (debounced write)"
+                );
+            }
+        } else {
+            self.persist_pending = true;
+            SUBAGENT_PERSIST_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// #freeze: force a persist if a hot-path write was previously coalesced
+    /// away. Call on graceful shutdown / session teardown so the most recent
+    /// intermediate checkpoint is not lost.
+    pub fn flush_pending_persist(&mut self) {
+        if self.persist_pending {
+            self.last_persist_at = Some(Instant::now());
+            self.persist_pending = false;
+            self.persist_state_best_effort();
         }
     }
 
@@ -2480,7 +2556,10 @@ impl SubAgentManager {
         agent.steps_taken = checkpoint.steps_taken;
         agent.checkpoint = Some(checkpoint);
         agent.last_activity_at = Instant::now();
-        self.persist_state_best_effort();
+        // #freeze: hot per-step path — coalesce the full-fleet persist so 20
+        // agents stepping concurrently do not serialize the whole fleet (with
+        // full transcripts) to disk under the write lock on every step.
+        self.persist_state_debounced();
         true
     }
 
@@ -2815,7 +2894,7 @@ pub fn new_shared_subagent_manager(workspace: PathBuf, max_agents: usize) -> Sha
         workspace,
         max_agents,
         Duration::from_secs(crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS),
-        crate::config::DEFAULT_INTERACTIVE_LAUNCH_LIMIT,
+        max_agents,
     )
 }
 
@@ -2826,13 +2905,13 @@ pub fn new_shared_subagent_manager_with_timeout(
     workspace: PathBuf,
     max_agents: usize,
     running_heartbeat_timeout: Duration,
-    interactive_launch_limit: usize,
+    launch_concurrency: usize,
 ) -> SharedSubAgentManager {
     let max_agents = max_agents.clamp(1, MAX_SUBAGENTS);
     let state_path = default_state_path(&workspace);
     let mut manager = SubAgentManager::new(workspace, max_agents)
         .with_running_heartbeat_timeout(running_heartbeat_timeout)
-        .with_interactive_launch_limit(interactive_launch_limit)
+        .with_launch_concurrency(launch_concurrency)
         .with_state_path(state_path);
     if let Err(err) = manager.load_state() {
         // Routed through tracing instead of stderr — see comment in
@@ -3093,7 +3172,7 @@ fn build_subagent_system_prompt(
     assignment: &SubAgentAssignment,
 ) -> String {
     let base = agent_type.system_prompt();
-    match assignment.role.as_deref() {
+    let mut prompt = match assignment.role.as_deref() {
         Some(role) if !role.trim().is_empty() => {
             format!(
                 "{base}\n\nYou are operating in the role of `{}`.",
@@ -3101,7 +3180,13 @@ fn build_subagent_system_prompt(
             )
         }
         _ => base,
-    }
+    };
+    // Sub-agents are background workers: the orchestrating agent is their only
+    // caller. They never talk to the end user.
+    prompt.push_str(
+        "\n\nYou are a background sub-agent: every instruction comes from the orchestrating agent, not a human. Never address the end user or ask them questions — do the assigned work and report results back to the orchestrator.",
+    );
+    prompt
 }
 
 fn subagent_request_system_prompt(
@@ -3195,12 +3280,11 @@ async fn run_subagent_task(task: SubAgentTask) {
         match Arc::clone(gate).try_acquire_owned() {
             Ok(permit) => _launch_permit = Some(permit),
             Err(tokio::sync::TryAcquireError::NoPermits) => {
-                _launch_permit =
-                    acquire_queued_interactive_launch_permit(&task, Arc::clone(gate)).await;
+                _launch_permit = acquire_queued_launch_permit(&task, Arc::clone(gate)).await;
             }
             Err(tokio::sync::TryAcquireError::Closed) => {
                 crate::logging::warn(format!(
-                    "interactive launch gate closed for {}; proceeding without backpressure",
+                    "sub-agent launch gate closed for {}; proceeding without backpressure",
                     task.agent_id
                 ));
             }
@@ -3285,7 +3369,7 @@ async fn run_subagent_task(task: SubAgentTask) {
     }
 }
 
-async fn acquire_queued_interactive_launch_permit(
+async fn acquire_queued_launch_permit(
     task: &SubAgentTask,
     gate: Arc<Semaphore>,
 ) -> Option<tokio::sync::OwnedSemaphorePermit> {
@@ -3296,7 +3380,7 @@ async fn acquire_queued_interactive_launch_permit(
             record_agent_progress(
                 &task.runtime,
                 &task.agent_id,
-                "cancelled while queued for an interactive fanout slot".to_string(),
+                "cancelled while queued for a sub-agent launch slot".to_string(),
             );
             None
         }
@@ -3361,6 +3445,9 @@ pub(crate) fn emit_parent_completion(
 fn subagent_done_sentinel(agent_id: &str, res: &SubAgentResult) -> String {
     let mut payload = json!({
         "agent_id": agent_id,
+        // Whale name — a stable, human-friendly handle the orchestrator can use
+        // to refer to this child in its own reasoning/output.
+        "name": res.nickname,
         "agent_type": res.agent_type.as_str(),
         "status": subagent_status_name(&res.status),
         "summary_location": "previous_line",
@@ -4865,6 +4952,33 @@ fn emit_agent_progress(
 /// - **Explicit narrow** (`allowed_tools = Some(list)`): legacy / Custom
 ///   path. The registry still builds the full surface, but only the listed
 ///   tool names are visible to the model and callable.
+/// Pure per-role posture check (#3217), independent of any runtime: whether a
+/// role may invoke a tool of the given approval level.
+///
+/// - Read (`Auto`) tools are always allowed.
+/// - Write/edit/patch (`Suggest`) tools require a write-capable posture, so the
+///   read-only roles (`explore`/`review`/`plan`/`verifier`) are denied.
+/// - Shell (`Required`) tools require a `Full` shell posture, so only
+///   `verifier`/`implementer`/`general` may shell out; `explore`/`review`
+///   (read-only shell) and `plan` (no shell) are denied because read-only-shell
+///   enforcement is not yet wired at the exec layer.
+///
+/// `custom` is governed by its explicit `allowed_tools` list, so the posture
+/// check permits it here (the allowlist is the authority for that role).
+fn role_posture_permits(agent_type: &SubAgentType, approval: ApprovalRequirement) -> bool {
+    if matches!(agent_type, SubAgentType::Custom) {
+        return true;
+    }
+    let profile = WorkerRuntimeProfile::for_role(agent_type.clone());
+    match approval {
+        ApprovalRequirement::Auto => true,
+        ApprovalRequirement::Suggest => profile.permissions.write,
+        ApprovalRequirement::Required => {
+            matches!(profile.shell, crate::worker_profile::ShellPolicy::Full)
+        }
+    }
+}
+
 struct SubAgentToolRegistry {
     /// `None` → full inheritance (no allowlist filter applied). `Some(list)` →
     /// only the listed tools are visible to the model and callable.
@@ -4928,6 +5042,23 @@ impl SubAgentToolRegistry {
         matches!(agent_type, SubAgentType::Implementer | SubAgentType::Custom)
     }
 
+    /// Whether the role posture permits a given registered tool, independent of
+    /// parent auto-approval. Delegates to the pure `role_posture_permits`.
+    /// Unregistered names pass through (the allowlist / availability checks
+    /// handle those separately).
+    fn posture_permits_tool(&self, name: &str) -> bool {
+        // Delegation (`agent`) is governed by the depth budget and the
+        // allowlist (`can_spawn_child` / `is_tool_allowed`), not the write/shell
+        // posture — a read-only role may still fan out child work.
+        if name == "agent" {
+            return true;
+        }
+        match self.registry.get(name) {
+            Some(spec) => role_posture_permits(&self.agent_type, spec.approval_requirement()),
+            None => true,
+        }
+    }
+
     /// Whether a given tool name is permitted under this child's filter.
     /// `None` filter = everything permitted.
     fn is_tool_allowed(&self, name: &str) -> bool {
@@ -4953,6 +5084,10 @@ impl SubAgentToolRegistry {
         filtered
             .into_iter()
             .filter(|tool| tool.name != "agent" || self.can_spawn_child)
+            // #3217: hide tools the role posture forbids so the model never
+            // even sees write/edit/patch (read-only roles) or shell (no-shell
+            // roles). Defense-in-depth with the `execute` guard below.
+            .filter(|tool| self.posture_permits_tool(&tool.name))
             .collect()
     }
 
@@ -4970,6 +5105,16 @@ impl SubAgentToolRegistry {
     async fn execute(&self, _agent_id: &str, name: &str, input: Value) -> Result<String> {
         if !self.is_tool_allowed(name) {
             return Err(anyhow!("Tool {name} not allowed for this sub-agent"));
+        }
+        // #3217: authoritative per-role posture — read-only roles cannot mutate
+        // and non-`Full`-shell roles cannot run shell, regardless of whether
+        // the parent session is auto-approved. This closes the auto-approve
+        // bypass where a read-only child could quietly write or shell out.
+        if !self.posture_permits_tool(name) {
+            return Err(anyhow!(
+                "Tool {name} is not permitted for the read-only `{role}` sub-agent role. Use an `implementer` or `general` role (or a `custom` role with an explicit allowed_tools list) to mutate the workspace or run shell commands.",
+                role = self.agent_type.as_str()
+            ));
         }
         if !self.auto_approve {
             let Some(spec) = self.registry.get(name) else {
@@ -5132,15 +5277,15 @@ fn subagent_status_name(status: &SubAgentStatus) -> &'static str {
 const SUBAGENT_OUTPUT_FORMAT: &str = include_str!("../../prompts/subagent_output_format.md");
 
 const GENERAL_AGENT_INTRO: &str = concat!(
-    "You are a general-purpose sub-agent spawned to handle a specific task autonomously.\n",
+    "You are a trusted general-purpose sub-agent. Your job is to complete the one task you were given, end-to-end, and report back concisely.\n",
     "Stay inside the assigned scope; put adjacent work under RISKS/BLOCKERS.\n",
-    "Plan multi-step work with `checklist_write`; add `update_plan` for complex strategy.\n",
+    "For genuinely multi-step work, track progress with `checklist_write` (and `update_plan` for complex strategy); skip it for short, focused tasks.\n",
     "**Stop quickly on failure**: if the same tool call fails 2 times in a row, stop retrying and return what you have so far with a one-line note explaining what's missing. Do not loop on impossible queries (e.g. external API unreachable, rate-limited, or returning empty).\n",
     "**Bounded effort**: prefer one focused attempt over many speculative retries. If you cannot complete the task with available data within 3-5 tool calls, return your current partial findings — the parent agent can compensate with its own knowledge.\n\n"
 );
 
 const EXPLORE_AGENT_INTRO: &str = concat!(
-    "You are an exploration sub-agent (role: `explore`). Map the relevant code quickly and stay read-only.\n",
+    "You are a trusted exploration sub-agent (role: `explore`). Your job is to map the relevant code quickly and stay strictly read-only.\n",
     "Orient first: confirm the workspace/project root, read relevant AGENTS.md/README guidance when the tree is unfamiliar, then search only the likely scope.\n",
     "Use list_dir/file_search, grep_files, and read_file; use RLM only for long inputs or many semantic slices, not basic path discovery.\n",
     "DeepSeek V4 can hold broad evidence, but your value is compressed reconnaissance: cite `path:line-range` for each finding and stop once evidence is sufficient.\n",
@@ -5148,14 +5293,14 @@ const EXPLORE_AGENT_INTRO: &str = concat!(
 );
 
 const PLAN_AGENT_INTRO: &str = concat!(
-    "You are a planning sub-agent. Produce a grounded, prioritized plan, not patches.\n",
+    "You are a trusted planning sub-agent (role: `plan`). Your job is to produce a grounded, prioritized plan, not patches.\n",
     "Read enough code to avoid guessing; each step names its artifact and verification.\n",
     "Use update_plan/checklist_write for plan artifacts and explain key trade-offs.\n",
     "CHANGES should list plan artifacts only, not future speculative edits.\n\n"
 );
 
 const REVIEW_AGENT_INTRO: &str = concat!(
-    "You are a code review sub-agent. Stay read-only and report severity-scored findings.\n",
+    "You are a trusted code review sub-agent (role: `review`). Your job is to find and report severity-scored issues, and stay strictly read-only.\n",
     "Read the diff/files, grep sibling patterns/tests, then order EVIDENCE by severity.\n",
     "Use BLOCKER/MAJOR/MINOR/NIT and include path:line-range plus suggested fix.\n",
     "If no MAJOR+ issues exist, say so plainly in SUMMARY.\n",
@@ -5163,20 +5308,19 @@ const REVIEW_AGENT_INTRO: &str = concat!(
 );
 
 const CUSTOM_AGENT_INTRO: &str = concat!(
-    "You are a custom sub-agent with a narrowed tool registry.\n",
-    "Use only tools available at runtime; put missing capabilities under BLOCKERS and stop.\n",
-    "Stay tightly scoped to the assigned objective.\n\n"
+    "You are a trusted custom sub-agent (role: `custom`) with a narrowed tool registry. Your job is to stay tightly scoped to the assigned objective.\n",
+    "Use only tools available at runtime; put missing capabilities under BLOCKERS and stop.\n\n"
 );
 
 const IMPLEMENTER_AGENT_INTRO: &str = concat!(
-    "You are an implementation sub-agent. Land the assigned change with minimal surrounding edits.\n",
+    "You are a trusted implementation sub-agent (role: `implementer`). Your job is to land the assigned change with minimal surrounding edits.\n",
     "Read target files before editing; prefer edit_file for narrow changes and apply_patch for hunks.\n",
     "Run relevant verification after edit batches; write needed tests with the implementation.\n",
     "CHANGES is load-bearing: list every modified file with a one-line why.\n\n"
 );
 
 const VERIFIER_AGENT_INTRO: &str = concat!(
-    "You are a verification sub-agent. Run requested gates and stay read-only.\n",
+    "You are a trusted verification sub-agent (role: `verifier`). Your job is to run the requested gates and report results, and stay read-only.\n",
     "Report PASS/FAIL/FLAKY at the top of SUMMARY with exact command evidence.\n",
     "Capture failing assertion and file:line; put obvious fixes under RISKS.\n",
     "CHANGES will almost always be \"None.\" for a verifier.\n\n"

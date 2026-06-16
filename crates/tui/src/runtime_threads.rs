@@ -2099,7 +2099,7 @@ impl RuntimeThreadManager {
             show_thinking: settings.show_thinking,
             max_steps: 100,
             max_subagents: self.config.max_subagents().clamp(1, MAX_SUBAGENTS),
-            interactive_launch_limit: self.config.interactive_launch_limit(),
+            launch_concurrency: self.config.launch_concurrency(),
             features: self.config.features(),
             compaction,
             todos: new_shared_todo_list(),

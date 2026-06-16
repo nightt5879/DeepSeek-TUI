@@ -6498,7 +6498,7 @@ async fn run_exec_agent(
         show_thinking: settings.show_thinking,
         max_steps: max_turns,
         max_subagents,
-        interactive_launch_limit: execution_config.interactive_launch_limit(),
+        launch_concurrency: execution_config.launch_concurrency(),
         features: execution_config.features(),
         compaction,
         todos: new_shared_todo_list(),

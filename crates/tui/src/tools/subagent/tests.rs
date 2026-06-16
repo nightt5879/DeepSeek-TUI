@@ -1042,6 +1042,68 @@ fn test_custom_agent_requires_allowed_tools() {
 }
 
 #[test]
+fn role_posture_blocks_writes_and_shell_for_read_only_roles() {
+    // #3217: read-only roles may never run write/edit/patch tools, regardless
+    // of parent auto-approval, but can always read.
+    for role in [
+        SubAgentType::Explore,
+        SubAgentType::Review,
+        SubAgentType::Plan,
+        SubAgentType::Verifier,
+    ] {
+        assert!(
+            !role_posture_permits(&role, ApprovalRequirement::Suggest),
+            "{role:?} must not run write/edit/patch tools"
+        );
+        assert!(
+            role_posture_permits(&role, ApprovalRequirement::Auto),
+            "{role:?} can still read"
+        );
+    }
+
+    // Write-capable roles keep write access.
+    for role in [SubAgentType::Implementer, SubAgentType::General] {
+        assert!(
+            role_posture_permits(&role, ApprovalRequirement::Suggest),
+            "{role:?} writes"
+        );
+    }
+
+    // Only Full-shell roles may run shell (Required) tools.
+    for role in [
+        SubAgentType::Verifier,
+        SubAgentType::Implementer,
+        SubAgentType::General,
+    ] {
+        assert!(
+            role_posture_permits(&role, ApprovalRequirement::Required),
+            "{role:?} has full shell"
+        );
+    }
+    for role in [
+        SubAgentType::Plan,
+        SubAgentType::Explore,
+        SubAgentType::Review,
+    ] {
+        assert!(
+            !role_posture_permits(&role, ApprovalRequirement::Required),
+            "{role:?} must not run shell tools"
+        );
+    }
+
+    // Custom is governed by its explicit allowed_tools list, so the posture
+    // check permits it (the allowlist is the authority for that role).
+    assert!(role_posture_permits(
+        &SubAgentType::Custom,
+        ApprovalRequirement::Suggest
+    ));
+    assert!(role_posture_permits(
+        &SubAgentType::Custom,
+        ApprovalRequirement::Required
+    ));
+}
+
+#[test]
 fn test_build_assignment_prompt_includes_metadata() {
     let assignment = SubAgentAssignment::new(
         "Inspect parser behavior".to_string(),
@@ -1887,10 +1949,12 @@ fn build_subagent_system_prompt_appends_role_when_set() {
     let assignment = SubAgentAssignment::new("p".to_string(), Some("worker".to_string()));
     let prompt = build_subagent_system_prompt(&SubAgentType::General, &assignment);
     assert!(
-        prompt.ends_with("You are operating in the role of `worker`."),
-        "expected role line at end, got: {}",
-        &prompt[prompt.len().saturating_sub(80)..]
+        prompt.contains("You are operating in the role of `worker`."),
+        "expected role line present, got: {}",
+        &prompt[prompt.len().saturating_sub(160)..]
     );
+    // The shared background-worker / caller framing follows the role line.
+    assert!(prompt.contains("background sub-agent"));
 }
 
 #[test]
@@ -2189,12 +2253,47 @@ async fn explore_role_still_blocks_suggest_writes_without_parent_auto_approve() 
         .expect_err("explore agents must not write");
     let msg = err.to_string();
     assert!(
-        msg.contains("not delegated to explore sub-agents"),
+        msg.contains("explore") && msg.contains("not permitted"),
         "explore writes should be rejected with a role-aware message: {msg}"
     );
     assert!(
         !tmp.path().join("should_not_appear.txt").exists(),
         "file must not have been written"
+    );
+}
+
+#[tokio::test]
+async fn explore_role_blocks_writes_even_under_parent_auto_approve() {
+    // #3217: the authoritative per-role posture closes the auto-approve bypass —
+    // a read-only role cannot mutate the workspace even when the parent session
+    // is auto-approved.
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = stub_runtime();
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    runtime.context.auto_approve = true;
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::Explore,
+        None,
+        Arc::new(Mutex::new(TodoList::new())),
+        Arc::new(Mutex::new(PlanState::default())),
+    );
+
+    let err = registry
+        .execute(
+            "agent_test",
+            "write_file",
+            json!({"path": "nope.txt", "content": "denied"}),
+        )
+        .await
+        .expect_err("explore must not write even under parent auto-approve");
+    assert!(
+        err.to_string().contains("not permitted"),
+        "expected posture rejection, got: {err}"
+    );
+    assert!(
+        !tmp.path().join("nope.txt").exists(),
+        "file must not have been written under auto-approve"
     );
 }
 
@@ -3229,26 +3328,22 @@ fn format_step_counter_keeps_concrete_budgets() {
     assert_eq!(format_step_counter(0, 1), "step 0/1");
 }
 
-// ── #3095: interactive fanout launch gate ────────────────────────────────────
+// ── #3095: sub-agent launch gate ─────────────────────────────────────────────
 
 #[test]
-fn launch_gate_defaults_to_interactive_limit_capped_by_max_agents() {
+fn launch_gate_defaults_to_launch_concurrency_capped_by_max_agents() {
     let tmp = tempdir().expect("tempdir");
     let manager = SubAgentManager::new(tmp.path().to_path_buf(), 10);
-    assert_eq!(
-        manager.launch_gate.available_permits(),
-        crate::config::DEFAULT_INTERACTIVE_LAUNCH_LIMIT
-    );
+    // Unset launch concurrency now seeds the gate to the full agent cap.
+    assert_eq!(manager.launch_gate.available_permits(), 10);
 
     let small = SubAgentManager::new(tmp.path().to_path_buf(), 2);
     assert_eq!(small.launch_gate.available_permits(), 2);
 
-    let custom =
-        SubAgentManager::new(tmp.path().to_path_buf(), 10).with_interactive_launch_limit(0);
+    let custom = SubAgentManager::new(tmp.path().to_path_buf(), 10).with_launch_concurrency(0);
     assert_eq!(custom.launch_gate.available_permits(), 1, "clamps up to 1");
 
-    let oversized =
-        SubAgentManager::new(tmp.path().to_path_buf(), 3).with_interactive_launch_limit(99);
+    let oversized = SubAgentManager::new(tmp.path().to_path_buf(), 3).with_launch_concurrency(99);
     assert_eq!(
         oversized.launch_gate.available_permits(),
         3,
@@ -3257,7 +3352,7 @@ fn launch_gate_defaults_to_interactive_limit_capped_by_max_agents() {
 }
 
 #[tokio::test]
-async fn interactive_launch_gate_queues_extra_direct_children() {
+async fn launch_gate_queues_extra_direct_children() {
     use tokio::sync::Semaphore;
     use tokio_util::sync::CancellationToken;
 

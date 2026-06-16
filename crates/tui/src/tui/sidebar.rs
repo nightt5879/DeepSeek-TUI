@@ -68,22 +68,10 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 /// Build the Auto-mode panel stack. Empty panels collapse to zero height so
-/// non-empty ones get the full sidebar real estate. Work appears when it has
+/// non-empty ones get the full sidebar real estate. To-do appears when it has
 /// useful content, or as the one quiet empty state when nothing else is active.
 fn render_sidebar_auto(f: &mut Frame, area: Rect, app: &mut App) {
-    let work_has_content = sidebar_work_summary(app).has_useful_content();
-    let tasks_empty = app.runtime_turn_id.is_none() && app.task_panel.is_empty();
-    let agents_empty = app.subagent_cache.is_empty()
-        && app.agent_progress.is_empty()
-        && active_fanout_counts(app).is_none()
-        && !foreground_rlm_running(app);
-
-    let visible = auto_sidebar_panels(AutoSidebarState {
-        work_has_content,
-        tasks_empty,
-        agents_empty,
-        context_enabled: app.context_panel,
-    });
+    let visible = auto_sidebar_panels(auto_sidebar_state(app));
 
     let constraints: Vec<Constraint> = match visible.len() {
         1 => vec![Constraint::Min(0)],
@@ -121,6 +109,37 @@ fn render_sidebar_auto(f: &mut Frame, area: Rect, app: &mut App) {
             AutoSidebarPanel::Context => render_context_panel(f, *rect, app),
         }
     }
+}
+
+/// Compute the Auto-mode panel signals. Shared by `render_sidebar_auto` (which
+/// panel boxes to show) and `sidebar_auto_idle` (whether to collapse the whole
+/// sidebar to a full-width transcript). Content-gated: the jobs/tasks panel
+/// appears only when there are real durable tasks or background shell jobs,
+/// never merely because a turn is in flight.
+fn auto_sidebar_state(app: &mut App) -> AutoSidebarState {
+    AutoSidebarState {
+        work_has_content: sidebar_work_summary(app).has_useful_content(),
+        tasks_empty: app.task_panel.is_empty(),
+        agents_empty: app.subagent_cache.is_empty()
+            && app.agent_progress.is_empty()
+            && active_fanout_counts(app).is_none()
+            && !foreground_rlm_running(app),
+        context_enabled: app.context_panel,
+    }
+}
+
+/// Auto-reveal: in Auto focus mode the sidebar collapses to nothing when there
+/// is no active content (no To-do, no live/queued fleet, no background jobs, no
+/// pinned context), so an idle session gets a full-width transcript. Any active
+/// content brings it back; completed agents linger in the cache as a natural
+/// grace before it retracts. Explicit panel focus and Hidden bypass this (the
+/// former should always show, the latter is handled by the width helper).
+pub(crate) fn sidebar_auto_idle(app: &mut App) -> bool {
+    if app.sidebar_focus != SidebarFocus::Auto {
+        return false;
+    }
+    let state = auto_sidebar_state(app);
+    !state.work_has_content && state.tasks_empty && state.agents_empty && !state.context_enabled
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -846,7 +865,7 @@ fn render_sidebar_work(f: &mut Frame, area: Rect, app: &mut App) {
     );
 
     let full_texts = work_panel_hover_texts(&summary, content_width.max(1), usable_rows);
-    render_sidebar_section(f, area, "Work", lines, full_texts, Vec::new(), app);
+    render_sidebar_section(f, area, "To-do", lines, full_texts, Vec::new(), app);
 }
 
 /// Click actions for one background job row pair (#3028).

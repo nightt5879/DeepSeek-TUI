@@ -271,9 +271,9 @@ pub struct EngineConfig {
     /// Maximum number of concurrently active subagents.
     pub max_subagents: usize,
     /// Number of direct (depth-1) sub-agents that may execute concurrently
-    /// before further interactive fanout launches queue for a slot (#3095).
-    /// Resolved from `[subagents] interactive_max_launch`.
-    pub interactive_launch_limit: usize,
+    /// before further launches queue for a launch slot (#3095).
+    /// Resolved from `[subagents] launch_concurrency`.
+    pub launch_concurrency: usize,
     /// Feature flags controlling tool availability.
     pub features: Features,
     /// Auto-compaction settings for long conversations.
@@ -387,7 +387,7 @@ impl Default for EngineConfig {
             show_thinking: true,
             max_steps: 100,
             max_subagents: DEFAULT_MAX_SUBAGENTS,
-            interactive_launch_limit: crate::config::DEFAULT_INTERACTIVE_LAUNCH_LIMIT,
+            launch_concurrency: DEFAULT_MAX_SUBAGENTS,
             features: Features::with_defaults(),
             compaction: CompactionConfig::default(),
             todos: new_shared_todo_list(),
@@ -818,7 +818,7 @@ impl Engine {
             config.workspace.clone(),
             config.max_subagents,
             config.subagent_heartbeat_timeout,
-            config.interactive_launch_limit,
+            config.launch_concurrency,
         );
         let shell_manager = config
             .runtime_services
@@ -1503,6 +1503,13 @@ impl Engine {
                     break;
                 }
             }
+        }
+
+        // #freeze: flush any sub-agent checkpoint that the hot-path debounce
+        // coalesced away, so a graceful shutdown keeps the latest progress.
+        {
+            let mut manager = self.subagent_manager.write().await;
+            manager.flush_pending_persist();
         }
 
         // #420: graceful MCP shutdown — send SIGTERM and give stdio servers

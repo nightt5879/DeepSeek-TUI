@@ -18,13 +18,8 @@ use crate::audit::log_sensitive_event;
 use crate::features::{Features, FeaturesToml, is_known_feature_key};
 use crate::hooks::HooksConfig;
 
-pub const DEFAULT_MAX_SUBAGENTS: usize = 10;
+pub const DEFAULT_MAX_SUBAGENTS: usize = 20;
 pub const MAX_SUBAGENTS: usize = 20;
-/// Default number of direct (depth-1) sub-agents that may execute
-/// concurrently in an interactive session before further launches queue
-/// for a slot (#3095). Deliberately lower than `DEFAULT_MAX_SUBAGENTS`,
-/// which caps total live agents across the whole spawn tree.
-pub const DEFAULT_INTERACTIVE_LAUNCH_LIMIT: usize = 4;
 /// Default per-step DeepSeek API timeout for sub-agent requests, in seconds.
 /// Matches the legacy hardcoded value so existing configs keep their old
 /// behavior when `[subagents] api_timeout_secs` is unset (#1806, #1808).
@@ -1715,11 +1710,15 @@ pub struct SubagentsConfig {
     #[serde(default)]
     pub max_concurrent: Option<usize>,
     /// Number of direct (depth-1) sub-agents that may execute concurrently
-    /// before further interactive fanout launches queue for a slot (#3095).
-    /// Defaults to `DEFAULT_INTERACTIVE_LAUNCH_LIMIT` (4) and is clamped to
-    /// [1, max_subagents].
+    /// before further launches queue for a launch slot (#3095). When unset,
+    /// defaults to the full resolved `max_subagents()` (no artificial
+    /// throttle); explicit values are clamped to [1, max_subagents].
     #[serde(default)]
-    pub interactive_max_launch: Option<usize>,
+    pub launch_concurrency: Option<usize>,
+    /// Deprecated pre-v0.8.61 alias for `launch_concurrency`. Honored only
+    /// when `launch_concurrency` is unset, so the new key always wins.
+    #[serde(default, rename = "interactive_max_launch")]
+    pub interactive_max_launch_legacy: Option<usize>,
     /// Per-step DeepSeek API timeout for sub-agent requests, in seconds. The
     /// timeout wraps `client.create_message` so a stuck single step cannot
     /// pin the parent's parent-completion wakeup channel indefinitely.
@@ -3196,17 +3195,19 @@ impl Config {
     }
 
     /// Number of direct (depth-1) sub-agents that may execute concurrently
-    /// before further interactive fanout launches queue for a slot (#3095).
-    /// Reads `[subagents] interactive_max_launch`, defaults to
-    /// `DEFAULT_INTERACTIVE_LAUNCH_LIMIT`, and clamps to
-    /// `[1, max_subagents]`.
+    /// before further launches queue for a launch slot (#3095). Reads
+    /// `[subagents] launch_concurrency` (or the deprecated
+    /// `interactive_max_launch` alias); when unset it defaults to the full
+    /// resolved `max_subagents()` (no artificial throttle), and any explicit
+    /// value is clamped to `[1, max_subagents]`.
     #[must_use]
-    pub fn interactive_launch_limit(&self) -> usize {
+    pub fn launch_concurrency(&self) -> usize {
+        let max = self.max_subagents();
         self.subagents
             .as_ref()
-            .and_then(|cfg| cfg.interactive_max_launch)
-            .unwrap_or(DEFAULT_INTERACTIVE_LAUNCH_LIMIT)
-            .clamp(1, self.max_subagents())
+            .and_then(|cfg| cfg.launch_concurrency.or(cfg.interactive_max_launch_legacy))
+            .unwrap_or(max)
+            .clamp(1, max)
     }
 
     /// Resolved per-step DeepSeek API timeout for sub-agents, in seconds.
@@ -7237,38 +7238,73 @@ action = "session.compact"
     }
 
     #[test]
-    fn max_subagents_defaults_to_ten() {
+    fn max_subagents_defaults_to_twenty() {
         assert_eq!(Config::default().max_subagents(), DEFAULT_MAX_SUBAGENTS);
-        assert_eq!(DEFAULT_MAX_SUBAGENTS, 10);
+        assert_eq!(DEFAULT_MAX_SUBAGENTS, 20);
     }
 
     #[test]
-    fn interactive_launch_limit_defaults_and_clamps_to_max_subagents() {
+    fn launch_concurrency_defaults_and_clamps_to_max_subagents() {
+        // Unset launch_concurrency now defaults to the full resolved cap.
         assert_eq!(
-            Config::default().interactive_launch_limit(),
-            DEFAULT_INTERACTIVE_LAUNCH_LIMIT
+            Config::default().launch_concurrency(),
+            Config::default().max_subagents()
         );
 
         let mut config = Config {
             subagents: Some(SubagentsConfig {
-                interactive_max_launch: Some(50),
+                launch_concurrency: Some(50),
                 ..SubagentsConfig::default()
             }),
             ..Config::default()
         };
-        assert_eq!(config.interactive_launch_limit(), config.max_subagents());
+        assert_eq!(config.launch_concurrency(), config.max_subagents());
 
         config.subagents = Some(SubagentsConfig {
-            interactive_max_launch: Some(0),
+            launch_concurrency: Some(0),
             ..SubagentsConfig::default()
         });
-        assert_eq!(config.interactive_launch_limit(), 1);
+        assert_eq!(config.launch_concurrency(), 1);
 
         config.subagents = Some(SubagentsConfig {
-            interactive_max_launch: Some(2),
+            launch_concurrency: Some(2),
             ..SubagentsConfig::default()
         });
-        assert_eq!(config.interactive_launch_limit(), 2);
+        assert_eq!(config.launch_concurrency(), 2);
+    }
+
+    #[test]
+    fn launch_concurrency_honors_deprecated_interactive_max_launch_alias() {
+        // The old TOML key `interactive_max_launch` still deserializes, via
+        // #[serde(rename)], into the hidden legacy field, and the resolver
+        // honors it when the new key is unset.
+        let cfg: SubagentsConfig =
+            toml::from_str("interactive_max_launch = 5").expect("parse legacy key");
+        assert_eq!(cfg.interactive_max_launch_legacy, Some(5));
+        assert_eq!(cfg.launch_concurrency, None);
+
+        let config = Config {
+            subagents: Some(cfg),
+            ..Config::default()
+        };
+        assert_eq!(config.launch_concurrency(), 5);
+    }
+
+    #[test]
+    fn launch_concurrency_new_key_wins_over_deprecated_alias() {
+        // When both keys are present the new `launch_concurrency` wins
+        // deterministically, regardless of document order.
+        let cfg: SubagentsConfig =
+            toml::from_str("launch_concurrency = 3\ninteractive_max_launch = 7")
+                .expect("parse both keys");
+        assert_eq!(cfg.launch_concurrency, Some(3));
+        assert_eq!(cfg.interactive_max_launch_legacy, Some(7));
+
+        let config = Config {
+            subagents: Some(cfg),
+            ..Config::default()
+        };
+        assert_eq!(config.launch_concurrency(), 3);
     }
 
     #[test]
