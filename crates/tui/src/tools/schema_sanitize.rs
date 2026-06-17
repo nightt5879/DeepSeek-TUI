@@ -1000,28 +1000,60 @@ pub fn sanitize_for_kimi(schema: &mut serde_json::Value) {
 
 /// Normalize a complete Kimi / Moonshot `function.parameters` object.
 ///
-/// This is root-only because recursively injecting `type: object` into every
-/// empty object would corrupt JSON Schema maps such as `"properties": {}`.
-/// The existing Kimi pass still handles nested `anyOf` / `oneOf` placement.
+/// Kimi / Moonshot requires `"type": "object"` on the parameters root
+/// regardless of whether the schema uses `properties`, `$ref`, `anyOf`,
+/// `allOf`, or `oneOf`.  We run `sanitize_for_kimi` first so nested
+/// `anyOf` / `oneOf` handling is correct, then unconditionally ensure
+/// `type: object` is present at the root (#3281).
+///
+/// This is root-only because recursively injecting `type: object` into
+/// every empty object would corrupt JSON Schema maps such as
+/// `"properties": {}`.
 pub fn sanitize_for_kimi_parameters(parameters: &mut serde_json::Value) {
     if !parameters.is_object() {
         *parameters = serde_json::Value::Object(Map::new());
     }
 
-    if let Some(obj) = parameters.as_object_mut() {
-        let root_object_schema = obj.is_empty()
-            || obj.contains_key("properties")
-            || obj.contains_key("required")
-            || obj.contains_key("additionalProperties");
-        if root_object_schema && !obj.contains_key("type") {
+    // Run the generic Kimi pass first so nested `anyOf` / `oneOf` receive
+    // their `type` from the parent *before* we re-add it at the root.
+    sanitize_for_kimi(parameters);
+
+    // Always ensure `type: object` at the parameters root.  Kimi/Moonshot
+    // rejects any parameters schema missing it (#3265, #3281).
+    //
+    // For bare `$ref` schemas (e.g. `{"$ref": "#/definitions/FileArgs"}`),
+    // we cannot add a sibling `type` because JSON Schema forbids sibling
+    // keywords alongside `$ref`.  Instead we wrap the $ref in an `allOf`
+    // array and inject `type: object` at the root — a standard JSON Schema
+    // pattern that preserves the $ref semantics.
+    if let Some(obj) = parameters.as_object_mut()
+        && !obj.contains_key("type")
+    {
+        if let Some(ref_val) = obj.remove("$ref") {
+            let mut new_root = serde_json::Map::new();
+            new_root.insert(
+                "type".to_string(),
+                serde_json::Value::String("object".to_string()),
+            );
+            new_root.insert(
+                "allOf".to_string(),
+                serde_json::Value::Array(vec![serde_json::json!({"$ref": ref_val})]),
+            );
+            // Preserve any other keys the original object may have had
+            // (e.g. "description") in the new root.
+            for (k, v) in obj.iter() {
+                if k != "$ref" {
+                    new_root.insert(k.clone(), v.clone());
+                }
+            }
+            *obj = new_root;
+        } else {
             obj.insert(
                 "type".to_string(),
                 serde_json::Value::String("object".to_string()),
             );
         }
     }
-
-    sanitize_for_kimi(parameters);
 }
 
 #[cfg(test)]
@@ -1131,5 +1163,58 @@ mod kimi_tests {
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["path"]["type"], "string");
         assert!(schema["properties"].get("type").is_none());
+    }
+
+    // #3281: root schemas using $ref, allOf, anyOf, oneOf must also
+    // receive type: object so Kimi/Moonshot does not reject them.
+
+    #[test]
+    fn kimi_parameters_add_type_to_anyof_root() {
+        let mut schema = json!({
+            "anyOf": [
+                {"type": "object", "properties": {"path": {"type": "string"}}},
+                {"type": "null"}
+            ]
+        });
+        sanitize_for_kimi_parameters(&mut schema);
+        assert_eq!(schema["type"], "object");
+        assert!(schema["anyOf"].is_array());
+    }
+
+    #[test]
+    fn kimi_parameters_add_type_to_allof_root() {
+        let mut schema = json!({
+            "allOf": [
+                {"type": "object", "properties": {"name": {"type": "string"}}}
+            ]
+        });
+        sanitize_for_kimi_parameters(&mut schema);
+        assert_eq!(schema["type"], "object");
+        assert!(schema["allOf"].is_array());
+    }
+
+    #[test]
+    fn kimi_parameters_add_type_to_oneof_root() {
+        let mut schema = json!({
+            "oneOf": [
+                {"type": "object", "properties": {"id": {"type": "integer"}}},
+                {"type": "object", "properties": {"name": {"type": "string"}}}
+            ]
+        });
+        sanitize_for_kimi_parameters(&mut schema);
+        assert_eq!(schema["type"], "object");
+        assert!(schema["oneOf"].is_array());
+    }
+
+    #[test]
+    fn kimi_parameters_wraps_ref_in_allof_with_type_object() {
+        let mut schema = json!({"$ref": "#/definitions/FileArgs"});
+        sanitize_for_kimi_parameters(&mut schema);
+        // $ref cannot have sibling keywords per JSON Schema, so we wrap
+        // it in allOf and inject type: object at the root (#3281).
+        assert_eq!(schema["type"], "object");
+        assert!(schema["allOf"].is_array());
+        assert_eq!(schema["allOf"][0]["$ref"], "#/definitions/FileArgs");
+        assert!(schema.get("$ref").is_none());
     }
 }
