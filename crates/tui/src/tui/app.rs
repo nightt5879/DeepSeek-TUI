@@ -1739,6 +1739,14 @@ pub struct App {
     /// thinking into the active cell so it groups visually with tool calls
     /// until the next assistant prose chunk flushes the group into history.
     pub streaming_thinking_active_entry: Option<usize>,
+    /// Instant of the last throttled active-cell revision bump for the
+    /// in-flight thinking stream (#1620). Reasoning chunks arrive faster than
+    /// the eye can read, and each bump invalidates the active cell's wrap
+    /// cache, forcing a full re-wrap. We debounce intermediate bumps to a
+    /// time window so high-frequency thinking deltas no longer trigger a
+    /// re-render per character. `None` means "no bump since the last
+    /// finalize" so the first chunk of a block always renders immediately.
+    pub thinking_revision_last_bump_at: Option<Instant>,
     /// Newline-gated streaming collector state.
     pub streaming_state: StreamingState,
     /// Live approximate output tokens for the current assistant stream.
@@ -2469,6 +2477,7 @@ impl App {
             streaming_message_index: None,
             suppress_stream_events_until_turn_complete: false,
             streaming_thinking_active_entry: None,
+            thinking_revision_last_bump_at: None,
             streaming_state: StreamingState::new(),
             streaming_output_token_estimate: 0,
             reasoning_buffer: String::new(),
