@@ -58,7 +58,8 @@ COPY . .
 RUN --mount=type=cache,id=codewhale-target-${TARGETARCH},target=/build/target,sharing=locked \
     --mount=type=cache,id=codewhale-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=codewhale-cargo-git-${TARGETARCH},target=/usr/local/cargo/git,sharing=locked \
-    cargo build --release --locked --target "$(cat /rust-target)" \
+    rustup target add "$(cat /rust-target)" \
+    && cargo build --release --locked --target "$(cat /rust-target)" \
       -p codewhale-cli -p codewhale-tui \
     && mkdir -p /out \
     && cp target/$(cat /rust-target)/release/codewhale /out/ \
