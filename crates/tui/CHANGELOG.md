@@ -32,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `codewhale app-server --host 0.0.0.0` now fails fast unless an explicit
   `--auth-token` or `CODEWHALE_APP_SERVER_TOKEN` is supplied, keeping generated
   one-time `cwapp_*` tokens loopback-only.
+- **Legacy `.deepseek` state write-path migration (#3240).** State subdirectories
+  (`sessions`, `slop_ledger`, `trophies`, `catalog`) are now always written under
+  `~/.codewhale/`, and the first write of a subdir relocates any pre-existing
+  `~/.deepseek/<sub>` contents into the primary location so the legacy tree stops
+  growing while old data is preserved. The read resolver still finds legacy data
+  for backfill until each subdir migrates. Reported on Windows where both trees
+  were being created.
 
 ## [0.8.62] - 2026-06-17
 
