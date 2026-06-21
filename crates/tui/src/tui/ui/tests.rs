@@ -333,6 +333,34 @@ fn composer_newline_shortcuts_do_not_steal_ctrl_enter() {
     )));
 }
 
+#[test]
+fn forced_submit_accepts_ctrl_enter_and_ctrl_j_encodings() {
+    assert!(is_forced_submit_key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::CONTROL,
+    )));
+    assert!(is_forced_submit_key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    )));
+    assert!(is_forced_submit_key(KeyEvent::new(
+        KeyCode::Char('j'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(is_forced_submit_key(KeyEvent::new(
+        KeyCode::Char('J'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    )));
+    assert!(!is_forced_submit_key(KeyEvent::new(
+        KeyCode::Char('j'),
+        KeyModifiers::ALT | KeyModifiers::CONTROL,
+    )));
+    assert!(!is_forced_submit_key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::ALT,
+    )));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn cmd_enter_normalizes_to_control_enter_not_newline() {
@@ -3716,14 +3744,14 @@ fn ctrl_alt_0_hides_sidebar() {
 }
 
 #[test]
-fn ctrl_alt_0_restores_auto_sidebar_when_already_hidden() {
+fn ctrl_alt_0_restores_pinned_sidebar_when_already_hidden() {
     let mut app = create_test_app();
     app.sidebar_focus = SidebarFocus::Hidden;
 
     apply_alt_0_shortcut(&mut app, KeyModifiers::ALT | KeyModifiers::CONTROL);
 
-    assert_eq!(app.sidebar_focus, SidebarFocus::Auto);
-    assert_eq!(app.status_message.as_deref(), Some("Sidebar focus: auto"));
+    assert_eq!(app.sidebar_focus, SidebarFocus::Pinned);
+    assert_eq!(app.status_message.as_deref(), Some("Sidebar focus: pinned"));
 }
 
 #[test]
@@ -3745,11 +3773,47 @@ fn hidden_sidebar_focus_suppresses_sidebar_split_even_when_wide() {
     let mut app = create_test_app();
     app.sidebar_width_percent = 28;
 
-    app.sidebar_focus = SidebarFocus::Auto;
+    app.sidebar_focus = SidebarFocus::Pinned;
     assert_eq!(sidebar_width_for_chat_area(&app, 120), Some(33));
 
     app.sidebar_focus = SidebarFocus::Hidden;
     assert_eq!(sidebar_width_for_chat_area(&app, 120), None);
+}
+
+#[test]
+fn sidebar_width_gate_suppresses_visible_focus_when_narrow() {
+    let mut app = create_test_app();
+    app.sidebar_focus = SidebarFocus::Pinned;
+    app.last_sidebar_host_width = Some(80);
+
+    assert_eq!(
+        sidebar_render_state(&mut app),
+        SidebarRenderState::SuppressedByWidth {
+            available_width: 80,
+            min_width: SIDEBAR_VISIBLE_MIN_WIDTH,
+        }
+    );
+}
+
+#[test]
+fn pinned_sidebar_is_visible_when_idle_and_wide() {
+    let mut app = create_test_app();
+    app.sidebar_focus = SidebarFocus::Pinned;
+    app.last_sidebar_host_width = Some(120);
+
+    assert_eq!(sidebar_render_state(&mut app), SidebarRenderState::Visible);
+}
+
+#[test]
+fn auto_sidebar_status_reports_idle_collapse_when_wide() {
+    let mut app = create_test_app();
+    app.sidebar_focus = SidebarFocus::Auto;
+    app.last_sidebar_host_width = Some(120);
+
+    assert_eq!(
+        sidebar_render_state(&mut app),
+        SidebarRenderState::AutoCollapsed
+    );
 }
 
 #[test]
@@ -3827,6 +3891,70 @@ fn jobs_panel_ignores_model_reasoning_but_shows_for_real_jobs() {
         !crate::tui::sidebar::sidebar_auto_idle(&mut app),
         "a live background job must surface the jobs panel"
     );
+}
+
+#[test]
+fn ctrl_x_jobs_prefill_only_catches_running_shell_jobs_in_tasks_sidebar() {
+    let mut app = create_test_app();
+    app.sidebar_focus = SidebarFocus::Tasks;
+    app.input = "draft".to_string();
+    app.cursor_position = app.input.len();
+    app.task_panel.push(TaskPanelEntry {
+        id: "shell_active".to_string(),
+        status: "running".to_string(),
+        prompt_summary: "shell: cargo test".to_string(),
+        duration_ms: Some(10),
+        kind: TaskPanelEntryKind::Background,
+        stale: false,
+        elapsed_since_output_ms: None,
+    });
+
+    assert!(prefill_jobs_cancel_all_if_tasks_sidebar(&mut app));
+    assert_eq!(app.input, "/jobs cancel-all");
+    assert_eq!(app.cursor_position, app.input.len());
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Press Enter to cancel all running commands")
+    );
+}
+
+#[test]
+fn ctrl_x_jobs_prefill_falls_through_outside_tasks_sidebar_shell_jobs() {
+    let mut non_shell = create_test_app();
+    non_shell.sidebar_focus = SidebarFocus::Tasks;
+    non_shell.input = "draft".to_string();
+    non_shell.cursor_position = non_shell.input.len();
+    non_shell.task_panel.push(TaskPanelEntry {
+        id: "task_active".to_string(),
+        status: "running".to_string(),
+        prompt_summary: "summarize the release notes".to_string(),
+        duration_ms: Some(10),
+        kind: TaskPanelEntryKind::Background,
+        stale: false,
+        elapsed_since_output_ms: None,
+    });
+
+    assert!(!prefill_jobs_cancel_all_if_tasks_sidebar(&mut non_shell));
+    assert_eq!(non_shell.input, "draft");
+
+    let mut other_sidebar = create_test_app();
+    other_sidebar.sidebar_focus = SidebarFocus::Agents;
+    other_sidebar.input = "draft".to_string();
+    other_sidebar.cursor_position = other_sidebar.input.len();
+    other_sidebar.task_panel.push(TaskPanelEntry {
+        id: "shell_active".to_string(),
+        status: "running".to_string(),
+        prompt_summary: "shell: cargo test".to_string(),
+        duration_ms: Some(10),
+        kind: TaskPanelEntryKind::Background,
+        stale: false,
+        elapsed_since_output_ms: None,
+    });
+
+    assert!(!prefill_jobs_cancel_all_if_tasks_sidebar(
+        &mut other_sidebar
+    ));
+    assert_eq!(other_sidebar.input, "draft");
 }
 
 // ── Sidebar resize-handle mouse tests ──────────────────────────────
@@ -10664,8 +10792,9 @@ fn agent_progress_redraw_coalesces_once_per_agent_per_drain() {
 
 #[test]
 fn six_worker_progress_storm_keeps_input_render_and_cancel_live() {
+    let max_engine_events_per_drain = MAX_ENGINE_EVENTS_PER_DRAIN;
     assert!(
-        MAX_ENGINE_EVENTS_PER_DRAIN <= 128,
+        max_engine_events_per_drain <= 128,
         "engine event drains must stay bounded so high sub-agent fanout cannot monopolize the UI tick"
     );
 

@@ -10,6 +10,7 @@ Bindings are not (yet) user-configurable — tracked for a future release (#436,
 |----------------------|---------------------------------------------------------------|
 | `F1` or `Ctrl-/`     | Toggle the help overlay                                       |
 | `Ctrl-K`             | Open the command palette (slash-command finder)                |
+| `Ctrl-X`             | Cancel all running background shell jobs when the Tasks sidebar is focused |
 | `Ctrl-C`             | Cancel current turn / dismiss modal / arm-then-confirm quit    |
 | `Ctrl-B`             | Background the running foreground shell command (turn continues; the command becomes a `/jobs` background job) |
 | `Ctrl-D`             | Quit (only when the composer is empty)                         |
@@ -20,8 +21,8 @@ Bindings are not (yet) user-configurable — tracked for a future release (#436,
 | `Ctrl-O`             | Open Activity Detail for selected/live/recent tool work, or the full reasoning timeline for thinking blocks when the composer is empty |
 | `Ctrl-Shift-E` / `Cmd-Shift-E` | Toggle the file-tree sidebar                          |
 | `Alt-G`              | Scroll transcript to top when the composer is empty             |
-| `Alt-!` / `Alt-@` / `Alt-#` / `Alt-$` / `Alt-0` | Focus Work / Tasks / Agents / Context / Auto sidebar |
-| `Ctrl-Alt-0`         | Hide the right sidebar                                          |
+| `Alt-!` / `Alt-@` / `Alt-#` / `Alt-$` / `Alt-0` | Focus Pinned / Tasks / Agents / Context / Auto sidebar |
+| `Ctrl-Alt-0`         | Hide/show the pinned sidebar                                    |
 | `Esc`                | Close topmost modal · cancel slash menu · dismiss toast        |
 
 ## Composer
@@ -31,7 +32,8 @@ Editing the message you're about to send.
 | Chord                       | Action                                                  |
 |-----------------------------|---------------------------------------------------------|
 | `Enter`                     | Send the message (or run the slash command)             |
-| `Alt-Enter` / `Ctrl-J`      | Insert a newline without sending                        |
+| `Alt-Enter` / `Ctrl-J`      | Insert a newline without sending (`Ctrl-J` force-steers while a turn is running) |
+| `Ctrl-Enter` / `Cmd-Enter`  | Force a live steer into the current turn when supported by the terminal |
 | `Ctrl-U`                    | Delete to start of line                                 |
 | `Ctrl-W`                    | Delete previous word                                    |
 | `Ctrl-A` / `Home`           | Move to start of line                                   |
@@ -42,7 +44,7 @@ Editing the message you're about to send.
 | `Ctrl-Y`                    | Yank (paste) from kill buffer                           |
 | `↑` / `↓`                   | Cycle composer history (also selects popup/attachment items) |
 | `Ctrl-P` / `Ctrl-N`         | Cycle composer history (alternative)                     |
-| `Ctrl-S`                    | Stash current draft (`/stash list`, `/stash pop` to recover) |
+| `Ctrl-S`                    | Stash current draft; with queued follow-ups during a running turn, send the next queued item now |
 | `Alt-R`                    | Search prompt history (Alt-R to exit)                  |
 | `Tab`                       | Slash-command / `@`-mention completion (popup-aware)    |
 | `Ctrl-O`                    | Open external editor for the composer draft when it has focus |

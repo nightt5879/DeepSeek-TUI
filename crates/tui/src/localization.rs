@@ -426,6 +426,7 @@ pub enum MessageId {
     KbShellControls,
     KbExitEmpty,
     KbCommandPalette,
+    KbCancelBackgroundShellJobs,
     KbFuzzyFilePicker,
     KbCompactInspector,
     KbLastMessagePager,
@@ -869,6 +870,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::KbShellControls,
     MessageId::KbExitEmpty,
     MessageId::KbCommandPalette,
+    MessageId::KbCancelBackgroundShellJobs,
     MessageId::KbFuzzyFilePicker,
     MessageId::KbCompactInspector,
     MessageId::KbLastMessagePager,
@@ -1572,6 +1574,9 @@ fn english(id: MessageId) -> &'static str {
         MessageId::KbShellControls => "Background the running foreground shell command",
         MessageId::KbExitEmpty => "Exit when input is empty",
         MessageId::KbCommandPalette => "Open the command palette",
+        MessageId::KbCancelBackgroundShellJobs => {
+            "Cancel all running background shell jobs (Tasks sidebar)"
+        }
         MessageId::KbFuzzyFilePicker => "Open the fuzzy file picker (insert @path on Enter)",
         MessageId::KbCompactInspector => "Open compact session context inspector",
         MessageId::KbLastMessagePager => "Open pager for the last message (when input is empty)",
@@ -1590,7 +1595,7 @@ fn english(id: MessageId) -> &'static str {
         MessageId::KbJumpPlanAgentYolo => "Trigger hotbar slots",
         MessageId::KbAltJumpPlanAgentYolo => "Alternative jump to Plan / Agent / YOLO mode",
         MessageId::KbFocusSidebar => {
-            "Focus Work / Tasks / Agents / Context / Auto sidebar; Ctrl+Alt+0 hides it"
+            "Focus Pinned / Tasks / Agents / Context / Auto sidebar; Ctrl+Alt+0 toggles pinned sidebar"
         }
         MessageId::KbTogglePlanAgent => "Toggle between Plan and Agent modes",
         MessageId::KbSessionPicker => "Open the session picker",
@@ -2197,6 +2202,9 @@ fn vietnamese(id: MessageId) -> Option<&'static str> {
         MessageId::KbShellControls => "Chuyển lệnh shell đang chạy ở tiền cảnh xuống nền",
         MessageId::KbExitEmpty => "Thoát khi khung nhập trống",
         MessageId::KbCommandPalette => "Mở bảng lệnh (command palette)",
+        MessageId::KbCancelBackgroundShellJobs => {
+            "Hủy mọi tác vụ shell nền đang chạy (thanh bên Tasks)"
+        }
         MessageId::KbFuzzyFilePicker => {
             "Mở trình tìm file nhanh (fuzzy) (chèn @path khi nhấn Enter)"
         }
@@ -2221,7 +2229,7 @@ fn vietnamese(id: MessageId) -> Option<&'static str> {
             "Phím tắt thay thế để nhảy sang chế độ Plan / Agent / YOLO"
         }
         MessageId::KbFocusSidebar => {
-            "Focus vào thanh bên Work / Tasks / Agents / Context / Auto; Ctrl+Alt+0 để ẩn"
+            "Focus vào thanh bên Pinned / Tasks / Agents / Context / Auto; Ctrl+Alt+0 để ẩn"
         }
         MessageId::KbTogglePlanAgent => "Chuyển đổi giữa chế độ Plan và Agent",
         MessageId::KbSessionPicker => "Mở bảng chọn phiên làm việc",
@@ -2991,6 +2999,9 @@ fn japanese(id: MessageId) -> Option<&'static str> {
         MessageId::KbShellControls => "実行中のフォアグラウンドコマンドをバックグラウンドへ移す",
         MessageId::KbExitEmpty => "入力が空の時に終了",
         MessageId::KbCommandPalette => "コマンドパレットを開く",
+        MessageId::KbCancelBackgroundShellJobs => {
+            "実行中のバックグラウンド shell ジョブをすべてキャンセル（Tasks サイドバー）"
+        }
         MessageId::KbFuzzyFilePicker => "ファジーファイルピッカーを開く（Enter で @path を挿入）",
         MessageId::KbCompactInspector => "コンパクトなセッションコンテキスト検査ツールを開く",
         MessageId::KbLastMessagePager => "最後のメッセージのページャーを開く（入力が空の時）",
@@ -3009,7 +3020,7 @@ fn japanese(id: MessageId) -> Option<&'static str> {
         MessageId::KbJumpPlanAgentYolo => "ホットバースロットを起動",
         MessageId::KbAltJumpPlanAgentYolo => "Plan / Agent / YOLO モードへの代替ジャンプ",
         MessageId::KbFocusSidebar => {
-            "Work / Tasks / Agents / Context / Auto / Hidden サイドバーにフォーカス"
+            "Pinned / Tasks / Agents / Context / Auto / Hidden サイドバーにフォーカス"
         }
         MessageId::KbTogglePlanAgent => "Plan モードと Agent モードを切り替え",
         MessageId::KbSessionPicker => "セッションピッカーを開く",
@@ -3554,6 +3565,9 @@ fn chinese_simplified(id: MessageId) -> Option<&'static str> {
         MessageId::KbShellControls => "将正在运行的前台命令转入后台",
         MessageId::KbExitEmpty => "输入框为空时退出",
         MessageId::KbCommandPalette => "打开命令面板",
+        MessageId::KbCancelBackgroundShellJobs => {
+            "取消所有正在运行的后台 shell 作业（Tasks 侧边栏）"
+        }
         MessageId::KbFuzzyFilePicker => "打开模糊文件选择器（按 Enter 插入 @path）",
         MessageId::KbCompactInspector => "打开紧凑会话上下文检查器",
         MessageId::KbLastMessagePager => "打开最后一条消息的分页器（输入框为空时）",
@@ -3567,7 +3581,7 @@ fn chinese_simplified(id: MessageId) -> Option<&'static str> {
         }
         MessageId::KbJumpPlanAgentYolo => "触发快捷栏槽位",
         MessageId::KbAltJumpPlanAgentYolo => "替代快捷键跳转到 Plan / Agent / YOLO 模式",
-        MessageId::KbFocusSidebar => "聚焦 Work / 任务 / 代理 / Context / 自动 / 隐藏侧边栏",
+        MessageId::KbFocusSidebar => "聚焦 Pinned / 任务 / 代理 / Context / 自动 / 隐藏侧边栏",
         MessageId::KbTogglePlanAgent => "在 Plan 和 Agent 模式之间切换",
         MessageId::KbSessionPicker => "打开会话选择器",
         MessageId::KbPasteAttach => "粘贴文本或附加剪贴板图片",
@@ -4129,6 +4143,9 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
         MessageId::KbShellControls => "Enviar o comando em primeiro plano para segundo plano",
         MessageId::KbExitEmpty => "Sair quando entrada vazia",
         MessageId::KbCommandPalette => "Abrir paleta de comandos",
+        MessageId::KbCancelBackgroundShellJobs => {
+            "Cancelar todos os trabalhos shell em segundo plano em execução (barra lateral Tasks)"
+        }
         MessageId::KbFuzzyFilePicker => {
             "Abrir seletor de arquivo fuzzy (insere @path ao pressionar Enter)"
         }
@@ -4151,7 +4168,7 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
         MessageId::KbJumpPlanAgentYolo => "Acionar slots da hotbar",
         MessageId::KbAltJumpPlanAgentYolo => "Salto alternativo para modo Plan / Agent / YOLO",
         MessageId::KbFocusSidebar => {
-            "Focar barra lateral Work / Tasks / Agents / Context / Auto / Ocultar"
+            "Focar barra lateral Pinned / Tasks / Agents / Context / Auto / Ocultar"
         }
         MessageId::KbTogglePlanAgent => "Alternar entre modos Plan e Agent",
         MessageId::KbSessionPicker => "Abrir seletor de sessões",
@@ -4762,6 +4779,9 @@ fn spanish_latin_america(id: MessageId) -> Option<&'static str> {
         MessageId::KbShellControls => "Enviar el comando en primer plano a segundo plano",
         MessageId::KbExitEmpty => "Salir cuando la entrada está vacía",
         MessageId::KbCommandPalette => "Abrir paleta de comandos",
+        MessageId::KbCancelBackgroundShellJobs => {
+            "Cancelar todos los trabajos shell en segundo plano en ejecución (barra lateral Tasks)"
+        }
         MessageId::KbFuzzyFilePicker => {
             "Abrir selector de archivo fuzzy (inserta @ruta al presionar Enter)"
         }
@@ -4784,7 +4804,7 @@ fn spanish_latin_america(id: MessageId) -> Option<&'static str> {
         MessageId::KbJumpPlanAgentYolo => "Activar ranuras de la hotbar",
         MessageId::KbAltJumpPlanAgentYolo => "Salto alternativo a modo Plan / Agent / YOLO",
         MessageId::KbFocusSidebar => {
-            "Enfocar barra lateral Work / Tasks / Agents / Context / Auto / Ocultar"
+            "Enfocar barra lateral Pinned / Tasks / Agents / Context / Auto / Ocultar"
         }
         MessageId::KbTogglePlanAgent => "Alternar entre modos Plan y Agent",
         MessageId::KbSessionPicker => "Abrir selector de sesiones",

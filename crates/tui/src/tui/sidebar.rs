@@ -1,4 +1,4 @@
-//! Sidebar rendering — Work / Tasks / Agents / Context panels.
+//! Sidebar rendering — Pinned / Tasks / Agents / Context panels.
 //!
 //! Extracted from `tui/ui.rs` (P1.2). The sidebar appears to the right of
 //! the chat transcript when the available width allows it. Each section
@@ -57,7 +57,7 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
 
     match app.sidebar_focus {
         SidebarFocus::Auto => render_sidebar_auto(f, area, app),
-        SidebarFocus::Work => render_sidebar_work(f, area, app),
+        SidebarFocus::Pinned => render_sidebar_pinned(f, area, app),
         SidebarFocus::Tasks => render_sidebar_tasks(f, area, app),
         SidebarFocus::Agents => render_sidebar_subagents(f, area, app),
         SidebarFocus::Context => render_context_panel(f, area, app),
@@ -72,7 +72,22 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
 /// useful content, or as the one quiet empty state when nothing else is active.
 fn render_sidebar_auto(f: &mut Frame, area: Rect, app: &mut App) {
     let visible = auto_sidebar_panels(auto_sidebar_state(app));
+    render_sidebar_panel_stack(f, area, app, &visible);
+}
 
+/// Build the pinned panel stack. This uses the same content-sensitive panels
+/// as Auto, but it never participates in idle auto-collapse.
+fn render_sidebar_pinned(f: &mut Frame, area: Rect, app: &mut App) {
+    let visible = auto_sidebar_panels(auto_sidebar_state(app));
+    render_sidebar_panel_stack(f, area, app, &visible);
+}
+
+fn render_sidebar_panel_stack(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    visible: &[AutoSidebarPanel],
+) {
     let constraints: Vec<Constraint> = match visible.len() {
         1 => vec![Constraint::Min(0)],
         2 => vec![Constraint::Percentage(50), Constraint::Min(0)],
@@ -1110,12 +1125,12 @@ fn task_panel_rows(
                 .any(|task| task.id.starts_with("shell_") && task.status == "running");
             let hint_action = if stale_running_shells.len() == 1 {
                 Some((
-                    "Ctrl+K -> cancel stale job".to_string(),
+                    "Ctrl+X -> cancel stale job".to_string(),
                     format!("/jobs cancel {}", stale_running_shells[0].id),
                 ))
             } else if any_running_shell {
                 Some((
-                    "Ctrl+K -> /jobs cancel-all".to_string(),
+                    "Ctrl+X -> /jobs cancel-all".to_string(),
                     "/jobs cancel-all".to_string(),
                 ))
             } else {
@@ -1245,9 +1260,9 @@ fn task_panel_hover_texts(app: &App, max_rows: usize) -> Vec<String> {
                 .iter()
                 .any(|task| task.id.starts_with("shell_") && task.status == "running");
             if stale_running_shells == 1 {
-                texts.push("Ctrl+K -> cancel stale job".to_string());
+                texts.push("Ctrl+X -> cancel stale job".to_string());
             } else if any_running_shell {
-                texts.push("Ctrl+K -> /jobs cancel-all".to_string());
+                texts.push("Ctrl+X -> /jobs cancel-all".to_string());
             }
         }
     }
@@ -3002,11 +3017,11 @@ mod tests {
         SidebarHoverSection, SidebarHoverState, SidebarSubagentSummary, SidebarToolRow,
         SidebarWorkChecklistItem, SidebarWorkStrategyStep, SidebarWorkSummary, ToolRowOrder,
         agent_row_hover_text, auto_sidebar_panels, background_task_spinner_prefix,
-        context_panel_cost_line, editorial_tool_rows, normalize_activity_text, sidebar_agent_rows,
-        sidebar_hover_rows, sidebar_work_summary, sort_sidebar_agent_rows_as_tree,
-        subagent_panel_hover_texts, subagent_panel_lines, subagent_panel_rows,
-        task_panel_hover_texts, task_panel_lines, task_panel_rows, work_panel_empty_hint,
-        work_panel_hover_texts, work_panel_lines,
+        context_panel_cost_line, editorial_tool_rows, normalize_activity_text, render_sidebar,
+        sidebar_agent_rows, sidebar_hover_rows, sidebar_work_summary,
+        sort_sidebar_agent_rows_as_tree, subagent_panel_hover_texts, subagent_panel_lines,
+        subagent_panel_rows, task_panel_hover_texts, task_panel_lines, task_panel_rows,
+        work_panel_empty_hint, work_panel_hover_texts, work_panel_lines,
     };
     use crate::config::Config;
     use crate::palette;
@@ -3020,7 +3035,7 @@ mod tests {
     use crate::tui::history::{
         ExecCell, ExecSource, GenericToolCell, HistoryCell, ToolCell, ToolStatus,
     };
-    use ratatui::text::Line;
+    use ratatui::{Terminal, backend::TestBackend, text::Line};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -3182,6 +3197,44 @@ mod tests {
         });
 
         assert_eq!(panels, vec![AutoSidebarPanel::Work]);
+    }
+
+    #[test]
+    fn pinned_sidebar_renders_agents_section_when_subagents_are_active() {
+        let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Pinned;
+        app.subagent_cache
+            .push(cached_agent("agent-active-1", Some("critic")));
+        app.agent_progress.insert(
+            "agent-active-1".to_string(),
+            "checking sidebar visibility".to_string(),
+        );
+
+        let backend = TestBackend::new(72, 18);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_sidebar(frame, frame.area(), &mut app))
+            .expect("draw sidebar");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(
+            rendered.contains("Agents"),
+            "pinned sidebar must surface active sub-agents: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("critic") || rendered.contains("Agent 1"),
+            "pinned sidebar should render the child agent label: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("checking sidebar visibility"),
+            "pinned sidebar should render child progress: {rendered:?}"
+        );
     }
 
     #[test]
@@ -4166,7 +4219,7 @@ mod tests {
 
         let hint_idx = text
             .iter()
-            .position(|line| line.contains("Ctrl+K"))
+            .position(|line| line.contains("Ctrl+X"))
             .expect("cancel-all hint row");
         assert_eq!(actions[hint_idx].as_deref(), Some("/jobs cancel-all"));
     }
