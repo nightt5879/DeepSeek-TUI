@@ -32,9 +32,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[subagents.providers.deepseek]` and tighter subscription profiles such as
   `[subagents.providers.glm]`; `/config subagents status` shows both global
   and active-provider resolved values.
+- **Sub-agent control and isolation.** The single `agent` tool now exposes
+  status, peek, and cancel actions for running children, and accepts
+  `worktree: true` to create an isolated git worktree/branch for parallel edit
+  lanes instead of requiring callers to hand-roll a `cwd`.
 
 ### Fixed
 
+- **Mode and tool catalog correctness.** Core action tools remain discoverable
+  in the model-facing catalog/tool search, and a consistency self-check flags
+  registered handlers that drift out of the advertised catalog. Review-looking
+  prompts in explicit Agent/YOLO mode now keep the requested mode and tools,
+  with only an advisory review hint.
+- **Sub-agent orchestration recovery.** Child agents now retry transient
+  provider header/SSE timeouts before failing, and parent runs synthesize missed
+  child completions from terminal child state so orchestration cannot hang on a
+  lost completion event.
+- **DeepSeek thinking tool calls.** DeepSeek chat-completions requests now omit
+  explicit `tool_choice` whenever reasoning/thinking is enabled, avoiding
+  provider rejections while leaving no-thinking routes unchanged.
+- **Task sidebar shortcuts and attribution.** Ctrl-K stays palette/emacs-kill,
+  while Ctrl-X is scoped to Tasks-sidebar background shell cancellation. Shell
+  jobs launched by sub-agents now render with their child-agent owner in the
+  Tasks sidebar and transcript.
+- **Benchmark-turn recovery and context economy.** Repeated read-only search
+  loop blocks now return guidance instead of fatal tool failures, Python build
+  failures that are missing `setuptools` include an install/retry hint, long
+  foreground shell timeouts steer models toward background execution, and noisy
+  shell/test/web outputs are compacted earlier for large-context routes.
 - **Config display redaction.** `codew config get/list` now recursively masks
   token-, secret-, password-, credential-, and authorization-like keys inside
   unknown `extras` tables and redacts sensitive HTTP header values before
@@ -65,8 +90,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `~/.codewhale/`, and the first write of a subdir relocates any pre-existing
   `~/.deepseek/<sub>` contents into the primary location so the legacy tree stops
   growing while old data is preserved. The read resolver still finds legacy data
-  for backfill until each subdir migrates. Reported on Windows where both trees
-  were being created.
+  for backfill until each subdir migrates. Reported by @Final527; onboarding
+  marker slice from #3302 by @nightt5879.
 - **State subdir validation on Windows (#3240).** State path hardening now
   rejects rooted/prefixed subdir strings such as `/etc` before resolving or
   migrating state directories, keeping the `.codewhale` write resolver inside
