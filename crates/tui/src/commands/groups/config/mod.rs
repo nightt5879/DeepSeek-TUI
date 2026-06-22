@@ -27,7 +27,7 @@ impl CommandGroup for ConfigCommands {
             Box::new(FunctionCommand::new(&VERBOSE_INFO, run_verbose)),
             Box::new(FunctionCommand::new(&TRUST_INFO, run_trust)),
             Box::new(FunctionCommand::new(&LOGOUT_INFO, run_logout)),
-            Box::new(FunctionCommand::new(&SLOP_INFO, run_slop)),
+            Box::new(FunctionCommand::new(&DEBT_INFO, run_debt)),
         ]
     }
 }
@@ -94,10 +94,10 @@ static LOGOUT_INFO: CommandInfo = CommandInfo {
     usage: "/logout",
     description_id: MessageId::CmdLogoutDescription,
 };
-static SLOP_INFO: CommandInfo = CommandInfo {
-    name: "slop",
-    aliases: &["canzha"],
-    usage: "/slop [query|export]",
+static DEBT_INFO: CommandInfo = CommandInfo {
+    name: "debt",
+    aliases: &["cleanup"],
+    usage: "/debt [query|export]",
     description_id: MessageId::CmdSlopDescription,
 };
 
@@ -135,8 +135,8 @@ fn run_trust(app: &mut App, arg: Option<&str>) -> CommandResult {
 fn run_logout(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "logout", arg)
 }
-fn run_slop(app: &mut App, arg: Option<&str>) -> CommandResult {
-    run_registered(app, "slop", arg)
+fn run_debt(app: &mut App, arg: Option<&str>) -> CommandResult {
+    run_registered(app, "debt", arg)
 }
 
 pub(in crate::commands) fn dispatch(
@@ -157,7 +157,7 @@ pub(in crate::commands) fn dispatch(
         "verbose" => config::verbose(app, arg),
         "trust" | "xinren" => config::trust(app, arg),
         "logout" => config::logout(app),
-        "slop" | "canzha" => config::slop(app, arg),
+        "debt" | "cleanup" | "slop" | "canzha" => config::slop(app, arg),
         _ => return None,
     };
     Some(result)

@@ -262,6 +262,8 @@
   <script>
     const $ = (id) => document.getElementById(id);
     const MAX_VISIBLE_EVENTS = 100;
+    const TOKEN_STORAGE_KEY = "codewhale_runtime_token";
+    const TOKEN_COOKIE = "codewhale_runtime_token";
     const state = {
       threadId: "",
       activeTurnId: "",
@@ -276,17 +278,32 @@
     }
 
     function token() {
-      return $("token").value;
+      return $("token").value.trim();
+    }
+
+    function setRuntimeTokenCookie(value) {
+      const attrs = "; Path=/; SameSite=Strict";
+      if (!value) {
+        document.cookie = TOKEN_COOKIE + "=; Max-Age=0" + attrs;
+        return;
+      }
+      document.cookie = TOKEN_COOKIE + "=" + encodeURIComponent(value) + attrs;
     }
 
     function takeTokenFromUrl() {
-      const params = new URLSearchParams(location.search);
+      const hash = location.hash.startsWith("#") ? location.hash.slice(1) : "";
+      const params = new URLSearchParams(hash);
       const urlToken = params.get("token");
       if (!urlToken) return;
-      localStorage.setItem("codewhale_runtime_token", urlToken);
+      localStorage.setItem(TOKEN_STORAGE_KEY, urlToken);
+      setRuntimeTokenCookie(urlToken);
       params.delete("token");
-      const qs = params.toString();
-      history.replaceState(null, "", location.pathname + (qs ? "?" + qs : ""));
+      const nextHash = params.toString();
+      history.replaceState(
+        null,
+        "",
+        location.pathname + location.search + (nextHash ? "#" + nextHash : "")
+      );
     }
 
     function headers(extra = {}) {
@@ -464,8 +481,8 @@
       $("active-title").textContent = title || id;
       $("events").innerHTML = "";
       if (state.source) state.source.close();
-      const qs = "?since_seq=0&replay_limit=" + MAX_VISIBLE_EVENTS +
-        (token() ? "&token=" + encodeURIComponent(token()) : "");
+      if (token()) setRuntimeTokenCookie(token());
+      const qs = "?since_seq=0&replay_limit=" + MAX_VISIBLE_EVENTS;
       const source = new EventSource("/v1/threads/" + encodeURIComponent(id) + "/events" + qs);
       state.source = source;
       const names = [
@@ -538,9 +555,11 @@
 
     async function boot() {
       takeTokenFromUrl();
-      $("token").value = localStorage.getItem("codewhale_runtime_token") || "";
+      $("token").value = localStorage.getItem(TOKEN_STORAGE_KEY) || "";
+      if (token()) setRuntimeTokenCookie(token());
       $("save-token").onclick = async () => {
-        localStorage.setItem("codewhale_runtime_token", token());
+        localStorage.setItem(TOKEN_STORAGE_KEY, token());
+        setRuntimeTokenCookie(token());
         await loadThreads().catch((err) => setStatus(err.message, "bad"));
       };
       $("refresh").onclick = () => loadThreads().catch((err) => setStatus(err.message, "bad"));

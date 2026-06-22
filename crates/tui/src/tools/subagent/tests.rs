@@ -2464,7 +2464,7 @@ async fn touch_refreshes_stale_running_agent_heartbeat() {
 fn test_persist_and_reload_marks_running_agent_as_interrupted() {
     let tmp = tempdir().expect("tempdir");
     let workspace = tmp.path().to_path_buf();
-    let state_path = default_state_path(tmp.path());
+    let state_path = default_state_path(tmp.path()).expect("default state path");
 
     let mut manager = SubAgentManager::new(workspace.clone(), 2).with_state_path(state_path);
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
@@ -2484,8 +2484,8 @@ fn test_persist_and_reload_marks_running_agent_as_interrupted() {
     manager.agents.insert(running_id.clone(), running);
     manager.persist_state().expect("persist state");
 
-    let mut reloaded =
-        SubAgentManager::new(workspace, 2).with_state_path(default_state_path(tmp.path()));
+    let mut reloaded = SubAgentManager::new(workspace, 2)
+        .with_state_path(default_state_path(tmp.path()).expect("default state path"));
     reloaded.load_state().expect("load state");
     let snapshot = reloaded
         .get_result(&running_id)
@@ -2501,7 +2501,7 @@ fn test_persist_and_reload_marks_running_agent_as_interrupted() {
 fn persist_and_reload_preserves_checkpoint_for_interrupted_running_agent() {
     let tmp = tempdir().expect("tempdir");
     let workspace = tmp.path().to_path_buf();
-    let state_path = default_state_path(tmp.path());
+    let state_path = default_state_path(tmp.path()).expect("default state path");
 
     let mut manager = SubAgentManager::new(workspace.clone(), 2).with_state_path(state_path);
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
@@ -2529,8 +2529,8 @@ fn persist_and_reload_preserves_checkpoint_for_interrupted_running_agent() {
     manager.agents.insert(running_id.clone(), running);
     manager.persist_state().expect("persist state");
 
-    let mut reloaded =
-        SubAgentManager::new(workspace, 2).with_state_path(default_state_path(tmp.path()));
+    let mut reloaded = SubAgentManager::new(workspace, 2)
+        .with_state_path(default_state_path(tmp.path()).expect("default state path"));
     reloaded.load_state().expect("load state");
     let snapshot = reloaded
         .get_result(&running_id)
@@ -2542,6 +2542,66 @@ fn persist_and_reload_preserves_checkpoint_for_interrupted_running_agent() {
     assert_eq!(checkpoint.steps_taken, 2);
     assert_eq!(checkpoint.messages.len(), 2);
     assert_eq!(message_text(&checkpoint.messages[1]), "partial progress");
+}
+
+#[cfg(unix)]
+#[test]
+fn load_state_rejects_symlinked_state_file() {
+    let tmp = tempdir().expect("tempdir");
+    let target = tmp.path().join("outside-state.json");
+    let link = tmp.path().join(SUBAGENT_STATE_FILE);
+    std::fs::write(
+        &target,
+        serde_json::json!({
+            "schema_version": SUBAGENT_STATE_SCHEMA_VERSION,
+            "agents": [],
+            "workers": []
+        })
+        .to_string(),
+    )
+    .expect("write target");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink state");
+
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 1).with_state_path(link);
+    let err = manager
+        .load_state()
+        .expect_err("symlinked state should fail");
+    assert!(format!("{err:#}").contains("must not traverse symlinks"));
+}
+
+#[test]
+fn persist_state_rejects_state_path_outside_workspace() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().join("workspace");
+    let outside_state = tmp.path().join("outside-state.json");
+    std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+
+    let manager = SubAgentManager::new(workspace, 1).with_state_path(outside_state);
+    let err = manager
+        .persist_state()
+        .expect_err("outside state path should fail");
+
+    assert!(format!("{err:#}").contains("must stay within workspace"));
+}
+
+#[cfg(unix)]
+#[test]
+fn persist_state_rejects_symlinked_state_directory() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().join("workspace");
+    let outside = tmp.path().join("outside-state");
+    let codewhale_dir = workspace.join(".codewhale");
+    let state_dir = codewhale_dir.join("state");
+    std::fs::create_dir_all(&codewhale_dir).expect("mkdir codewhale");
+    std::fs::create_dir_all(&outside).expect("mkdir outside");
+    std::os::unix::fs::symlink(&outside, &state_dir).expect("symlink state dir");
+
+    let err = default_state_path(&workspace)
+        .expect_err("symlinked state directory should fail before manager construction");
+    assert!(
+        format!("{err:#}").contains("must stay within workspace")
+            || format!("{err:#}").contains("must not traverse symlinks")
+    );
 }
 
 #[test]
@@ -4505,9 +4565,13 @@ async fn launch_gate_queues_extra_direct_children() {
     }
 
     tokio::spawn(run_subagent_task(task_a));
-    // Give the first task time to take the only permit before the second
-    // task tries; the second must then queue with a visible reason.
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while gate.available_permits() != 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("first child should acquire the launch gate");
     tokio::spawn(run_subagent_task(task_b));
 
     let mut messages = Vec::new();

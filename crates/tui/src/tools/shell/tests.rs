@@ -200,6 +200,16 @@ fn exec_shell_parallel_flags_are_input_aware() {
     })));
 }
 
+#[test]
+fn exec_shell_interact_requires_approval() {
+    let tool = ShellInteractTool::new("exec_shell_interact");
+    assert_eq!(tool.approval_requirement(), ApprovalRequirement::Required);
+    assert!(
+        tool.capabilities()
+            .contains(&ToolCapability::RequiresApproval)
+    );
+}
+
 #[tokio::test]
 async fn read_only_shell_policy_blocks_non_readonly_commands() {
     let tmp = tempdir().expect("tempdir");

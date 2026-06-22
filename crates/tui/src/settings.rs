@@ -355,11 +355,10 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            // Keep the persisted fallback `false`; startup code may enable
-            // auto-compaction by model window when the user has not saved an
-            // explicit preference. V4-class 1M-token models stay opt-in to
-            // preserve prefix-cache behavior, while 256K-class models default
-            // on at the configured percent threshold.
+            // Keep the persisted fallback `false`; startup code enables
+            // auto-compaction by known model window when the user has not saved
+            // an explicit preference. This preserves an explicit opt-out while
+            // making long-session continuity the default runtime behavior.
             auto_compact: false,
             auto_compact_threshold_percent: 80.0,
             calm_mode: false,
@@ -927,7 +926,7 @@ impl Settings {
         vec![
             (
                 "auto_compact",
-                "Auto-compact near the hard context limit: on/off (default off)",
+                "Auto-compact near the hard context limit: on/off (model-aware default)",
             ),
             (
                 "auto_compact_threshold_percent",
@@ -1445,14 +1444,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_settings_disable_auto_compact_to_protect_v4_prefix_cache() {
+    fn default_settings_keep_auto_compact_as_unset_fallback() {
         let settings = Settings::default();
-        // v0.8.11: default is `false` to stop the engine from routinely
-        // rewriting the prompt prefix, which breaks V4's prefix-cache
-        // discount. The explicit `/compact` command and the
-        // `auto_compact = on` opt-in stay available; the default is
-        // flipped so the cache-friendly path is the one users get
-        // without configuring anything (#664).
+        // The persisted fallback remains false so a missing settings file does
+        // not look like an explicit user preference. Startup resolves the
+        // runtime default from the active model window unless the file contains
+        // `auto_compact`.
         assert!(!settings.auto_compact);
         assert_eq!(settings.auto_compact_threshold_percent, 80.0);
     }

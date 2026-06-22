@@ -19,14 +19,14 @@ path = "src/bin/codew_legacy_shim.rs"
 anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
-codewhale-agent = { path = "../agent", version = "0.8.63" }
-codewhale-app-server = { path = "../app-server", version = "0.8.63" }
-codewhale-config = { path = "../config", version = "0.8.63" }
-codewhale-execpolicy = { path = "../execpolicy", version = "0.8.63" }
-codewhale-mcp = { path = "../mcp", version = "0.8.63" }
-codewhale-release = { path = "../release", version = "0.8.63" }
-codewhale-secrets = { path = "../secrets", version = "0.8.63" }
-codewhale-state = { path = "../state", version = "0.8.63" }
+codewhale-agent = { path = "../agent", version = "0.8.64" }
+codewhale-app-server = { path = "../app-server", version = "0.8.64" }
+codewhale-config = { path = "../config", version = "0.8.64" }
+codewhale-execpolicy = { path = "../execpolicy", version = "0.8.64" }
+codewhale-mcp = { path = "../mcp", version = "0.8.64" }
+codewhale-release = { path = "../release", version = "0.8.64" }
+codewhale-secrets = { path = "../secrets", version = "0.8.64" }
+codewhale-state = { path = "../state", version = "0.8.64" }
 chrono.workspace = true
 dirs.workspace = true
 serde.workspace = true
@@ -38,5 +38,15 @@ tokio.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tracing.workspace = true
+
+# Parent-death cleanup for delegated server children (#3259): on Linux the
+# dispatcher sets PR_SET_PDEATHSIG so the child is signalled if the dispatcher
+# dies uncatchably; on Windows it assigns the child to a kill-on-job-close Job
+# Object.
+[target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]

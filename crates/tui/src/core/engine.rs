@@ -287,6 +287,8 @@ pub struct EngineConfig {
     pub subagents_enabled: bool,
     /// Feature flags controlling tool availability.
     pub features: Features,
+    /// Deterministic auto-review policy for tool calls.
+    pub auto_review_policy: crate::tui::auto_review::AutoReviewPolicy,
     /// Auto-compaction settings for long conversations.
     pub compaction: CompactionConfig,
     /// Shared Todo list state.
@@ -415,6 +417,7 @@ impl Default for EngineConfig {
             launch_concurrency: DEFAULT_MAX_SUBAGENTS,
             subagents_enabled: true,
             features: Features::with_defaults(),
+            auto_review_policy: crate::tui::auto_review::AutoReviewPolicy::default(),
             compaction: CompactionConfig::default(),
             todos: new_shared_todo_list(),
             plan_state: new_shared_plan_state(),
@@ -1046,12 +1049,12 @@ impl Engine {
                 &self.session.workspace,
                 self.session.approval_mode,
             );
-            if let Some(ExecShellAskRuleDecision::Prompt(reason)) = ask_rule_decision.as_ref() {
+            if let Some(ToolAskRuleDecision::Prompt(reason)) = ask_rule_decision.as_ref() {
                 approval_required = true;
                 approval_description = reason.clone();
                 approval_force_prompt = true;
             }
-            if let Some(ExecShellAskRuleDecision::Block(reason)) = ask_rule_decision {
+            if let Some(ToolAskRuleDecision::Block(reason)) = ask_rule_decision {
                 Err(ToolError::permission_denied(reason))
             } else if approval_required {
                 emit_tool_audit(json!({
@@ -1098,6 +1101,7 @@ impl Engine {
                             self.tx_event.clone(),
                             tool_name.clone(),
                             tool_input.clone(),
+                            self.session.workspace.clone(),
                             Some(&registry),
                             None,
                             None,
@@ -1136,6 +1140,7 @@ impl Engine {
                             self.tx_event.clone(),
                             tool_name.clone(),
                             tool_input.clone(),
+                            self.session.workspace.clone(),
                             Some(&registry),
                             None,
                             Some(elevated_context),
@@ -1152,6 +1157,7 @@ impl Engine {
                     self.tx_event.clone(),
                     tool_name.clone(),
                     tool_input.clone(),
+                    self.session.workspace.clone(),
                     Some(&registry),
                     None,
                     None,
@@ -3242,11 +3248,14 @@ fn effective_input_policy(
             ));
         }
     } else if is_review_only_user_intent(content) {
-        // Advisory only: never silently override an explicitly chosen mode
-        // (Yolo/Agent) or strip its tools. Surface the signal so the user can
-        // opt into read-only Plan mode themselves with `/mode plan`.
+        mode = AppMode::Plan;
+        trust_mode = false;
+        auto_approve = false;
+        if matches!(approval_mode, crate::tui::approval::ApprovalMode::Auto) {
+            approval_mode = crate::tui::approval::ApprovalMode::Suggest;
+        }
         status = Some(
-            "This looks like a review or inspection request. Keeping your current mode and tools — run `/mode plan` for strict read-only tools.".to_string(),
+            "Review/inspection request detected; using read-only Plan tools for this turn. Add an explicit fix/edit/commit instruction to allow writes.".to_string(),
         );
     }
 
@@ -3315,9 +3324,66 @@ fn agent_approval_mode_for_turn(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ExecShellAskRuleDecision {
+pub(super) enum ToolAskRuleDecision {
     Prompt(String),
     Block(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum AutoReviewPlanDecision {
+    NoChange,
+    ForcePrompt(String),
+    Block(String),
+}
+
+pub(super) fn auto_review_run_origin_for_plan(
+    detached_start: bool,
+) -> crate::tui::auto_review::RunOrigin {
+    if detached_start {
+        crate::tui::auto_review::RunOrigin::Background
+    } else {
+        crate::tui::auto_review::RunOrigin::Interactive
+    }
+}
+
+pub(super) fn auto_review_plan_decision(
+    policy: &crate::tui::auto_review::AutoReviewPolicy,
+    tool_name: &str,
+    tool_input: &Value,
+    run_origin: crate::tui::auto_review::RunOrigin,
+    approval_mode: crate::tui::approval::ApprovalMode,
+    user_intent: Option<&str>,
+    workspace_trusted: bool,
+    dirty_worktree: bool,
+) -> (AutoReviewPlanDecision, Value) {
+    let context = crate::tui::auto_review::AutoReviewContext::from_tool_call(
+        tool_name,
+        tool_input,
+        run_origin,
+        approval_mode,
+        user_intent,
+        workspace_trusted,
+        dirty_worktree,
+    );
+    let decision = policy.evaluate(&context);
+    let audit_event = policy.audit_event(&context, &decision);
+    let plan_decision = match decision.action {
+        crate::tui::auto_review::AutoReviewAction::Allow
+        | crate::tui::auto_review::AutoReviewAction::AskUser => AutoReviewPlanDecision::NoChange,
+        crate::tui::auto_review::AutoReviewAction::HoldForReview => {
+            let reason = format!("Auto-review policy requires approval: {}", decision.reason);
+            if matches!(approval_mode, crate::tui::approval::ApprovalMode::Never) {
+                AutoReviewPlanDecision::Block(reason)
+            } else {
+                AutoReviewPlanDecision::ForcePrompt(reason)
+            }
+        }
+        crate::tui::auto_review::AutoReviewAction::Block => AutoReviewPlanDecision::Block(format!(
+            "Auto-review policy blocked tool '{tool_name}': {}",
+            decision.reason
+        )),
+    };
+    (plan_decision, audit_event)
 }
 
 pub(super) fn exec_shell_ask_rule_decision(
@@ -3326,11 +3392,63 @@ pub(super) fn exec_shell_ask_rule_decision(
     tool_input: &Value,
     workspace: &Path,
     approval_mode: crate::tui::approval::ApprovalMode,
-) -> Option<ExecShellAskRuleDecision> {
+) -> Option<ToolAskRuleDecision> {
     if tool_name != "exec_shell" {
         return None;
     }
     let command = tool_input.get("command").and_then(Value::as_str)?;
+    tool_ask_rule_decision_for_context(config, tool_name, command, None, workspace, approval_mode)
+}
+
+pub(super) fn file_tool_ask_rule_decision(
+    config: &EngineConfig,
+    tool_name: &str,
+    tool_input: &Value,
+    workspace: &Path,
+    approval_mode: crate::tui::approval::ApprovalMode,
+) -> Option<ToolAskRuleDecision> {
+    let paths = file_tool_permission_paths(tool_name, tool_input)?;
+    if paths.is_empty() {
+        return tool_ask_rule_decision_for_context(
+            config,
+            tool_name,
+            "",
+            None,
+            workspace,
+            approval_mode,
+        );
+    }
+
+    let mut prompt: Option<String> = None;
+    for path in paths {
+        match tool_ask_rule_decision_for_context(
+            config,
+            tool_name,
+            "",
+            Some(&path),
+            workspace,
+            approval_mode,
+        ) {
+            Some(ToolAskRuleDecision::Block(reason)) => {
+                return Some(ToolAskRuleDecision::Block(reason));
+            }
+            Some(ToolAskRuleDecision::Prompt(reason)) => {
+                prompt.get_or_insert(reason);
+            }
+            None => {}
+        }
+    }
+    prompt.map(ToolAskRuleDecision::Prompt)
+}
+
+fn tool_ask_rule_decision_for_context(
+    config: &EngineConfig,
+    tool_name: &str,
+    command: &str,
+    path: Option<&str>,
+    workspace: &Path,
+    approval_mode: crate::tui::approval::ApprovalMode,
+) -> Option<ToolAskRuleDecision> {
     let cwd = workspace.to_string_lossy();
     let ask_for_approval = match approval_mode {
         crate::tui::approval::ApprovalMode::Never => AskForApproval::Never,
@@ -3344,22 +3462,46 @@ pub(super) fn exec_shell_ask_rule_decision(
             command,
             cwd: cwd.as_ref(),
             tool: Some(tool_name),
-            path: None,
+            path,
             ask_for_approval,
             sandbox_mode: None,
         })
         .ok()?;
     if !decision.allow {
-        Some(ExecShellAskRuleDecision::Block(
-            decision.reason().to_string(),
-        ))
+        Some(ToolAskRuleDecision::Block(decision.reason().to_string()))
     } else if decision.requires_approval {
-        Some(ExecShellAskRuleDecision::Prompt(
-            decision.reason().to_string(),
-        ))
+        Some(ToolAskRuleDecision::Prompt(decision.reason().to_string()))
     } else {
         None
     }
+}
+
+fn file_tool_permission_paths(tool_name: &str, input: &Value) -> Option<Vec<String>> {
+    match tool_name {
+        "read_file" | "write_file" | "edit_file" | "file_search" | "grep_files" => {
+            Some(string_field(input, "path").into_iter().collect())
+        }
+        "list_dir" => Some(vec![
+            string_field(input, "path").unwrap_or_else(|| ".".to_string()),
+        ]),
+        "apply_patch" => Some(apply_patch_permission_paths(input)),
+        _ => None,
+    }
+}
+
+fn string_field(input: &Value, key: &str) -> Option<String> {
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn apply_patch_permission_paths(input: &Value) -> Vec<String> {
+    crate::tools::apply_patch::preflight_apply_patch(input)
+        .map(|preflight| preflight.touched_files)
+        .unwrap_or_default()
 }
 
 /// Spawn the engine in a background task

@@ -3795,18 +3795,22 @@ fn hidden_sidebar_focus_suppresses_sidebar_split_even_when_wide() {
 }
 
 #[test]
-fn sidebar_width_gate_suppresses_visible_focus_when_narrow() {
+fn sidebar_width_gate_uses_sixty_four_column_boundary() {
     let mut app = create_test_app();
     app.sidebar_focus = SidebarFocus::Pinned;
-    app.last_sidebar_host_width = Some(80);
+    app.last_sidebar_host_width = Some(SIDEBAR_VISIBLE_MIN_WIDTH - 1);
 
     assert_eq!(
         sidebar_render_state(&mut app),
         SidebarRenderState::SuppressedByWidth {
-            available_width: 80,
+            available_width: SIDEBAR_VISIBLE_MIN_WIDTH - 1,
             min_width: SIDEBAR_VISIBLE_MIN_WIDTH,
         }
     );
+
+    app.last_sidebar_host_width = Some(SIDEBAR_VISIBLE_MIN_WIDTH);
+
+    assert_eq!(sidebar_render_state(&mut app), SidebarRenderState::Visible);
 }
 
 #[test]
@@ -4483,12 +4487,16 @@ fn fanout_interrupted_mailbox_drops_running_count() {
 fn stall_reason_provider_wait_includes_route_and_idle_budget() {
     let mut app = create_test_app();
     app.is_loading = true;
-    app.turn_started_at = Some(Instant::now() - Duration::from_secs(45));
-    app.turn_last_activity_at = Some(Instant::now() - Duration::from_secs(40));
+    app.stream_chunk_timeout_secs = 300;
+    // Set idle to 65s so it exceeds the 60s threshold (#3189).
+    app.turn_started_at = Some(Instant::now() - Duration::from_secs(70));
+    app.turn_last_activity_at = Some(Instant::now() - Duration::from_secs(65));
 
     let reason = crate::tui::footer_ui::stall_reason(&app).expect("stalled turn has a reason");
     assert!(reason.contains("waiting for model"), "{reason}");
-    assert!(reason.contains("40s"), "{reason}");
+    // idle >= 60s, so the counter appears, but < 75% budget (225s) so no budget detail.
+    assert!(reason.contains("65s"), "{reason}");
+    assert!(!reason.contains("/300s"), "{reason}");
 }
 
 #[test]
@@ -10824,9 +10832,8 @@ fn agent_progress_redraw_coalesces_once_per_agent_per_drain() {
 
 #[test]
 fn six_worker_progress_storm_keeps_input_render_and_cancel_live() {
-    let max_engine_events_per_drain = MAX_ENGINE_EVENTS_PER_DRAIN;
-    assert!(
-        max_engine_events_per_drain <= 128,
+    const _: () = assert!(
+        MAX_ENGINE_EVENTS_PER_DRAIN <= 128,
         "engine event drains must stay bounded so high sub-agent fanout cannot monopolize the UI tick"
     );
 

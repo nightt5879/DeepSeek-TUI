@@ -110,10 +110,10 @@ model = "your-deepseek-compatible-model"
 ```
 
 Private gateways with broken or intercepted certificates should use
-`SSL_CERT_FILE` with a trusted CA bundle. As a last resort,
-`insecure_skip_tls_verify = true` can be set on the active `[providers.*]`
-table; it applies only to the LLM provider client and is shown by
-`codewhale doctor`.
+`SSL_CERT_FILE` with a trusted CA bundle. The legacy
+`insecure_skip_tls_verify = true` key is still parsed so `codewhale doctor` can
+report stale configs, but provider clients reject it instead of skipping TLS
+certificate verification.
 
 Keep `provider`, `api_key`, and `base_url` in user config or process
 environment. Project-local config overlays intentionally cannot set those keys,

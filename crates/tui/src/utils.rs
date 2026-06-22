@@ -10,6 +10,30 @@ use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use serde_json::Value;
 
+const LOG_FINGERPRINT_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const LOG_FINGERPRINT_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Return a stable, non-reversible log label for an identifier.
+///
+/// This is meant for correlation in diagnostics where the raw value may be a
+/// session token, remote protocol session id, or other bearer-like handle.
+#[must_use]
+pub fn redacted_identifier_for_log(identifier: &str) -> String {
+    if identifier.is_empty() {
+        return "<redacted:empty>".to_string();
+    }
+
+    let mut hash = LOG_FINGERPRINT_OFFSET_BASIS;
+    for byte in identifier.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(LOG_FINGERPRINT_PRIME);
+    }
+    hash ^= identifier.len() as u64;
+    hash = hash.wrapping_mul(LOG_FINGERPRINT_PRIME);
+
+    format!("<redacted:{hash:016x}>")
+}
+
 // === Project Mapping Helpers ===
 
 /// Identify if a file is a "key" file for project identification.
@@ -519,11 +543,28 @@ pub fn estimate_message_chars(messages: &[Message]) -> usize {
 // without additional platform scaffolding.
 #[cfg(test)]
 mod tests {
-    use super::display_path_with_home;
+    use super::{display_path_with_home, redacted_identifier_for_log};
     use std::path::PathBuf;
 
     fn home(s: &str) -> Option<PathBuf> {
         Some(PathBuf::from(s))
+    }
+
+    #[test]
+    fn redacted_identifier_for_log_hides_value_and_stays_stable() {
+        let identifier = "session-secret-1234567890";
+        let redacted = redacted_identifier_for_log(identifier);
+
+        assert!(redacted.starts_with("<redacted:"));
+        assert!(redacted.ends_with('>'));
+        assert!(!redacted.contains(identifier));
+        assert_eq!(redacted, redacted_identifier_for_log(identifier));
+        assert_ne!(redacted, redacted_identifier_for_log("another-session"));
+    }
+
+    #[test]
+    fn redacted_identifier_for_log_marks_empty_values() {
+        assert_eq!(redacted_identifier_for_log(""), "<redacted:empty>");
     }
 
     #[test]

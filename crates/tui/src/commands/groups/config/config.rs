@@ -60,6 +60,12 @@ pub fn config_command(app: &mut App, arg: Option<&str>) -> CommandResult {
     if raw.is_empty() {
         return show_config(app, None);
     }
+    if matches!(
+        raw.to_ascii_lowercase().as_str(),
+        "audit" | "editability" | "editable" | "status"
+    ) {
+        return config_editability_audit(app);
+    }
     let mut raw_words = raw.splitn(2, char::is_whitespace);
     if raw_words
         .next()
@@ -439,6 +445,207 @@ fn parse_config_bool(value: &str) -> Result<bool, String> {
         _ => Err(format!(
             "Failed to parse boolean '{value}': expected on/off, true/false, yes/no."
         )),
+    }
+}
+
+fn approval_mode_config_value(mode: ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::Auto => "auto",
+        ApprovalMode::Suggest => "on-request",
+        ApprovalMode::Never => "never",
+    }
+}
+
+fn config_editability_audit(app: &App) -> CommandResult {
+    let config = match load_command_config(app) {
+        Ok(config) => config,
+        Err(err) => return CommandResult::error(err),
+    };
+    let config_path = crate::config_persistence::config_toml_path(app.config_path.as_deref())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "(unresolved)".to_string());
+
+    let mut provider_config = config.clone();
+    provider_config.provider = Some(app.api_provider.as_str().to_string());
+    let model = if app.auto_model {
+        "auto".to_string()
+    } else {
+        app.model.clone()
+    };
+
+    let rows = [
+        (
+            "provider",
+            app.api_provider.as_str().to_string(),
+            "session",
+            "/config provider <name>",
+            "Switches the active provider now; edit provider in config.toml for startup default.",
+        ),
+        (
+            "model",
+            model,
+            "session",
+            "/config model <id|auto>",
+            "Switches the active model now; use default_text_model in config.toml for startup default.",
+        ),
+        (
+            "approval_policy",
+            approval_mode_config_value(app.approval_mode).to_string(),
+            "runtime+persisted",
+            "/config approval_mode <auto|on-request|never> --save",
+            "Writes top-level approval_policy and updates the current session.",
+        ),
+        (
+            "allow_shell",
+            app.allow_shell.to_string(),
+            "runtime+persisted",
+            "/config allow_shell <true|false> --save",
+            "Writes top-level allow_shell and applies to subsequent turns.",
+        ),
+        (
+            "stream_chunk_timeout_secs",
+            app.stream_chunk_timeout_secs.to_string(),
+            "runtime+persisted",
+            "/config stream_chunk_timeout_secs <0|1..3600> --save",
+            "Writes [tui].stream_chunk_timeout_secs and updates the running stream timeout.",
+        ),
+        (
+            "subagents.enabled",
+            subagents_config_display_value(&config, "enabled"),
+            "runtime+persisted",
+            "/config subagents on|off --save",
+            "Writes [subagents].enabled and updates subsequent sub-agent launches.",
+        ),
+        (
+            "subagents.max_concurrent",
+            subagents_config_display_value(&config, "max_concurrent"),
+            "runtime+persisted",
+            "/config subagents max_concurrent <n> --save",
+            "Clamped with Config::max_subagents and written to [subagents].max_concurrent.",
+        ),
+        (
+            "subagents.max_depth",
+            subagents_config_display_value(&config, "max_depth"),
+            "runtime+persisted",
+            "/config subagents max_depth <n> --save",
+            "Clamped to the configured spawn-depth ceiling.",
+        ),
+        (
+            "subagents.launch_concurrency",
+            subagents_config_display_value(&config, "launch_concurrency"),
+            "runtime+persisted",
+            "/config subagents launch_concurrency <n> --save",
+            "Clamped to the resolved sub-agent concurrency cap.",
+        ),
+        (
+            "subagents.api_timeout_secs",
+            subagents_config_display_value(&config, "api_timeout_secs"),
+            "runtime+persisted",
+            "/config subagents api_timeout_secs <seconds> --save",
+            "0 means the compiled default; non-zero values are clamped to the documented range.",
+        ),
+        (
+            "subagents.heartbeat_timeout_secs",
+            subagents_config_display_value(&config, "heartbeat_timeout_secs"),
+            "runtime+persisted",
+            "/config subagents heartbeat_timeout_secs <seconds> --save",
+            "0 means the compiled default; non-zero values are clamped to the documented range.",
+        ),
+        (
+            "base_url",
+            config.deepseek_base_url(),
+            "persisted restart",
+            "/config base_url <url> --save",
+            "Writes top-level base_url; model clients read it on startup.",
+        ),
+        (
+            "providers.<active>.base_url",
+            provider_config.deepseek_base_url(),
+            "persisted restart",
+            "/config provider_url <url> --save",
+            "Writes the active provider table; model clients read it on startup.",
+        ),
+        (
+            "mcp_config_path",
+            app.mcp_config_path.display().to_string(),
+            "persisted restart",
+            "/config mcp_config_path <path> --save",
+            "The MCP tool pool is built at startup, so a restart is required.",
+        ),
+        (
+            "workspace_follow_symlinks",
+            app.workspace_follow_symlinks.to_string(),
+            "partial restart",
+            "/config workspace_follow_symlinks <true|false> --save",
+            "Updates TUI file completion now; engine tools require restart.",
+        ),
+        (
+            "instructions",
+            file_only_status(config.instructions.as_ref().map(|v| !v.is_empty())),
+            "file-only restart",
+            "edit config.toml",
+            "Prompt layers are loaded before the first turn.",
+        ),
+        (
+            "hooks",
+            file_only_status(config.hooks.as_ref().map(|_| true)),
+            "file-only",
+            "edit config.toml",
+            "Hook definitions are structured TOML, not a scalar runtime setting.",
+        ),
+        (
+            "network",
+            file_only_status(config.network.as_ref().map(|_| true)),
+            "file-only",
+            "edit config.toml",
+            "Network policy is evaluated by tool dispatch and should be reviewed as TOML.",
+        ),
+        (
+            "tools",
+            file_only_status(config.tools.as_ref().map(|_| true)),
+            "file-only restart",
+            "edit config.toml",
+            "Tool catalog policy is built before model/tool negotiation.",
+        ),
+        (
+            "memory",
+            file_only_status(config.memory.as_ref().map(|_| true)),
+            "file-only restart",
+            "edit config.toml",
+            "Memory loading changes prompt context and is resolved at startup.",
+        ),
+        (
+            "runtime_api",
+            file_only_status(config.runtime_api.as_ref().map(|_| true)),
+            "file-only restart",
+            "edit config.toml",
+            "Serve/API tuning belongs to the runtime server startup path.",
+        ),
+        (
+            "vision_model",
+            file_only_status(config.vision_model.as_ref().map(|_| true)),
+            "file-only restart",
+            "edit config.toml",
+            "Image-analysis provider clients are configured outside the scalar /config editor.",
+        ),
+    ];
+
+    let mut lines = Vec::new();
+    lines.push("Config editability audit".to_string());
+    lines.push(format!("Config path: {config_path}"));
+    lines.push("Key | Current | Editability | Command / reason".to_string());
+    for (key, current, editability, command, note) in rows {
+        lines.push(format!("{key} | {current} | {editability} | {command}"));
+        lines.push(format!("  {note}"));
+    }
+    CommandResult::message(lines.join("\n"))
+}
+
+fn file_only_status(configured: Option<bool>) -> String {
+    match configured {
+        Some(true) => "configured".to_string(),
+        Some(false) => "empty".to_string(),
+        None => "unset".to_string(),
     }
 }
 
@@ -962,7 +1169,27 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             return match mode {
                 Some(m) => {
                     app.approval_mode = m;
-                    CommandResult::message(format!("approval_mode = {}", m.label()))
+                    if persist {
+                        let saved = approval_mode_config_value(m);
+                        match persist_root_string_key(
+                            app.config_path.as_deref(),
+                            "approval_policy",
+                            saved,
+                        ) {
+                            Ok(path) => CommandResult::message(format!(
+                                "approval_mode = {} (saved to {} as approval_policy = \"{}\")",
+                                m.label(),
+                                path.display(),
+                                saved
+                            )),
+                            Err(err) => CommandResult::error(format!("Failed to save: {err}")),
+                        }
+                    } else {
+                        CommandResult::message(format!(
+                            "approval_mode = {} (session only, add --save to persist)",
+                            m.label()
+                        ))
+                    }
                 }
                 None => CommandResult::error(
                     "Invalid approval_mode. Use: auto, suggest/on-request/untrusted, never/deny",
@@ -1087,8 +1314,7 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                 && !(MIN_STREAM_CHUNK_TIMEOUT_SECS..=MAX_STREAM_CHUNK_TIMEOUT_SECS).contains(&raw)
             {
                 return CommandResult::error(format!(
-                    "stream_chunk_timeout_secs must be 0 or {}..={}",
-                    MIN_STREAM_CHUNK_TIMEOUT_SECS, MAX_STREAM_CHUNK_TIMEOUT_SECS
+                    "stream_chunk_timeout_secs must be 0 or {MIN_STREAM_CHUNK_TIMEOUT_SECS}..={MAX_STREAM_CHUNK_TIMEOUT_SECS}"
                 ));
             }
             let resolved = if raw == 0 {
@@ -1424,21 +1650,21 @@ pub fn theme(app: &mut App, arg: Option<&str>) -> CommandResult {
     }
 }
 
-/// `/slop [query|export]` — inspect or export the slop ledger (#2127).
+/// `/debt [query|export]` — inspect or export the debt ledger (#2127).
 /// With no arguments, prints a summary. `query` shows filtered results;
 /// `export` outputs the full ledger as Markdown.
 pub fn slop(_app: &mut App, arg: Option<&str>) -> CommandResult {
     let arg = arg.map(str::trim).unwrap_or("");
     let ledger = match crate::slop_ledger::SlopLedger::load() {
         Ok(l) => l,
-        Err(e) => return CommandResult::error(format!("Failed to load slop ledger: {e}")),
+        Err(e) => return CommandResult::error(format!("Failed to load debt ledger: {e}")),
     };
 
     match arg {
         "" => CommandResult::message(ledger.summary()),
         "query" | "q" => {
             if ledger.is_empty() {
-                return CommandResult::message("Slop ledger is empty.");
+                return CommandResult::message("Debt ledger is empty.");
             }
             let mut out = String::new();
             for entry in &ledger.query(&Default::default()) {
@@ -1460,7 +1686,7 @@ pub fn slop(_app: &mut App, arg: Option<&str>) -> CommandResult {
             CommandResult::message(md)
         }
         _ => CommandResult::error(format!(
-            "Unknown /slop action '{arg}'. Use /slop, /slop query, or /slop export."
+            "Unknown /debt action '{arg}'. Use /debt, /debt query, or /debt export."
         )),
     }
 }
@@ -1787,7 +2013,7 @@ mod tests {
     fn sidebar_config_command_reports_width_suppression() {
         let mut app = create_test_app();
         app.sidebar_focus = SidebarFocus::Hidden;
-        app.last_sidebar_host_width = Some(80);
+        app.last_sidebar_host_width = Some(63);
 
         let result = sidebar(&mut app, Some("on"));
 
@@ -1796,9 +2022,22 @@ mod tests {
         assert_eq!(
             result.message.as_deref(),
             Some(
-                "Sidebar is on, but hidden because the terminal is too narrow (80 cols; needs at least 100)"
+                "Sidebar is on, but hidden because the terminal is too narrow (63 cols; needs at least 64)"
             )
         );
+    }
+
+    #[test]
+    fn sidebar_config_command_is_visible_at_minimum_width() {
+        let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Hidden;
+        app.last_sidebar_host_width = Some(64);
+
+        let result = sidebar(&mut app, Some("on"));
+
+        assert!(!result.is_error);
+        assert_eq!(app.sidebar_focus, SidebarFocus::Pinned);
+        assert_eq!(result.message.as_deref(), Some("Sidebar is visible"));
     }
 
     #[test]
@@ -2278,6 +2517,47 @@ heartbeat_timeout_secs = 1
     }
 
     #[test]
+    fn config_command_audit_lists_editability_and_current_values() {
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-config-audit-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_root).unwrap();
+        let config_path = temp_root.join("custom-config.toml");
+        fs::write(
+            &config_path,
+            r#"
+base_url = "https://api.from-config.local/v1"
+instructions = ["~/global.md"]
+
+[subagents]
+enabled = false
+max_concurrent = 4
+"#,
+        )
+        .unwrap();
+
+        let mut app = create_test_app();
+        app.config_path = Some(config_path.clone());
+        app.approval_mode = ApprovalMode::Never;
+        app.stream_chunk_timeout_secs = 45;
+
+        let result = config_command(&mut app, Some("audit"));
+        let msg = result.message.unwrap();
+
+        assert!(!result.is_error);
+        assert!(msg.contains("Config editability audit"));
+        assert!(msg.contains(&format!("Config path: {}", config_path.display())));
+        assert!(msg.contains("approval_policy | never | runtime+persisted"));
+        assert!(msg.contains("stream_chunk_timeout_secs | 45 | runtime+persisted"));
+        assert!(msg.contains("subagents.enabled | false | runtime+persisted"));
+        assert!(msg.contains("subagents.max_concurrent | 4 | runtime+persisted"));
+        assert!(msg.contains("base_url | https://api.from-config.local/v1 | persisted restart"));
+        assert!(msg.contains("instructions | configured | file-only restart"));
+        assert!(msg.contains("network | unset | file-only"));
+    }
+
+    #[test]
     fn config_command_base_url_without_save_requires_save() {
         let _lock = lock_test_env();
         let mut app = create_test_app();
@@ -2504,7 +2784,7 @@ heartbeat_timeout_secs = 1
             )
         );
         assert!(saved.contains("[providers.xiaomi_mimo]"));
-        assert!(saved.contains(&format!("base_url = \"{}\"", DEFAULT_XIAOMI_MIMO_BASE_URL)));
+        assert!(saved.contains(&format!("base_url = \"{DEFAULT_XIAOMI_MIMO_BASE_URL}\"")));
     }
 
     #[test]
@@ -2588,6 +2868,36 @@ heartbeat_timeout_secs = 1
         let result = config_command(&mut app, Some("approval_mode never"));
         assert!(result.message.is_some());
         assert_eq!(app.approval_mode, ApprovalMode::Never);
+    }
+
+    #[test]
+    fn config_approval_mode_save_persists_top_level_policy() {
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-approval-policy-save-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_root).unwrap();
+        let config_path = temp_root.join("custom-config.toml");
+
+        let mut app = create_test_app();
+        app.config_path = Some(config_path.clone());
+        let result = config_command(&mut app, Some("approval_mode suggest --save"));
+        let msg = result.message.unwrap();
+        let saved = fs::read_to_string(&config_path).unwrap();
+
+        assert!(!result.is_error);
+        assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+        assert_eq!(
+            msg,
+            format!(
+                "approval_mode = SUGGEST (saved to {} as approval_policy = \"on-request\")",
+                config_path.display()
+            )
+        );
+        assert!(saved.contains("approval_policy = \"on-request\""));
+
+        let loaded = Config::load(Some(config_path), None).unwrap();
+        assert_eq!(loaded.approval_policy.as_deref(), Some("on-request"));
     }
 
     #[test]

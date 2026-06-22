@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.64] - 2026-06-22
+
+### Added
+
+- **Seamless auto-compaction defaults.** Known large-context routes now keep
+  automatic compaction on by default while carrying summaries forward through
+  the stable prompt path, reducing surprise context loss without changing
+  explicit opt-out behavior.
+- **Runtime web automation readiness.** Local app automation gains a
+  loopback-only dev-server readiness primitive so agents can wait for TCP and
+  optional HTTP health checks before browser verification. Harvested from
+  #3376 by @cyq1017.
+- **Model and integration polish.** `/model pro` and `/model flash` shortcuts
+  now resolve to the current DeepSeek V4 routes while preserving existing model
+  IDs. Harvested from #3350 by @KUK4. The WeCom bridge landed with
+  maintainer follow-up hardening for state permissions and chat-facing error
+  reporting, from #3370 by @pkeging.
+
+### Fixed
+
+- **Security and trust-boundary hardening.** Project-local config can no longer
+  loosen user-owned shell or instruction-file policy, file edits now require a
+  fresh read of the target file, git history inputs reject option-shaped or
+  control-character revisions, interactive execution surfaces require approval,
+  and local tool paths are narrowed through workspace/root validation.
+- **Runtime and diagnostics redaction.** Generated runtime/app-server tokens,
+  raw session lineage identifiers, provider registry drift values, review
+  receipt internals, and webhook URLs are no longer echoed into human-facing
+  logs or diagnostics.
+- **Network and alert safety.** Provider TLS verification bypass requests now
+  fail closed, fleet alert webhooks require HTTPS, fetch URL hostnames are
+  resolved before requests, and runtime mobile auth no longer relies on
+  token-bearing URLs.
+- **Path-state hardening.** Config sibling files, project MCP cwd values,
+  runtime thread store files, sub-agent state, project-local state roots, and
+  app-server sidecar config paths now resolve through checked roots before
+  reads/writes.
+- **Release CI repair.** Nightly cross-target builds install Rust targets
+  explicitly and retry transient cargo failures; auto-tag runs are serialized
+  and treat an already-created remote tag as a no-op. Safe slices harvested
+  from #3374 by @donglovejava.
+- **Provider wait and sidebar regressions.** Provider-wait footers suppress
+  noisy countdowns until useful while keeping timeout warnings visible,
+  harvested from #3375 by @idling11. The pinned sidebar can render at a
+  narrower 64-column boundary, harvested from #3371 by @donglovejava.
+- **Delegated server cleanup.** Delegated `serve` / `app-server` children gain
+  OS-level parent-death cleanup on supported platforms, completing the #3259
+  follow-up from #3378 and #3317 by @wuisabel-gif.
+- **ACP and sandbox correctness.** ACP sessions preserve multi-turn
+  conversation history across prompt turns, harvested from #3372 by @xulongzhe.
+  Worktree Git metadata writes are allowed through sandbox policy without
+  broad trust-mode escalation, from #3356 by @cyq1017 and the #3355 report by
+  @linletian.
+
+### Changed
+
+- **Community and dependency harvests.** The release train carries focused
+  community-credit slices from #3379 by @greyfreedom, #3348 by @nightt5879,
+  #3346 by @hongqitai, #3345/#3333 by @cyq1017, and Dependabot updates for
+  `windows`, `toml`, `tokio`, `lru`, `similar`, and web tooling security locks.
+- **Public release surface cleanup.** Benchmark-specific materials were kept
+  out of the public release repo; benchmark source fragments belong in the
+  separate `codewhale-bench` lane.
+
 ## [0.8.63] - 2026-06-19
 
 ### Added
@@ -55,7 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while Ctrl-X is scoped to Tasks-sidebar background shell cancellation. Shell
   jobs launched by sub-agents now render with their child-agent owner in the
   Tasks sidebar and transcript.
-- **Benchmark-turn recovery and context economy.** Repeated read-only search
+- **Long-turn recovery and context economy.** Repeated read-only search
   loop blocks now return guidance instead of fatal tool failures, Python build
   failures that are missing `setuptools` include an install/retry hint, long
   foreground shell timeouts steer models toward background execution, and noisy
@@ -123,7 +187,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 - **Base prompt / delegate skill guidance** updated to encourage parallel
   read-only exploration (2-4 `type: "explore"` sub-agents) for broad repo,
-  version, branch, benchmark, and API-surface investigations, while keeping
+  version, branch, release, and API-surface investigations, while keeping
   architecture, integration, and final verification in the parent. The
   delegate skill examples now use provider-neutral `model_strength` instead of
   hardcoded DeepSeek model ids.
@@ -297,7 +361,7 @@ folds in several community contributions.
 - Work sidebar no longer shows stale `phase now:` / `phase next:` strategy rows once the checklist
   is 100% complete.
 - Plan mode no longer shortcuts investigation for requests that name a repository, URL, version,
-  release, build state, benchmark, bug, PR, issue, API surface, or local code path.
+  release, build state, bug, PR, issue, API surface, or local code path.
 - Oversized pasted text stays editable in the composer, with a file backup appended at submit
   time for model access; thanks @idling11 (#3267, closes #3263).
 - Bare digit keys `1`-`8` now insert text instead of firing hotbar slots; use `Alt+digit` for
@@ -796,8 +860,6 @@ folds in several community contributions.
 
 ### Added
 
-- **Benchmark harness runners.** Added CodeWhale-native benchmark entry points for SWE-bench, Terminal-Bench, and PinchBench, plus a local PinchBench runner that can grade tool-use traces with an LLM judge.
-- **Direct MiMo benchmark routing.** The benchmark runner now defaults to direct Xiaomi MiMo v2.5 Pro routing when configured, while keeping provider/model selection explicit.
 - Added `/restore list [N]` so users can inspect more side-git rollback
   snapshots with UTC timestamps before choosing a restore point. Plain
   `/restore` now shows the 20 most recent snapshots, numeric restore targets can
@@ -1138,7 +1200,6 @@ folds in several community contributions.
 
 ### Fixed
 
-- **Benchmark workspace copying.** Fixed benchmark workspace file copying so local benchmark tasks can preserve their intended file layout during agent runs.
 - **MiMo default tests.** Guarded Xiaomi MiMo default-model tests against ambient CI provider environment variables.
 - Stream/body decode failures such as `Stream read error: error decoding
   response body` are now classified as recoverable network interruptions
@@ -2284,7 +2345,8 @@ overflow report and `/theme` picker edge-wrapping patch in #1814.
 
 Older releases (v0.8.39 and earlier) are archived in [docs/CHANGELOG_ARCHIVE.md](docs/CHANGELOG_ARCHIVE.md).
 
-[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.63...HEAD
+[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.64...HEAD
+[0.8.64]: https://github.com/Hmbown/CodeWhale/compare/v0.8.63...v0.8.64
 [0.8.63]: https://github.com/Hmbown/CodeWhale/compare/v0.8.62...v0.8.63
 [0.8.62]: https://github.com/Hmbown/CodeWhale/compare/v0.8.61...v0.8.62
 [0.8.61]: https://github.com/Hmbown/CodeWhale/compare/v0.8.60...v0.8.61

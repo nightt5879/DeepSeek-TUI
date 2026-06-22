@@ -28,7 +28,7 @@ jobs:
           toolchain: '1.88'
           components: clippy, rustfmt
       - name: Install Linux system dependencies
-        if: runner.os == 'Linux' && matrix.target != 'x86_64-unknown-linux-musl'
+        if: runner.os == 'Linux'
         run: |
           for i in 1 2 3 4 5; do
             sudo apt-get update && break
@@ -173,6 +173,8 @@ jobs:
         with:
           toolchain: '1.88'
           targets: ${{ matrix.target }}
+      - name: Install Rust target
+        run: rustup target add --toolchain 1.88 ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -191,7 +193,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          rustup target add x86_64-unknown-linux-musl
+          rustup target add --toolchain 1.88 x86_64-unknown-linux-musl
           cargo build --release --locked --target x86_64-unknown-linux-musl
       - name: Install RISC-V cross-compilation toolchain
         if: matrix.target == 'riscv64gc-unknown-linux-gnu'

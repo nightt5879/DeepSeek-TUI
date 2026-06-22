@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -356,6 +356,7 @@ pub(super) async fn bounded_error_text(response: reqwest::Response, max_bytes: u
 }
 
 fn validate_base_url_security(base_url: &str) -> Result<()> {
+    let display_base_url = redact_url_for_display(base_url);
     if base_url.starts_with("https://")
         || base_url.starts_with("http://localhost")
         || base_url.starts_with("http://127.0.0.1")
@@ -378,7 +379,7 @@ fn validate_base_url_security(base_url: &str) -> Result<()> {
 
     if base_url.starts_with("http://") {
         anyhow::bail!(
-            "Refusing insecure base URL '{base_url}'.\n\
+            "Refusing insecure base URL '{display_base_url}'.\n\
              \n\
              Loopback hosts (localhost, 127.0.0.1, [::1]) are auto-allowed.\n\
              For other trusted local hosts (LAN, llama.cpp on a private IP, etc.)\n\
@@ -389,8 +390,63 @@ fn validate_base_url_security(base_url: &str) -> Result<()> {
     }
 
     anyhow::bail!(
-        "Refusing base URL '{base_url}': only HTTPS (or explicitly allowed HTTP) URLs are supported.",
+        "Refusing base URL '{display_base_url}': only HTTPS (or explicitly allowed HTTP) URLs are supported.",
     )
+}
+
+pub(crate) fn redact_url_for_display(url: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return url.to_string();
+    };
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        let _ = parsed.set_username("***");
+        let _ = parsed.set_password(Some("***"));
+    }
+    if parsed.query().is_none() {
+        return parsed.to_string();
+    }
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(key, value)| {
+            let value = if is_sensitive_url_query_key(&key) {
+                "***".to_string()
+            } else {
+                value.into_owned()
+            };
+            (key.into_owned(), value)
+        })
+        .collect();
+    parsed.set_query(None);
+    let mut query = parsed.query_pairs_mut();
+    for (key, value) in pairs {
+        query.append_pair(&key, &value);
+    }
+    drop(query);
+    parsed.to_string()
+}
+
+fn is_sensitive_url_query_key(key: &str) -> bool {
+    let normalized = key.trim().replace(['-', '.'], "_").to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "api_key"
+            | "apikey"
+            | "access_token"
+            | "auth_token"
+            | "authorization"
+            | "bearer"
+            | "client_secret"
+            | "credential"
+            | "id_token"
+            | "password"
+            | "refresh_token"
+            | "secret"
+            | "token"
+    ) || normalized.ends_with("_api_key")
+        || normalized.ends_with("_authorization")
+        || normalized.ends_with("_password")
+        || normalized.ends_with("_secret")
+        || normalized.ends_with("_token")
 }
 
 pub(super) fn versioned_base_url(base_url: &str) -> String {
@@ -594,7 +650,10 @@ impl DeepSeekClient {
             .and_then(|p| p.path_suffix.clone());
 
         logging::info(format!("API provider: {}", api_provider.as_str()));
-        logging::info(format!("API base URL: {base_url}"));
+        logging::info(format!(
+            "API base URL: {}",
+            redact_url_for_display(&base_url)
+        ));
         if let Some(suffix) = &path_suffix {
             logging::info(format!("API path suffix override: {suffix}"));
         }
@@ -606,22 +665,21 @@ impl DeepSeekClient {
         }
         if insecure_skip_tls_verify {
             logging::warn(format!(
-                "TLS certificate verification is disabled for provider {}; prefer SSL_CERT_FILE with a trusted custom CA bundle when possible",
+                "TLS certificate verification cannot be disabled for provider {}; use SSL_CERT_FILE with a trusted custom CA bundle instead",
                 api_provider.as_str()
             ));
+            bail!(
+                "TLS certificate verification cannot be disabled for provider {}; configure SSL_CERT_FILE with a trusted custom CA bundle instead",
+                api_provider.as_str()
+            );
         }
         logging::info(format!(
             "Retry policy: enabled={}, max_retries={}, initial_delay={}s, max_delay={}s",
             retry.enabled, retry.max_retries, retry.initial_delay, retry.max_delay
         ));
 
-        let http_client = Self::build_http_client(
-            &api_key,
-            &http_headers,
-            api_provider,
-            &base_url,
-            insecure_skip_tls_verify,
-        )?;
+        let http_client =
+            Self::build_http_client(&api_key, &http_headers, api_provider, &base_url)?;
 
         Ok(Self {
             http_client,
@@ -642,7 +700,6 @@ impl DeepSeekClient {
         extra_headers: &HashMap<String, String>,
         api_provider: ApiProvider,
         base_url: &str,
-        insecure_skip_tls_verify: bool,
     ) -> Result<reqwest::Client> {
         let headers = build_default_headers(api_key, extra_headers, api_provider, base_url)?;
         // The ChatGPT Codex backend sits behind Cloudflare bot protection that
@@ -677,9 +734,6 @@ impl DeepSeekClient {
             && !cert_path.is_empty()
         {
             builder = add_extra_root_certs(builder, &cert_path);
-        }
-        if insecure_skip_tls_verify {
-            builder = builder.danger_accept_invalid_certs(true);
         }
         builder.build().map_err(Into::into)
     }
@@ -1855,23 +1909,31 @@ mod tests {
             &HashMap::new(),
             ApiProvider::Deepseek,
             crate::config::DEFAULT_DEEPSEEK_BASE_URL,
-            false,
         );
 
         assert!(client.is_ok());
     }
 
     #[test]
-    fn build_http_client_accepts_provider_scoped_tls_skip_verify() {
-        let client = DeepSeekClient::build_http_client(
-            "sk-test",
-            &HashMap::new(),
-            ApiProvider::Openai,
-            crate::config::DEFAULT_OPENAI_BASE_URL,
-            true,
-        );
+    fn client_new_rejects_provider_scoped_tls_skip_verify() {
+        let mut providers = crate::config::ProvidersConfig::default();
+        providers.openai.api_key = Some("sk-test".to_string());
+        providers.openai.base_url = Some(crate::config::DEFAULT_OPENAI_BASE_URL.to_string());
+        providers.openai.insecure_skip_tls_verify = Some(true);
+        let config = Config {
+            provider: Some("openai".to_string()),
+            providers: Some(providers),
+            ..Config::default()
+        };
+        assert!(config.insecure_skip_tls_verify());
 
-        assert!(client.is_ok());
+        let err = match DeepSeekClient::new(&config) {
+            Ok(_) => panic!("tls skip verify should be rejected"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("cannot be disabled"));
+        assert!(message.contains("SSL_CERT_FILE"));
     }
 
     #[test]
@@ -3852,6 +3914,22 @@ mod tests {
     }
 
     #[test]
+    fn base_url_security_errors_redact_sensitive_url_parts() {
+        let _lock = ALLOW_INSECURE_HTTP_ENV_LOCK.lock().unwrap();
+        let _guard = AllowInsecureHttpEnvGuard::capture();
+        unsafe { std::env::remove_var(ALLOW_INSECURE_HTTP_ENV) };
+
+        let err =
+            validate_base_url_security("http://user:secret@example.com/v1?api_key=sk-test&ok=1")
+                .expect_err("non-local insecure HTTP should be rejected");
+        let message = err.to_string();
+
+        assert!(message.contains("http://***:***@example.com/v1?api_key=***&ok=1"));
+        assert!(!message.contains("user:secret"));
+        assert!(!message.contains("sk-test"));
+    }
+
+    #[test]
     fn base_url_security_allows_localhost_http() {
         let _lock = ALLOW_INSECURE_HTTP_ENV_LOCK.lock().unwrap();
         let _guard = AllowInsecureHttpEnvGuard::capture();
@@ -4054,6 +4132,18 @@ mod tests {
         assert_eq!(
             api_url_with_suffix("https://api.deepseek.com", "chat/completions", None),
             "https://api.deepseek.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn redact_url_for_display_masks_userinfo_and_sensitive_query_values() {
+        let redacted = redact_url_for_display(
+            "https://user:secret@example.com/v1?api_key=sk-test&region=us&refresh-token=abc",
+        );
+
+        assert_eq!(
+            redacted,
+            "https://***:***@example.com/v1?api_key=***&region=us&refresh-token=***"
         );
     }
 

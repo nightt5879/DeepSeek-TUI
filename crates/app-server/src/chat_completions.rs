@@ -224,9 +224,25 @@ pub(crate) async fn chat_completions_handler(
 
     let url = upstream_url(&endpoint);
 
+    if endpoint.insecure_skip_tls_verify {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": format!(
+                        "TLS certificate verification cannot be disabled for provider {:?}; use SSL_CERT_FILE with a trusted custom CA bundle",
+                        endpoint.provider
+                    ),
+                    "type": "invalid_request_error",
+                    "code": "tls_verification_required"
+                }
+            })),
+        )
+            .into_response();
+    }
+
     // Build upstream request.
     let upstream_req = reqwest::Client::builder()
-        .danger_accept_invalid_certs(endpoint.insecure_skip_tls_verify)
         .build()
         .map_err(|e| {
             (
@@ -386,6 +402,14 @@ mod tests {
         auth_token: Option<&str>,
         mock_base_url: &str,
     ) -> (axum::Router, tempfile::TempDir) {
+        app_with_mock_upstream_with_provider_extra(auth_token, mock_base_url, "")
+    }
+
+    fn app_with_mock_upstream_with_provider_extra(
+        auth_token: Option<&str>,
+        mock_base_url: &str,
+        provider_extra: &str,
+    ) -> (axum::Router, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config_path = tmp.path().join("config.toml");
         let config_content = format!(
@@ -397,6 +421,7 @@ api_key = "sk-deepseek-secret"
 base_url = "{mock_base_url}"
 model = "trinity-large-thinking"
 api_key = "arcee-configured-key"
+{provider_extra}
 "#
         );
         fs::write(&config_path, config_content).expect("write config");
@@ -593,6 +618,46 @@ api_key = "arcee-configured-key"
         assert!(
             content.contains("auth=Bearer arcee-configured-key"),
             "expected configured auth in mock echo, got: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn insecure_tls_skip_verify_is_rejected() {
+        install_crypto_provider();
+        let (mock_url, _mock) = start_mock_upstream().await;
+        let (app, _tmp) = app_with_mock_upstream_with_provider_extra(
+            None,
+            &mock_url,
+            "insecure_skip_tls_verify = true",
+        );
+
+        let body = serde_json::json!({
+            "model": "trinity-large-thinking",
+            "messages": [
+                {"role": "user", "content": "hello"}
+            ]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let resp_body = response_body_json(response).await;
+        assert_eq!(resp_body["error"]["code"], "tls_verification_required");
+        assert!(
+            resp_body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("SSL_CERT_FILE")
         );
     }
 

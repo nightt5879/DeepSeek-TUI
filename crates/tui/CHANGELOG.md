@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.64] - 2026-06-22
+
+### Added
+
+- **Seamless auto-compaction defaults.** Known large-context routes now keep
+  automatic compaction on by default while carrying summaries forward through
+  the stable prompt path, reducing surprise context loss without changing
+  explicit opt-out behavior.
+- **Runtime web automation readiness.** Local app automation gains a
+  loopback-only dev-server readiness primitive so agents can wait for TCP and
+  optional HTTP health checks before browser verification. Harvested from
+  #3376 by @cyq1017.
+- **Model and integration polish.** `/model pro` and `/model flash` shortcuts
+  now resolve to the current DeepSeek V4 routes while preserving existing model
+  IDs. Harvested from #3350 by @KUK4. The WeCom bridge landed with
+  maintainer follow-up hardening for state permissions and chat-facing error
+  reporting, from #3370 by @pkeging.
+
+### Fixed
+
+- **Security and trust-boundary hardening.** Project-local config can no longer
+  loosen user-owned shell or instruction-file policy, file edits now require a
+  fresh read of the target file, git history inputs reject option-shaped or
+  control-character revisions, interactive execution surfaces require approval,
+  and local tool paths are narrowed through workspace/root validation.
+- **Runtime and diagnostics redaction.** Generated runtime/app-server tokens,
+  raw session lineage identifiers, provider registry drift values, review
+  receipt internals, and webhook URLs are no longer echoed into human-facing
+  logs or diagnostics.
+- **Network and alert safety.** Provider TLS verification bypass requests now
+  fail closed, fleet alert webhooks require HTTPS, fetch URL hostnames are
+  resolved before requests, and runtime mobile auth no longer relies on
+  token-bearing URLs.
+- **Path-state hardening.** Config sibling files, project MCP cwd values,
+  runtime thread store files, sub-agent state, project-local state roots, and
+  app-server sidecar config paths now resolve through checked roots before
+  reads/writes.
+- **Release CI repair.** Nightly cross-target builds install Rust targets
+  explicitly and retry transient cargo failures; auto-tag runs are serialized
+  and treat an already-created remote tag as a no-op. Safe slices harvested
+  from #3374 by @donglovejava.
+- **Provider wait and sidebar regressions.** Provider-wait footers suppress
+  noisy countdowns until useful while keeping timeout warnings visible,
+  harvested from #3375 by @idling11. The pinned sidebar can render at a
+  narrower 64-column boundary, harvested from #3371 by @donglovejava.
+- **Delegated server cleanup.** Delegated `serve` / `app-server` children gain
+  OS-level parent-death cleanup on supported platforms, completing the #3259
+  follow-up from #3378 and #3317 by @wuisabel-gif.
+- **ACP and sandbox correctness.** ACP sessions preserve multi-turn
+  conversation history across prompt turns, harvested from #3372 by @xulongzhe.
+  Worktree Git metadata writes are allowed through sandbox policy without
+  broad trust-mode escalation, from #3356 by @cyq1017 and the #3355 report by
+  @linletian.
+
+### Changed
+
+- **Community and dependency harvests.** The release train carries focused
+  community-credit slices from #3379 by @greyfreedom, #3348 by @nightt5879,
+  #3346 by @hongqitai, #3345/#3333 by @cyq1017, and Dependabot updates for
+  `windows`, `toml`, `tokio`, `lru`, `similar`, and web tooling security locks.
+- **Public release surface cleanup.** Benchmark-specific materials were kept
+  out of the public release repo; benchmark source fragments belong in the
+  separate `codewhale-bench` lane.
+
 ## [0.8.63] - 2026-06-19
 
 ### Added
@@ -55,7 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while Ctrl-X is scoped to Tasks-sidebar background shell cancellation. Shell
   jobs launched by sub-agents now render with their child-agent owner in the
   Tasks sidebar and transcript.
-- **Benchmark-turn recovery and context economy.** Repeated read-only search
+- **Long-turn recovery and context economy.** Repeated read-only search
   loop blocks now return guidance instead of fatal tool failures, Python build
   failures that are missing `setuptools` include an install/retry hint, long
   foreground shell timeouts steer models toward background execution, and noisy
@@ -123,7 +187,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 - **Base prompt / delegate skill guidance** updated to encourage parallel
   read-only exploration (2-4 `type: "explore"` sub-agents) for broad repo,
-  version, branch, benchmark, and API-surface investigations, while keeping
+  version, branch, release, and API-surface investigations, while keeping
   architecture, integration, and final verification in the parent. The
   delegate skill examples now use provider-neutral `model_strength` instead of
   hardcoded DeepSeek model ids.
@@ -297,7 +361,7 @@ folds in several community contributions.
 - Work sidebar no longer shows stale `phase now:` / `phase next:` strategy rows once the checklist
   is 100% complete.
 - Plan mode no longer shortcuts investigation for requests that name a repository, URL, version,
-  release, build state, benchmark, bug, PR, issue, API surface, or local code path.
+  release, build state, bug, PR, issue, API surface, or local code path.
 - Oversized pasted text stays editable in the composer, with a file backup appended at submit
   time for model access; thanks @idling11 (#3267, closes #3263).
 - Bare digit keys `1`-`8` now insert text instead of firing hotbar slots; use `Alt+digit` for
@@ -796,8 +860,6 @@ folds in several community contributions.
 
 ### Added
 
-- **Benchmark harness runners.** Added CodeWhale-native benchmark entry points for SWE-bench, Terminal-Bench, and PinchBench, plus a local PinchBench runner that can grade tool-use traces with an LLM judge.
-- **Direct MiMo benchmark routing.** The benchmark runner now defaults to direct Xiaomi MiMo v2.5 Pro routing when configured, while keeping provider/model selection explicit.
 - Added `/restore list [N]` so users can inspect more side-git rollback
   snapshots with UTC timestamps before choosing a restore point. Plain
   `/restore` now shows the 20 most recent snapshots, numeric restore targets can
@@ -1138,7 +1200,6 @@ folds in several community contributions.
 
 ### Fixed
 
-- **Benchmark workspace copying.** Fixed benchmark workspace file copying so local benchmark tasks can preserve their intended file layout during agent runs.
 - **MiMo default tests.** Guarded Xiaomi MiMo default-model tests against ambient CI provider environment variables.
 - Stream/body decode failures such as `Stream read error: error decoding
   response body` are now classified as recoverable network interruptions
@@ -1412,77 +1473,6 @@ harvested into this release. Thanks also to **@idling11** (#2602),
 **@gordonlu** (#2585), **@cyq1017** (#2593), **@xyuai** (#2587, #2584),
 and **@IcedOranges** (#2584) for reports, drafts, and investigations
 that shaped this release cycle.
-
-## [0.8.50] - 2026-06-02
-
-### Added
-
-- Added a Windows NSIS installer release artifact and classroom/lab deployment
-  checklist, harvested from #2045 for #1987. The release workflow now builds
-  `CodeWhaleSetup.exe` from the canonical Windows binaries, and the installer
-  adds/removes only the exact current-user PATH entry.
-- Added deterministic session timestamps in session listings, receipt-export
-  boundary docs, and current-model turn metadata for routed/auto sessions.
-- Added exact AtlasCloud provider-hinted model ID pass-through for explicit
-  `vendor/model-id` selections, harvested from #2569 without freezing a
-  brittle provider catalog.
-- Added Xiaomi MiMo speech/TTS support with a `codewhale speech` CLI command,
-  `tts` tool alias, and config wiring for voice-design and voice-clone models,
-  harvested from #2560.
-- Added a three-zone immutable prefix diagnostic layer (FrozenPrefix Phase 2)
-  that logs cache-prefix drift at debug level without blocking requests,
-  harvested from #2514.
-- Added a Cache Guard CI integration test suite simulating prefix-cache
-  behaviour across nine scenarios, gated behind `CODEWHALE_CACHE_GUARD=1`,
-  harvested from #2503.
-- Added a plan-mode byte-stability invariant test verifying that the tool
-  catalog head remains byte-identical across mode toggles, harvested from
-  #2519.
-- Localized all 15 `/queue` command messages across 7 shipped locales,
-  harvested from #2568.
-- Added localized `FanoutCounts` MessageId for i18n of the aggregate worker
-  stats line in fanout cards, harvested from #2566.
-- Added contribution gate CI workflows (PR gate, issue gate, contributor
-  approval) with a dry-run mode, harvested from #2565.
-
-### Changed
-
-- Hardened theme repainting and sidebar color use so theme switches do not
-  leave stale Whale-dark panel colors behind.
-- Made legacy config migration visible when CodeWhale copies old DeepSeek-era
-  config into the CodeWhale config path.
-
-### Fixed
-
-- Fixed `/context` to use the effective routed model for context-window
-  budgeting, so DeepSeek V4 routes report the 1M-token window and legacy
-  DeepSeek routes keep the 128K fallback.
-- Fixed npm wrapper version output so `--version` prefers the installed binary
-  version instead of stale package metadata when both are available.
-- Fixed multiline composer arrow navigation so holding Up/Down at the first or
-  last line no longer replaces the current draft with prompt history.
-- Fixed foreground `exec_shell` output collection so timeout and inherited-pipe
-  cleanup cannot wedge later tool calls behind the global tool lock.
-- Clarified the English DeepSeek account-balance footer chip from `bal` to
-  `balance` so it is less likely to be mistaken for session spend.
-- Fixed truncated subagent tool calls and repeated truncated subagent responses
-  so they return model-visible errors instead of silently failing.
-- Moved Paste to the first position in the right-click context menu so users
-  copying text from the output area can paste with a single left-click instead
-  of navigating past cell-specific actions.
-
-### Community
-
-Thanks to **@ZhulongNT** (#2045), **@cyq1017** (#2521, #2536, #2537, #2559,
-#2562, #2563, #2564), **@HUQIANTAO** (#2527, #2519, #2503), **@lucaszhu-hue**
-(#2569), **@idling11** (#2573), **@encyc** (#2514), **@xyuai** (#2560),
-**@gordonlu** (#2568, #2566), and **@nightt5879** (#2565) for the work
-harvested into this release pass. Thanks
-also to issue reporters and verification helpers including **@New2Niu**
-(#2561), **@buko** (#2533, #2369), **@wywsoor** (#2494), **@ctxyao** (#2556),
-**@Dr3259** (#2380), **@caiyilian** (#2567), and **@chinaqy110** (#2571) for
-reports and acceptance details that shaped these fixes, plus the WeChat/Chinese
-UX reports relayed during the final triage pass.
 
 ---
 

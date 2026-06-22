@@ -205,17 +205,6 @@ non-interactive filesystem/shell tool use, matching the supported automation
 path used by stream-json wrappers.
 ")]
     Exec(TuiPassthroughArgs),
-    /// Generate SWE-bench prediction rows from CodeWhale runs.
-    #[command(after_help = "\
-Examples:
-  codewhale swebench run --instance-id django__django-12345 --issue-file issue.md
-  codewhale swebench export --instance-id django__django-12345 --predictions-path all_preds.jsonl
-
-This command forwards to the TUI runtime. `run` invokes tool-backed agent mode
-and writes a SWE-bench-compatible JSONL prediction row from the resulting
-working-tree diff. `export` only writes the current diff.
-")]
-    Swebench(TuiPassthroughArgs),
     /// Manage durable Agent Fleet runs via the TUI runtime.
     Fleet(TuiPassthroughArgs),
     /// Run a CodeWhale-powered code review over a git diff.
@@ -277,7 +266,7 @@ Transports:
 --http`/`--mobile`, which remain as compatibility aliases. The runtime API token
 is read from --auth-token, CODEWHALE_RUNTIME_TOKEN, or DEEPSEEK_RUNTIME_TOKEN.
 
-See docs/RUNTIME_API.md and scripts/release/app-server-smoke.sh.")]
+See docs/RUNTIME_API.md.")]
     AppServer(AppServerArgs),
     /// Generate shell completions.
     #[command(after_help = r#"Examples:
@@ -507,6 +496,8 @@ enum ModelCommand {
         #[arg(long, value_enum)]
         provider: Option<ProviderArg>,
     },
+    /// Set the default model (e.g. "pro", "flash", "deepseek-v4-pro").
+    Set { model: String },
 }
 
 #[derive(Debug, Args)]
@@ -595,7 +586,7 @@ struct AppServerArgs {
     #[arg(long, conflicts_with = "stdio")]
     mobile: bool,
     /// Run the app-server JSON-RPC control transport over stdio (no listener).
-    /// Used by local SDKs and the release benchmark smoke probe.
+    /// Used by local SDKs and JSON-RPC integrations.
     #[arg(long, default_value_t = false)]
     stdio: bool,
     /// Show a QR code for the mobile URL in the terminal (requires --mobile).
@@ -715,10 +706,6 @@ fn run() -> Result<()> {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             delegate_to_tui(&cli, &resolved_runtime, tui_args("exec", args))
         }
-        Some(Commands::Swebench(args)) => {
-            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
-            delegate_to_tui(&cli, &resolved_runtime, tui_args("swebench", args))
-        }
         Some(Commands::Fleet(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             delegate_to_tui(&cli, &resolved_runtime, tui_args("fleet", args))
@@ -758,7 +745,9 @@ fn run() -> Result<()> {
         Some(Commands::Auth(args)) => run_auth_command(&mut store, args.command),
         Some(Commands::McpServer) => run_mcp_server_command(&mut store),
         Some(Commands::Config(args)) => run_config_command(&mut store, args.command),
-        Some(Commands::Model(args)) => run_model_command(args.command, runtime_overrides.provider),
+        Some(Commands::Model(args)) => {
+            run_model_command(&mut store, args.command, runtime_overrides.provider)
+        }
         Some(Commands::Thread(args)) => run_thread_command(args.command),
         Some(Commands::Sandbox(args)) => run_sandbox_command(args.command),
         Some(Commands::AppServer(args)) => {
@@ -1499,6 +1488,7 @@ fn model_command_provider_hint(
 }
 
 fn run_model_command(
+    store: &mut ConfigStore,
     command: ModelCommand,
     top_level_provider: Option<ProviderKind>,
 ) -> Result<()> {
@@ -1521,6 +1511,21 @@ fn run_model_command(
             println!("resolved: {}", resolved.resolved.id);
             println!("provider: {}", resolved.resolved.provider.as_str());
             println!("used_fallback: {}", resolved.used_fallback);
+            Ok(())
+        }
+        ModelCommand::Set { model } => {
+            let trimmed = model.trim();
+            if trimmed.is_empty() {
+                bail!("Model name cannot be empty");
+            }
+            let canonical = match trimmed.to_ascii_lowercase().as_str() {
+                "pro" | "deepseek-v4pro" => "deepseek-v4-pro",
+                "flash" | "deepseek-v4flash" => "deepseek-v4-flash",
+                _ => trimmed,
+            };
+            store.config.default_text_model = Some(canonical.to_string());
+            store.save()?;
+            println!("Default model set to '{canonical}'");
             Ok(())
         }
     }
@@ -1768,15 +1773,20 @@ fn delegate_to_tui(
 /// child before the dispatcher exits, and `kill_on_drop` tears the child down
 /// if the dispatcher unwinds.
 ///
-/// An uncatchable `SIGKILL` of the dispatcher cannot run this path; covering
-/// that needs `PR_SET_PDEATHSIG` (Linux) / Job Objects (Windows) and is tracked
-/// as follow-up on #3259.
+/// For an *uncatchable* dispatcher death (SIGKILL, a hard crash) the Tokio
+/// supervisor above can't run, so two OS-level safety nets are installed as
+/// well (#3259): on Linux the child sets `PR_SET_PDEATHSIG` so the kernel
+/// signals it when the dispatcher dies; on Windows the child is placed in a
+/// kill-on-job-close Job Object so closing the dispatcher's handle (which the
+/// OS does on process death) terminates it. macOS has no equivalent primitive,
+/// so an uncatchable dispatcher death there can still orphan the child.
 fn delegate_server_to_tui(
     cli: &Cli,
     resolved_runtime: &ResolvedRuntimeOptions,
     passthrough: Vec<String>,
 ) -> Result<()> {
-    let std_cmd = build_tui_command(cli, resolved_runtime, passthrough)?;
+    let mut std_cmd = build_tui_command(cli, resolved_runtime, passthrough)?;
+    install_server_parent_death_signal(&mut std_cmd);
     let tui = PathBuf::from(std_cmd.get_program());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1788,6 +1798,12 @@ fn delegate_server_to_tui(
         let mut child = cmd
             .spawn()
             .map_err(|err| anyhow!("{}", tui_spawn_error(&tui, &err)))?;
+        // Windows: hold a kill-on-job-close Job Object for the dispatcher's
+        // lifetime so an uncatchable dispatcher death tears the child down.
+        // Bound for the whole `block_on` scope; never dropped early because the
+        // match arms below `std::process::exit`.
+        #[cfg(windows)]
+        let _child_job = attach_server_child_job(&child);
         match supervise_server_child(&mut child, server_shutdown_signal()).await? {
             ServerTeardown::Exited(status) => exit_with_tui_status(status),
             // The child has been killed and reaped; exit with the conventional
@@ -1796,6 +1812,30 @@ fn delegate_server_to_tui(
         }
     })
 }
+
+/// On Linux, ask the kernel to terminate the delegated server if the dispatcher
+/// dies before it can run the graceful shutdown supervisor. This covers the
+/// hard parent-death edge of #3259 for `SIGKILL`, OOM, or abrupt process exit.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn install_server_parent_death_signal(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `pre_exec` runs in the child between fork and exec. The closure
+    // only calls `libc::prctl` with constant arguments and does not touch heap
+    // memory or parent-held locks.
+    unsafe {
+        cmd.pre_exec(|| {
+            let result = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
+            if result == -1 {
+                // Best effort: the child only loses this OS-level safety net.
+                let _ = std::io::Error::last_os_error();
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+fn install_server_parent_death_signal(_cmd: &mut Command) {}
 
 /// Outcome of supervising a delegated server child.
 #[derive(Debug)]
@@ -1830,10 +1870,7 @@ where
 
 /// Resolve when the dispatcher should tear down a delegated server child, and
 /// the conventional `128 + signal` exit code to propagate: Ctrl+C on every
-/// platform (130), plus SIGTERM (143) and SIGHUP (129) on Unix (e.g.
-/// `kill <pid>` or a service manager stopping the process). A signal source
-/// that fails to install simply never fires, leaving Ctrl+C as the floor.
-/// Mirrors `wait_for_terminating_signal` in `crates/tui/src/main.rs`.
+/// platform (130), plus SIGTERM (143) and SIGHUP (129) on Unix.
 #[cfg(unix)]
 async fn server_shutdown_signal() -> i32 {
     use tokio::signal::unix::{SignalKind, signal};
@@ -1866,6 +1903,87 @@ async fn server_shutdown_signal() -> i32 {
 async fn server_shutdown_signal() -> i32 {
     let _ = tokio::signal::ctrl_c().await;
     130
+}
+
+/// Assign the delegated server `child` to a kill-on-job-close Job Object so the
+/// OS terminates it when the dispatcher's handle to the job closes — which it
+/// does on any dispatcher exit, including an uncatchable kill (#3259). The
+/// returned guard must be held for the dispatcher's lifetime. Best-effort:
+/// returns `None` if the job cannot be created or assigned. Mirrors the Job
+/// Object idiom in `crates/tui/src/tools/shell.rs`.
+#[cfg(windows)]
+fn attach_server_child_job(child: &tokio::process::Child) -> Option<ServerChildJob> {
+    let Some(child_handle) = child.raw_handle() else {
+        tracing::warn!("delegated server child exited before a job object could be attached");
+        return None;
+    };
+
+    match ServerChildJob::attach(child_handle) {
+        Ok(job) => Some(job),
+        Err(err) => {
+            tracing::warn!("failed to place delegated server child in a job object: {err}");
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ServerChildJob {
+    handle: windows::Win32::Foundation::HANDLE,
+}
+
+// SAFETY: the wrapped value is a process-wide kernel handle; moving it across
+// threads does not invalidate it, and it is only ever closed once, on drop.
+#[cfg(windows)]
+unsafe impl Send for ServerChildJob {}
+
+#[cfg(windows)]
+impl ServerChildJob {
+    fn attach(child_handle: std::os::windows::io::RawHandle) -> std::io::Result<Self> {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        use windows::core::PCWSTR;
+
+        // SAFETY: FFI calls with valid arguments; results are checked via the
+        // `windows` Result wrappers and the handle is stored for close-on-drop.
+        let handle = unsafe { CreateJobObjectW(None, PCWSTR::null()) }.map_err(win_io_error)?;
+        let job = Self { handle };
+
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        unsafe {
+            SetInformationJobObject(
+                job.handle,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+            .map_err(win_io_error)?;
+            AssignProcessToJobObject(job.handle, HANDLE(child_handle)).map_err(win_io_error)?;
+        }
+        Ok(job)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ServerChildJob {
+    fn drop(&mut self) {
+        // Closing the last handle triggers KILL_ON_JOB_CLOSE. On a normal return
+        // the child has already been reaped, so this is a no-op cleanup; an
+        // uncatchable dispatcher death closes the handle via the OS instead.
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn win_io_error(err: windows::core::Error) -> std::io::Error {
+    std::io::Error::other(err)
 }
 
 #[cfg(all(test, unix))]
@@ -1914,6 +2032,15 @@ mod server_teardown_tests {
             child.id().is_none(),
             "delegated child must be reaped after dispatcher teardown"
         );
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    #[test]
+    fn parent_death_signal_hook_does_not_break_spawn() {
+        let mut cmd = Command::new("true");
+        install_server_parent_death_signal(&mut cmd);
+        let status = cmd.status().expect("spawn true with parent-death hook");
+        assert!(status.success());
     }
 }
 
@@ -1978,7 +2105,7 @@ fn build_tui_command(
     if verbosity.is_none()
         && passthrough
             .iter()
-            .any(|arg| matches!(arg.as_str(), "exec" | "swebench" | "eval"))
+            .any(|arg| matches!(arg.as_str(), "exec" | "eval"))
     {
         verbosity = Some("concise".to_string());
     }
@@ -2458,6 +2585,14 @@ mod tests {
                     provider: Some(ProviderArg::Deepseek)
                 }
             })) if model == "deepseek-v4-pro"
+        ));
+
+        let cli = parse_ok(&["deepseek", "model", "set", "pro"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Model(ModelArgs {
+                command: ModelCommand::Set { ref model }
+            })) if model == "pro"
         ));
     }
 

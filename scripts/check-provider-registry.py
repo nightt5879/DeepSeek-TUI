@@ -35,10 +35,27 @@ HUGGINGFACE_ALIASES = {"huggingface", "hugging-face", "hugging_face", "hf"}
 HUGGINGFACE_API_KEY_ENV_ORDER = ["HUGGINGFACE_API_KEY", "HF_TOKEN"]
 HUGGINGFACE_BASE_URL_ENV_ORDER = ["HUGGINGFACE_BASE_URL", "HF_BASE_URL"]
 HUGGINGFACE_MODEL_ENV_ORDER = ["HUGGINGFACE_MODEL", "HF_MODEL"]
+SENSITIVE_IDENTIFIER_RE = re.compile(r"(?i)(api[_-]?key|token|secret|password|credential)")
+SENSITIVE_BEARER_RE = re.compile(r"(?i)(authorization:\s*bearer\s+)\S+")
+SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(api[_-]?key|token|secret|password|credential)(\s*[:=]\s*)\S+"
+)
 
 
 def read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def display_public_value(value: str) -> str:
+    if SENSITIVE_IDENTIFIER_RE.search(value):
+        return "<redacted sensitive identifier>"
+    return value
+
+
+def redact_sensitive_text(value: str) -> str:
+    value = SENSITIVE_BEARER_RE.sub(r"\1<redacted>", value)
+    value = SENSITIVE_ASSIGNMENT_RE.sub(r"\1\2<redacted>", value)
+    return SENSITIVE_IDENTIFIER_RE.sub("<redacted sensitive identifier>", value)
 
 
 def require_index(source: str, needle: str, context: str, start: int = 0) -> int:
@@ -265,7 +282,7 @@ def report_huggingface_coverage(
     )
 
     for label, env_order in [
-        ("Hugging Face API key env precedence", HUGGINGFACE_API_KEY_ENV_ORDER),
+        ("Hugging Face auth env precedence", HUGGINGFACE_API_KEY_ENV_ORDER),
         ("Hugging Face base URL env precedence", HUGGINGFACE_BASE_URL_ENV_ORDER),
         ("Hugging Face model env precedence", HUGGINGFACE_MODEL_ENV_ORDER),
     ]:
@@ -290,16 +307,23 @@ def report_env_lookup_order(
 def report_string_order(
     label: str, source: str, expected_order: list[str], context: str
 ) -> list[str]:
+    contains_sensitive_expected_value = any(
+        SENSITIVE_IDENTIFIER_RE.search(value) for value in expected_order
+    )
     positions = []
     for needle in expected_order:
         index = source.find(needle)
         if index == -1:
-            return [f"{label} missing {needle!r} in {context}"]
+            if contains_sensitive_expected_value:
+                return [f"{label} missing required entry in {context}"]
+            return [f"{label} missing {display_public_value(needle)!r} in {context}"]
         positions.append(index)
     if positions != sorted(positions):
+        if contains_sensitive_expected_value:
+            return [f"{label} has wrong order in {context}"]
         return [
             f"{label} has wrong order in {context}: expected "
-            + " before ".join(expected_order)
+            + " before ".join(display_public_value(value) for value in expected_order)
         ]
     return []
 
@@ -352,7 +376,7 @@ def main() -> int:
     if errors:
         print("Provider registry drift check failed:", file=sys.stderr)
         for error in errors:
-            print(f"- {error}", file=sys.stderr)
+            print(f"- {redact_sensitive_text(error)}", file=sys.stderr)
         return 1
 
     print("Provider registry drift check passed.")

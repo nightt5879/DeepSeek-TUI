@@ -6,8 +6,11 @@
 //! - `ToolResult`: Unified result type for tool execution
 //! - `ToolCapability`: Capabilities and requirements of tools
 
+use std::collections::HashMap;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -102,6 +105,33 @@ impl std::fmt::Debug for RuntimeToolServices {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileReadSnapshot {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Debug, Default)]
+pub struct FileReadTracker {
+    reads: HashMap<PathBuf, FileReadSnapshot>,
+}
+
+pub type SharedFileReadTracker = Arc<Mutex<FileReadTracker>>;
+
+fn new_shared_file_read_tracker() -> SharedFileReadTracker {
+    Arc::new(Mutex::new(FileReadTracker::default()))
+}
+
+fn file_read_snapshot(path: &Path) -> Result<FileReadSnapshot, ToolError> {
+    let metadata = fs::metadata(path).map_err(|e| {
+        ToolError::execution_failed(format!("Failed to inspect {}: {e}", path.display()))
+    })?;
+    Ok(FileReadSnapshot {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
 /// Sandbox policy for command execution.
 #[derive(Debug, Clone, Default)]
 pub enum SandboxPolicy {
@@ -117,6 +147,10 @@ pub struct ToolContext {
     pub workspace: PathBuf,
     /// Shared shell manager for background tasks and streaming IO.
     pub shell_manager: SharedShellManager,
+    /// Per-session snapshots for files successfully observed by `read_file`.
+    /// Mutation tools use this to reject narrow edits against unread or stale
+    /// content.
+    pub file_read_tracker: SharedFileReadTracker,
     /// Sub-agent that owns tool work started through this context. Root user
     /// turns leave this unset; child contexts stamp it so long-running shell
     /// jobs can be attributed in UI surfaces.
@@ -222,11 +256,16 @@ impl ToolContext {
         let workspace = workspace.into();
         let shell_manager = new_shared_shell_manager(workspace.clone());
         // Prefer .codewhale, fall back to .deepseek for project-local state
-        let notes_path = codewhale_config::resolve_project_state_dir(&workspace, "notes.md").1;
-        let mcp_config_path = codewhale_config::resolve_project_state_dir(&workspace, "mcp.json").1;
+        let notes_path = codewhale_config::resolve_project_state_dir(&workspace, "notes.md")
+            .expect("hardcoded project notes state path is valid")
+            .1;
+        let mcp_config_path = codewhale_config::resolve_project_state_dir(&workspace, "mcp.json")
+            .expect("hardcoded project MCP state path is valid")
+            .1;
         Self {
             workspace,
             shell_manager,
+            file_read_tracker: new_shared_file_read_tracker(),
             owner_agent_id: None,
             owner_agent_name: None,
             trust_mode: false,
@@ -271,6 +310,7 @@ impl ToolContext {
         Self {
             workspace,
             shell_manager,
+            file_read_tracker: new_shared_file_read_tracker(),
             owner_agent_id: None,
             owner_agent_name: None,
             trust_mode,
@@ -315,6 +355,7 @@ impl ToolContext {
         Self {
             workspace,
             shell_manager,
+            file_read_tracker: new_shared_file_read_tracker(),
             owner_agent_id: None,
             owner_agent_name: None,
             trust_mode,
@@ -442,6 +483,65 @@ impl ToolContext {
     pub fn with_lsp_manager(mut self, manager: Arc<LspManager>) -> Self {
         self.lsp_manager = Some(manager);
         self
+    }
+
+    /// Remember that the caller has observed the current on-disk state of a
+    /// file. This is intentionally best-effort so successful reads/writes do
+    /// not fail after completing only because a post-operation metadata lookup
+    /// raced with filesystem changes.
+    pub fn note_file_read(&self, path: &Path) {
+        let Ok(snapshot) = file_read_snapshot(path) else {
+            return;
+        };
+        let Ok(mut tracker) = self.file_read_tracker.lock() else {
+            return;
+        };
+        tracker.reads.insert(path.to_path_buf(), snapshot);
+    }
+
+    /// Require a successful, still-fresh `read_file` snapshot before a narrow
+    /// in-place edit. This catches model edits made against guessed or stale
+    /// content while leaving transactional patch preflight separate.
+    pub fn require_fresh_file_read(
+        &self,
+        path: &Path,
+        requested_path: &str,
+    ) -> Result<(), ToolError> {
+        let prior = {
+            let tracker = self.file_read_tracker.lock().map_err(|_| {
+                ToolError::execution_failed(
+                    "Failed to check read-before-edit state: tracker lock poisoned".to_string(),
+                )
+            })?;
+            tracker.reads.get(path).cloned()
+        };
+
+        let Some(prior) = prior else {
+            return Err(ToolError::execution_failed(format!(
+                "Refusing edit_file for {} because it has not been read in this session. \
+                 Recovery: call read_file with path=\"{requested_path}\" to inspect the current contents, \
+                 then retry edit_file with a unique search string.",
+                path.display()
+            )));
+        };
+
+        let current = file_read_snapshot(path).map_err(|e| {
+            ToolError::execution_failed(format!(
+                "Refusing edit_file for {} because the file could not be checked for staleness ({e}). \
+                 Recovery: call read_file with path=\"{requested_path}\" again, then retry edit_file.",
+                path.display()
+            ))
+        })?;
+
+        if current != prior {
+            return Err(ToolError::execution_failed(format!(
+                "Refusing edit_file for {} because it changed since the last read_file call. \
+                 Recovery: call read_file with path=\"{requested_path}\" again and retry with the current contents.",
+                path.display()
+            )));
+        }
+
+        Ok(())
     }
 
     /// Resolve a path relative to workspace, validating it doesn't escape.

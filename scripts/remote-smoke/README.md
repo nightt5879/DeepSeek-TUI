@@ -32,10 +32,9 @@ leftover-billable-resources check.
 
 Telegram is blocked in mainland China and DigitalOcean has no China
 datacenters (cross-border routes are slow; DO IP ranges are frequently
-GFW-affected). Mainland-based users should use the existing Tencent
-Lighthouse HK + Feishu/Lark lane (`docs/TENCENT_CLOUD_REMOTE_FIRST.md`)
-instead — that is exactly why it exists. This lane is for users outside
-mainland China.
+GFW-affected). Mainland-based users should prefer a regional host and chat
+bridge approved by their organization. This lane is for users outside mainland
+China.
 
 ## Security model
 
@@ -147,7 +146,5 @@ gh pr create --repo Hmbown/CodeWhale --base main \
 gh issue edit <N> --add-label needs-human --remove-label agent-in-progress
 ```
 
-See `docs/AGENT_RUNNER.md` (added by #3043; until that lands, the design
-background lives in `docs/rfcs/REMOTE_SETUP_DESIGN.md`) for the full
-protocol including safety rules (PR-only delivery, no force-push, secrets
-never in argv/history/logs, one worktree per issue).
+Keep the same safety rules for any automated agent lane: PR-only delivery, no
+force-push, secrets never in argv/history/logs, and one worktree per issue.

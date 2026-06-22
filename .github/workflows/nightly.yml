@@ -77,9 +77,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: '1.88'
           targets: ${{ matrix.target }}
+      - name: Install Rust target
+        run: rustup target add --toolchain 1.88 ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -119,7 +122,18 @@ jobs:
           CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
           PKG_CONFIG_ALLOW_CROSS: 1
           PKG_CONFIG_LIBDIR_riscv64gc_unknown_linux_gnu: /usr/lib/riscv64-linux-gnu/pkgconfig
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: |
+          for attempt in 1 2 3; do
+            if cargo build --release --locked --target ${{ matrix.target }}; then
+              exit 0
+            fi
+            if [ "${attempt}" -lt 3 ]; then
+              echo "Build attempt ${attempt} failed; retrying in 30s..."
+              sleep 30
+            fi
+          done
+          echo "Build failed after 3 attempts" >&2
+          exit 1
       - name: Stage artifact
         id: stage
         shell: bash

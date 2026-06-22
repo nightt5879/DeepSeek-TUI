@@ -4,7 +4,7 @@
 
 This document covers the security boundaries of CodeWhale Workrooms — the
 durable, addressable containers for threaded agent conversations described
-in [RFC 3209](../../docs/rfcs/3209-workrooms.md).
+in [RFC 3209](rfcs/3209-workrooms.md).
 
 Workrooms do **not** introduce any new network services, cloud dependencies,
 or default-on public sharing. Security responsibility stays with the

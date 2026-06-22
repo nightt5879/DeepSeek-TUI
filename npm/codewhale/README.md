@@ -2,10 +2,10 @@
 
 > The terminal coding agent for any model — open models first.
 
-CodeWhale is a Rust TUI and CLI for 24 providers — DeepSeek, OpenRouter,
-Hugging Face, and local vLLM/SGLang/Ollama are first-class routes, and it
-speaks natively to Anthropic Claude and OpenAI when that's what you have —
-with approval-gated tools, OS sandboxing, side-git snapshots, and `/restore`
+CodeWhale is a Rust TUI and CLI for many model providers — DeepSeek,
+OpenRouter, Hugging Face, and local vLLM/SGLang/Ollama are first-class routes,
+and it speaks natively to Anthropic Claude and OpenAI when that's what you have
+— with approval-gated tools, OS sandboxing, side-git snapshots, and `/restore`
 rollback.
 
 This npm package is a small launcher: it downloads the matching native

@@ -230,6 +230,7 @@ impl Engine {
             let tx_event = self.tx_event.clone();
             let mcp_pool = mcp_pool.clone();
             let shell_permits = shell_permits.clone();
+            let workspace = self.session.workspace.clone();
             tasks.push(async move {
                 let _shell_permit = if tool_name == "exec_shell" {
                     shell_permits.acquire_owned().await.ok()
@@ -243,6 +244,7 @@ impl Engine {
                     tx_event,
                     tool_name.clone(),
                     tool_input.clone(),
+                    workspace,
                     Some(registry_ref),
                     mcp_pool,
                     None,
@@ -294,6 +296,7 @@ impl Engine {
         tx_event: mpsc::Sender<Event>,
         tool_name: String,
         tool_input: serde_json::Value,
+        workspace: PathBuf,
         registry: Option<&crate::tools::ToolRegistry>,
         mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
         context_override: Option<crate::tools::ToolContext>,
@@ -301,6 +304,11 @@ impl Engine {
         let started_at = std::time::Instant::now();
         let dispatch = if McpPool::is_mcp_tool(&tool_name) {
             "mcp"
+        } else if matches!(
+            tool_name.as_str(),
+            CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME
+        ) {
+            "interpreter"
         } else if registry.is_some() {
             "registry"
         } else {
@@ -340,6 +348,10 @@ impl Engine {
                     "tool '{tool_name}' is not registered"
                 )))
             }
+        } else if tool_name == CODE_EXECUTION_TOOL_NAME {
+            execute_code_execution_tool(&tool_input, &workspace).await
+        } else if tool_name == JS_EXECUTION_TOOL_NAME {
+            execute_js_execution_tool(&tool_input, &workspace).await
         } else if let Some(registry) = registry {
             registry
                 .execute_full_with_context(&tool_name, tool_input, context_override.as_ref())

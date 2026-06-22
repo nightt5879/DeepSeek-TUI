@@ -3425,7 +3425,7 @@ Welcome — and thank you.
 - **npm `postinstall` failure messages** — when no prebuilt is available for
   the host's `os.platform() / os.arch()` combo, the wrapper now prints the
   full `cargo install` fallback recipe and a link to
-  [`docs/INSTALL.md`](docs/INSTALL.md) instead of just the bare error.
+  [`docs/INSTALL.md`](INSTALL.md) instead of just the bare error.
 - **`DEEPSEEK_TUI_OPTIONAL_INSTALL=1`** — new env knob that downgrades a
   postinstall failure to a warning + `exit 0`, so CI matrices that include
   unsupported platforms don't fail the whole `npm install`.

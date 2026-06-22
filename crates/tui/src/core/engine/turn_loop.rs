@@ -58,6 +58,24 @@ fn approval_intent_summary(text: &str) -> Option<String> {
     Some(summary)
 }
 
+pub(super) fn registered_tool_approval_required(
+    tool_name: &str,
+    requirement: ApprovalRequirement,
+    auto_approve: bool,
+) -> bool {
+    if requirement == ApprovalRequirement::Auto {
+        return false;
+    }
+    if registered_tool_requires_non_bypassable_approval(tool_name) {
+        return true;
+    }
+    !auto_approve
+}
+
+fn registered_tool_requires_non_bypassable_approval(tool_name: &str) -> bool {
+    matches!(tool_name, "rlm_eval")
+}
+
 impl Engine {
     fn drain_shell_completion_events(&self) -> Vec<crate::tools::shell::ShellCompletionEvent> {
         self.shell_manager
@@ -1547,9 +1565,11 @@ impl Engine {
                 } else if let Some(registry) = tool_registry
                     && let Some(spec) = registry.get(&tool_name)
                 {
-                    approval_required = spec.approval_requirement_for(&tool_input)
-                        != ApprovalRequirement::Auto
-                        && !registry.context().auto_approve;
+                    approval_required = registered_tool_approval_required(
+                        &tool_name,
+                        spec.approval_requirement_for(&tool_input),
+                        registry.context().auto_approve,
+                    );
                     approval_description = spec.description().to_string();
                     supports_parallel = spec.supports_parallel_for(&tool_input);
                     read_only = spec.is_read_only_for(&tool_input);
@@ -1582,22 +1602,63 @@ impl Engine {
                     approval_required = true;
                 }
 
-                if blocked_error.is_none()
-                    && let Some(decision) = exec_shell_ask_rule_decision(
+                if blocked_error.is_none() {
+                    let ask_rule_decision = exec_shell_ask_rule_decision(
                         &self.config,
                         &tool_name,
                         &tool_input,
                         &self.session.workspace,
                         self.session.approval_mode,
                     )
-                {
+                    .or_else(|| {
+                        file_tool_ask_rule_decision(
+                            &self.config,
+                            &tool_name,
+                            &tool_input,
+                            &self.session.workspace,
+                            self.session.approval_mode,
+                        )
+                    });
+                    if let Some(decision) = ask_rule_decision {
+                        match decision {
+                            ToolAskRuleDecision::Prompt(reason) => {
+                                approval_required = true;
+                                approval_description = reason;
+                                approval_force_prompt = true;
+                            }
+                            ToolAskRuleDecision::Block(reason) => {
+                                approval_required = false;
+                                approval_force_prompt = false;
+                                blocked_error = Some(ToolError::permission_denied(reason));
+                            }
+                        }
+                    }
+                }
+
+                if blocked_error.is_none() {
+                    let (decision, audit_event) = auto_review_plan_decision(
+                        &self.config.auto_review_policy,
+                        &tool_name,
+                        &tool_input,
+                        auto_review_run_origin_for_plan(detached_start),
+                        self.session.approval_mode,
+                        None,
+                        crate::config::is_workspace_trusted(&self.session.workspace),
+                        false,
+                    );
+                    emit_tool_audit(json!({
+                        "event": "tool.auto_review_decision",
+                        "tool_id": tool_id.clone(),
+                        "auto_review": audit_event,
+                    }));
                     match decision {
-                        ExecShellAskRuleDecision::Prompt(reason) => {
+                        AutoReviewPlanDecision::NoChange => {}
+                        AutoReviewPlanDecision::ForcePrompt(reason) => {
                             approval_required = true;
                             approval_description = reason;
                             approval_force_prompt = true;
                         }
-                        ExecShellAskRuleDecision::Block(reason) => {
+                        AutoReviewPlanDecision::Block(reason) => {
                             approval_required = false;
                             approval_force_prompt = false;
                             blocked_error = Some(ToolError::permission_denied(reason));
@@ -1801,6 +1862,7 @@ impl Engine {
                         let session_id = self.session.id.clone();
                         let started_at = Instant::now();
                         let shell_permits = shell_permits.clone();
+                        let workspace = self.session.workspace.clone();
 
                         tool_tasks.push(async move {
                             let _shell_permit = if plan.name == "exec_shell" {
@@ -1815,6 +1877,7 @@ impl Engine {
                                 tx_event.clone(),
                                 plan.name.clone(),
                                 plan.input.clone(),
+                                workspace,
                                 registry,
                                 mcp_pool,
                                 None,
@@ -1923,58 +1986,6 @@ impl Engine {
                                     tool_exec_lock.clone(),
                                 )
                                 .await;
-
-                            let _ = self
-                                .tx_event
-                                .send(Event::ToolCallComplete {
-                                    id: tool_id.clone(),
-                                    name: tool_name.clone(),
-                                    result: result.clone(),
-                                })
-                                .await;
-
-                            outcomes[plan.index] = Some(ToolExecOutcome {
-                                index: plan.index,
-                                id: tool_id,
-                                name: tool_name,
-                                input: tool_input,
-                                started_at,
-                                result,
-                            });
-                            continue;
-                        }
-
-                        if tool_name == CODE_EXECUTION_TOOL_NAME {
-                            let started_at = Instant::now();
-                            let result =
-                                execute_code_execution_tool(&tool_input, &self.session.workspace)
-                                    .await;
-
-                            let _ = self
-                                .tx_event
-                                .send(Event::ToolCallComplete {
-                                    id: tool_id.clone(),
-                                    name: tool_name.clone(),
-                                    result: result.clone(),
-                                })
-                                .await;
-
-                            outcomes[plan.index] = Some(ToolExecOutcome {
-                                index: plan.index,
-                                id: tool_id,
-                                name: tool_name,
-                                input: tool_input,
-                                started_at,
-                                result,
-                            });
-                            continue;
-                        }
-
-                        if tool_name == JS_EXECUTION_TOOL_NAME {
-                            let started_at = Instant::now();
-                            let result =
-                                execute_js_execution_tool(&tool_input, &self.session.workspace)
-                                    .await;
 
                             let _ = self
                                 .tx_event
@@ -2172,6 +2183,7 @@ impl Engine {
                                 self.tx_event.clone(),
                                 tool_name.clone(),
                                 tool_input.clone(),
+                                self.session.workspace.clone(),
                                 tool_registry,
                                 mcp_pool.clone(),
                                 context_override,

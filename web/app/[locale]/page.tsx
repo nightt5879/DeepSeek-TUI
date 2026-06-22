@@ -164,8 +164,8 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
             <p className="mt-6 text-lg text-ink-soft leading-relaxed max-w-2xl">
               <span className="font-cjk text-indigo font-semibold">CodeWhale</span>
               {isZh
-                ? " 是一个开源的终端编程智能体（TUI + CLI）。你指向一个模型和一个项目，它就开始干活：读代码、改文件、跑命令、查结果、规划多步任务，并在出错时自我修正。它真正具备 agentic 能力——系统提示就是为此设计的，带计划的长时间任务是常态。目标很朴素：跟上商业编码智能体的研究和特性，然后超越它们。"
-                : " is an open source terminal coding agent — a TUI and a CLI. Point it at a model and a project and it gets to work: reading code, making edits, running commands, checking results, planning multi-step tasks, and correcting itself when something fails. It's genuinely agentic — the system prompt is built for it, and long-running tasks with a real plan are the norm. The goal is simple: stay current with the best commercial coding agents, and surpass them."}
+                ? " 是一个开源的终端编程智能体（TUI + CLI）。你指向一个模型和一个项目，它就开始干活：读代码、改文件、跑命令、查结果、规划多步任务，并在出错时自我修正。它真正具备 agentic 能力——系统提示就是为此设计的，带计划的长时间任务是常态。目标很朴素：让本地终端工作流持续跟上编码智能体的研究和实用能力。"
+                : " is an open source terminal coding agent — a TUI and a CLI. Point it at a model and a project and it gets to work: reading code, making edits, running commands, checking results, planning multi-step tasks, and correcting itself when something fails. It's genuinely agentic — the system prompt is built for it, and long-running tasks with a real plan are the norm. The goal is simple: keep the local terminal workflow current with practical coding-agent research and capabilities."}
             </p>
 
             {/* HONEST STATUS — what's working right now, and what isn't */}

@@ -185,7 +185,7 @@ footer chips are visible, or set `[tui].status_items` in `config.toml` to
 control both selection and order. Supported keys currently include `mode`,
 `model`, `cost`, `balance` (DeepSeek / DeepSeekCN only), `status`, `agents`,
 `reasoning_replay`, `prefix_stability`, `cache`, `context_percent`,
-`git_branch`, `last_tool_elapsed` (placeholder), `rate_limit` (placeholder),
+`git_branch`, `last_tool_elapsed` (reserved), `rate_limit` (reserved),
 and `tokens`. Omit `status_items` to keep the built-in default order; set it to
 `[]` to hide configurable chips.
 

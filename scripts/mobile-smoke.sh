@@ -110,6 +110,24 @@ assert_body_contains() {
     fi
 }
 
+assert_body_not_contains() {
+    local method="$1" path="$2" header="$3" substring="$4"
+    local url="http://127.0.0.1:${PORT}${path}"
+    local curl_args=(-sf --max-time 10 -X "$method")
+    if [[ -n "$header" ]]; then
+        curl_args+=(-H "$header")
+    fi
+
+    local body
+    body=$(curl "${curl_args[@]}" "$url" 2>/dev/null || true)
+
+    if echo "$body" | grep -q "$substring"; then
+        fail "$method $path body unexpectedly contains '$substring'"
+    else
+        pass "$method $path body does not contain '$substring'"
+    fi
+}
+
 # ── build ────────────────────────────────────────────────────────────────────
 
 if [[ ! -x "$BINARY" ]]; then
@@ -127,8 +145,8 @@ PORT=$(pick_port)
 log "=== Test Group 1: Token auth ==="
 start_server "$PORT" --mobile --auth-token "$TOKEN"
 
-assert_status GET "/mobile" 401
-assert_body_contains GET "/mobile?token=${TOKEN}" "" "CodeWhale Mobile"
+assert_body_contains GET "/mobile" "" "CodeWhale Mobile"
+assert_body_not_contains GET "/mobile" "" "$TOKEN"
 assert_status GET "/v1/threads/summary" 401
 assert_status GET "/v1/threads/summary" "Authorization: Bearer ${TOKEN}" 200
 assert_status POST "/v1/approvals/no_such_id" "Authorization: Bearer ${TOKEN}" '{"decision":"allow"}' 404

@@ -104,12 +104,6 @@ apps/
 # Maintainer-internal design notes (trade-secret material, never published)
 .private/
 
-# Maintainer-local SWE-bench scratch (instance workspaces, venvs, predictions,
-# Docker harness logs). Never published.
-.swebench/
-deep-swe/
-all_preds.jsonl
-
 # Agent handoffs and version-specific setup plans are working-state notes, not
 # public docs. Keep durable setup guidance in docs/runbooks instead.
 docs/*HANDOFF*.md
@@ -123,21 +117,14 @@ docs/*_PLAN.md
 scripts/run_deep_swe.py
 .claude/
 
-# Benchmark artifacts and caches re-included by !scripts/**
+# Local run artifacts and caches re-included by !scripts/**
 results/
-benchmark_results/*
-!benchmark_results/.gitkeep
 scripts/**/__pycache__/
 
-# Maintainer-local verification artifacts and benchmark corpora
-.harbor-datasets/
-.pinchbench-skill/
-.terminal-bench-datasets/
-.venv-bench/
+# Maintainer-local verification artifacts
 .uv-bin/
 .uv-cache/
 .uv-tools/
-codewhale__*.json
 issues/
 logs/
 notes/

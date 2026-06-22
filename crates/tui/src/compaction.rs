@@ -36,20 +36,20 @@ pub struct CompactionConfig {
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
-            // ON BY DEFAULT since v0.8.6 (#402 P0 survivability) — but the
-            // engine-level `auto_compact` setting was flipped OFF in v0.8.11
-            // (#665) so this default is mostly a fallback for code paths
-            // that build a `CompactionConfig` without going through
-            // `compaction_threshold_for_model_and_effort`. Real per-model
-            // values are still derived through that helper.
+            // ON BY DEFAULT since v0.8.6 (#402 P0 survivability). v0.8.64
+            // resolves the user-facing default through the active model's
+            // known context window, while explicit `auto_compact = false`
+            // remains the opt-out. This fallback covers code paths that build
+            // a `CompactionConfig` directly; real per-model values are still
+            // derived through the threshold helpers.
             enabled: true,
             // v0.8.11: 50K was a 128K-era leftover that biased every
             // unconfigured caller toward "compact almost immediately on V4."
             // Bumped to 800K (80% of V4's 1M window) so the dead-code
             // default matches the hard automatic compaction guardrail. This
             // is intentionally later than the model-visible 60% "suggest
-            // /compact during sustained work" guidance; automatic replacement
-            // compaction rewrites the cacheable prefix and remains opt-in.
+            // /compact during sustained work" guidance so automatic
+            // replacement compaction stays a late continuity guardrail.
             // Real call sites override this via
             // `compaction_threshold_for_model_and_effort`.
             token_threshold: 800_000,

@@ -37,10 +37,8 @@ Optional:
 - `CODEWHALE_REPO_URL`: defaults to the CNB mirror URL
 - `LIGHTHOUSE_SSH_PORT`: defaults to `22`
 
-The server side should already have `/opt/whalebro/codewhale`,
-`/etc/codewhale/runtime.env`, `/etc/codewhale/feishu-bridge.env`, and the
-`codewhale-runtime` / `codewhale-feishu-bridge` systemd services from
-`docs/TENCENT_LIGHTHOUSE_HK.md`.
+The server side should already have the runtime checkout, environment files,
+and systemd services installed by the maintainer-owned server setup process.
 
 ## Safety Notes
 

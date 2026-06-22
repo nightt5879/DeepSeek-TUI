@@ -338,7 +338,9 @@ async fn app_handler(
 }
 
 fn build_state(config_path: Option<PathBuf>, auth_token: Option<String>) -> Result<AppState> {
-    let store = ConfigStore::load(config_path.clone())?;
+    let has_explicit_config_path = config_path.is_some();
+    let store = ConfigStore::load(config_path)?;
+    let config_path = has_explicit_config_path.then(|| store.path().to_path_buf());
     let config = store.config.clone();
     let exec_policy = store.exec_policy_engine();
     let registry = ModelRegistry::default();
@@ -411,14 +413,20 @@ fn resolve_auth_token(options: &AppServerOptions) -> Result<Option<String>> {
     let token = configured
         .map(str::to_string)
         .unwrap_or_else(|| format!("cwapp_{}", Uuid::new_v4().simple()));
-    if has_explicit_token {
-        eprintln!("app-server auth: bearer token required for HTTP routes.");
-    } else {
-        eprintln!("app-server auth: generated bearer token for this process.");
-        eprintln!("  Authorization: Bearer {token}");
-        eprintln!("  Pass --auth-token or set CODEWHALE_APP_SERVER_TOKEN for a stable token.");
+    for line in app_server_auth_status_lines(has_explicit_token) {
+        eprintln!("{line}");
     }
     Ok(Some(token))
+}
+
+fn app_server_auth_status_lines(has_explicit_token: bool) -> Vec<&'static str> {
+    if has_explicit_token {
+        return vec!["app-server auth: bearer token required for HTTP routes."];
+    }
+    vec![
+        "app-server auth: generated bearer token for this process (not printed).",
+        "  Pass --auth-token or set CODEWHALE_APP_SERVER_TOKEN when another client needs to connect.",
+    ]
 }
 
 fn cors_layer(extra_origins: &[String]) -> CorsLayer {
@@ -1073,6 +1081,27 @@ mod tests {
         (app_router(state, &[]), tmp)
     }
 
+    #[test]
+    fn build_state_keeps_resolved_explicit_config_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_dir = tmp.path().join("config-dir");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        let config_path = config_dir.join("config.toml");
+        fs::write(&config_path, "api_key = \"sk-deepseek-secret\"\n").expect("write config");
+
+        let state = build_state(Some(config_path.clone()), None).expect("state");
+
+        assert_eq!(
+            state.config_path.as_deref(),
+            Some(
+                config_path
+                    .canonicalize()
+                    .expect("canonical config")
+                    .as_path()
+            )
+        );
+    }
+
     async fn response_body_json(response: Response) -> Value {
         let bytes = to_bytes(response.into_body(), usize::MAX)
             .await
@@ -1403,6 +1432,15 @@ mod tests {
         let token = resolve_auth_token(&options).unwrap();
         assert!(token.is_some());
         assert!(token.unwrap().starts_with("cwapp_"));
+    }
+
+    #[test]
+    fn generated_auth_status_does_not_render_token() {
+        let rendered = app_server_auth_status_lines(false).join("\n");
+
+        assert!(!rendered.contains("Authorization: Bearer"));
+        assert!(rendered.contains("not printed"));
+        assert!(rendered.contains("CODEWHALE_APP_SERVER_TOKEN"));
     }
 
     #[test]

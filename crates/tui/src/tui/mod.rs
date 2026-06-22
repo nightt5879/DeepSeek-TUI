@@ -14,6 +14,7 @@
 pub mod active_cell;
 pub mod app;
 pub mod approval;
+pub mod auto_review;
 pub mod auto_router;
 pub mod backtrack;
 pub mod clipboard;

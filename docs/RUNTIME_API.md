@@ -1,21 +1,21 @@
 # Runtime API & Integration Contract
 
 `codewhale app-server` is the canonical local runtime API and control plane.
-Local SDKs, benchmark supervisors, mobile/remote-control clients, and editor
-integrations talk to it instead of screen-scraping terminal output. It serves
-the full HTTP/SSE runtime API (`/v1/*`), a JSON-RPC control transport over
-stdio, and the phone-friendly mobile page. `codewhale doctor --json` provides
-machine-readable health, and `codewhale serve --acp` speaks the Agent Client
-Protocol over stdio for editors such as Zed.
+Local SDKs, mobile/remote-control clients, and editor integrations talk to it
+instead of screen-scraping terminal output. It serves the full HTTP/SSE runtime
+API (`/v1/*`), a JSON-RPC control transport over stdio, and the phone-friendly
+mobile page. `codewhale doctor --json` provides machine-readable health, and
+`codewhale serve --acp` speaks the Agent Client Protocol over stdio for editors
+such as Zed.
 
 `codewhale serve --http` / `serve --mobile` remain as **compatibility aliases**
 for `codewhale app-server --http` / `--mobile`; both launch the identical
 server. New integrations should target `app-server`.
 
 `codewhale exec` is the separate one-shot headless worker path (stream-json,
-fleet worker subprocess, CI/benchmark primitive). It is not part of this API,
-but it shares the same runtime, provider/model resolution, permission profiles,
-and event vocabulary.
+fleet worker subprocess, CI primitive). It is not part of this API, but it
+shares the same runtime, provider/model resolution, permission profiles, and
+event vocabulary.
 
 This document is the stable integration contract for native workbench
 applications (and other local supervisors) that embed the DeepSeek engine.
@@ -23,7 +23,7 @@ applications (and other local supervisors) that embed the DeepSeek engine.
 ## Architecture
 
 ```
-local supervisor / SDK / benchmark harness
+local supervisor / SDK / automation harness
         │
         ├─ codewhale app-server --http     → HTTP/SSE runtime API (/v1/*)        [canonical]
         ├─ codewhale app-server --mobile   → runtime API + mobile control page
@@ -48,7 +48,7 @@ CLI/API surfaces are not implemented yet.
 |---|---|---|
 | `codewhale app-server --http` | HTTP/SSE on `127.0.0.1:7878` | Full `/v1/*` runtime API (canonical) |
 | `codewhale app-server --mobile` | HTTP/SSE on `0.0.0.0:7878` + `/mobile` | Runtime API + phone control page |
-| `codewhale app-server --stdio` | JSON-RPC 2.0 over stdio | Local SDK / benchmark control probe (no listener) |
+| `codewhale app-server --stdio` | JSON-RPC 2.0 over stdio | Local SDK / control probe (no listener) |
 | `codewhale app-server` | HTTP on `127.0.0.1:8787` | Legacy in-process app-server (`/healthz`, `/thread`, `/app`, `/prompt`, `/tool`, `/jobs`) |
 | `codewhale serve --http` / `--mobile` | same server as `app-server --http`/`--mobile` | Compatibility aliases |
 
@@ -77,17 +77,17 @@ printf '%s\n' \
 `prompt/*`) and the full method list; `thread/capabilities`,
 `app/capabilities`, and `prompt/capabilities` scope it per family. The method
 set is pinned by a drift test in `crates/app-server/src/lib.rs`, so SDK and
-benchmark clients can rely on it not changing silently.
+local integration clients can rely on it not changing silently.
 
-## Benchmarking & SDK contract
+## SDK contract
 
-The app-server exists so an external benchmark or SDK can answer — without
-scraping TUI output — *what route ran, which provider/model/reasoning/permission
-profile was effective, what events happened, how many tokens were used, and how
-the run finished.* The durable Thread/Turn/Item data model already carries most
-of this; the table maps each benchmark need to where a harness reads it.
+The app-server exists so an external SDK can answer — without scraping TUI
+output — *what route ran, which provider/model/reasoning/permission profile was
+effective, what events happened, how many tokens were used, and how the run
+finished.* The durable Thread/Turn/Item data model already carries most of
+this; the table maps each integration need to where a local client reads it.
 
-| Benchmark need | Where it comes from | Status |
+| Integration need | Where it comes from | Status |
 |---|---|---|
 | Route / effective model | `TurnRecord` + thread `model`; per-run `--provider`/`--model` overrides | available |
 | Permission / sandbox / approval profile | thread `auto_approve`, sandbox + approval policy | available |
@@ -97,12 +97,12 @@ of this; the table maps each benchmark need to where a harness reads it.
 | Token usage | `TurnRecord.usage`; aggregate via `GET /v1/usage` | available |
 | Single-read run receipt (route + usage + cost) | `GET /v1/threads/{id}/turns/{turn_id}/receipt` | proposed ([RECEIPTS.md](RECEIPTS.md)) |
 
-For one-shot/headless benchmark runs, prefer `codewhale exec` with explicit
+For one-shot/headless automation, prefer `codewhale exec` with explicit
 `--provider <id> --model <id>` so a failure identifies the exact provider/model
-pair. Use `app-server` when the harness needs to start/resume/steer/interrupt
-turns, list models/capabilities, follow the event stream, or read usage. Both
-paths share the same runtime, so route-effective model resolution and the event
-vocabulary match.
+pair. Use `app-server` when a local integration needs to start, resume, steer,
+or interrupt turns, list models/capabilities, follow the event stream, or read
+usage. Both paths share the same runtime, so route-effective model resolution
+and the event vocabulary match.
 
 ### Release smoke
 

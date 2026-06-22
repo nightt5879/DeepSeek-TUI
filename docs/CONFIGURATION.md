@@ -78,6 +78,20 @@ Overrides:
 
 If both are set, `--config` wins. Environment variable overrides are applied after the file is loaded.
 
+### TUI editability audit
+
+Inside the TUI, run `/config audit` to see which documented keys can be changed
+from the current session, which ones can also be persisted, and which ones stay
+file-only or restart-only. The audit includes current values for the high-impact
+runtime controls such as `approval_policy`, `allow_shell`,
+`stream_chunk_timeout_secs`, `base_url`, `mcp_config_path`, and the
+`[subagents]` concurrency/depth/timeout keys.
+
+Use the command's "Command / reason" column as the source of truth before
+editing by hand. For example, `/config approval_mode on-request --save` writes
+top-level `approval_policy = "on-request"`, while provider base URLs are saved
+but still require restarting the model client.
+
 ### User workspace entries
 
 For a shell opt-in that should live in the user's global config rather than in
@@ -94,41 +108,39 @@ this user-owned override.
 
 In interactive mode, the per-project overlay
 `<workspace>/.codewhale/config.toml` is applied after this user entry. A
-project-level `allow_shell = false` still takes precedence.
+project-level `allow_shell = false` can still tighten the session; project-level
+`allow_shell = true` is ignored.
 
 ### Per-project overlay (#485)
 
-When the TUI starts in a workspace that contains a
-`<workspace>/.codewhale/config.toml` file, the values declared in that
-file are merged on top of the global config. Legacy
-`<workspace>/.deepseek/config.toml` files are still read when the
-CodeWhale path is absent. This lets a repo lock its own provider,
-model, sandbox policy, or approval policy without touching the user's
-`~/.codewhale/config.toml`. Pass
-`--no-project-config` to skip the overlay for one launch.
+When the TUI starts in a workspace that contains a regular-file
+`<workspace>/.codewhale/config.toml`, the safe values declared in that file are
+merged on top of the global config. Legacy
+`<workspace>/.deepseek/config.toml` files are still read when the CodeWhale path
+is absent. Symlinked project config files are rejected. This lets a repo suggest
+a model or tighten local safety posture without touching the user's
+`~/.codewhale/config.toml`. Pass `--no-project-config` to skip the overlay for
+one launch.
 
 Supported keys in the project overlay (top-level fields only):
 
 | Key | Effect |
 |---|---|
-| `provider` | switch backend (e.g. `"nvidia-nim"` for an enterprise repo) |
 | `model` | override `default_text_model` |
-| `api_key` | use a per-repo key (typically read from `.env`, **not committed**) |
-| `base_url` | point at a self-hosted endpoint |
 | `reasoning_effort` | force `"high"` / `"max"` for a complex repo |
-| `verbosity` | use `"normal"` or `"concise"` prompt/output discipline |
-| `approval_policy` | `"never"` / `"on-request"` / `"untrusted"` for opinionated repos |
-| `sandbox_mode` | `"read-only"` / `"workspace-write"` / `"danger-full-access"` |
-| `mcp_config_path` | per-repo MCP server set |
+| `approval_policy` | only values that tighten the user's current approval posture |
+| `sandbox_mode` | only values that tighten the user's current sandbox posture |
 | `notes_path` | keep notes in-repo |
 | `max_subagents` | clamp sub-agent concurrency for a constrained repo (clamped to 1..=20) |
-| `allow_shell` | gate shell tool access on `false` |
+| `allow_shell` | `false` can disable shell access; `true` is ignored |
 
 The overlay is intentionally narrow — it covers the fields a repo
 maintainer is most likely to want to standardize across contributors.
-Other settings (skills_dir, hooks, capacity, retry, etc.) stay
-user-global. If your repo needs more, file an issue describing the
-specific use case.
+Credential, endpoint, provider-selection, MCP config, hooks, skills, capacity,
+retry, and `instructions = [...]` settings stay user-global. If a repo-local
+config declares `api_key`, `base_url`, `provider`, `mcp_config_path`,
+`allow_shell = true`, or `instructions`, CodeWhale ignores that key and keeps
+the user's global setting.
 
 The `codewhale` facade and `codewhale-tui` binary share the same config file for
 DeepSeek auth and model defaults. `codewhale auth set --provider deepseek` (and
@@ -223,11 +235,11 @@ The suffix applies only to chat-completion requests. Model listing and
 DeepSeek beta paths keep their built-in routing so a generic gateway override
 does not accidentally rewrite `/models` or `/beta/completions`.
 
-For private gateways with broken or intercepted certificates, prefer
-`SSL_CERT_FILE` with a trusted CA bundle. As a last resort, a provider table can
-set `insecure_skip_tls_verify = true`; this disables certificate verification
-only for the active LLM provider client, leaves other HTTP clients unchanged,
-and is reported by `codewhale doctor`.
+For private gateways with broken or intercepted certificates, use
+`SSL_CERT_FILE` with a trusted CA bundle. The legacy provider-table key
+`insecure_skip_tls_verify = true` is still parsed so `codewhale doctor` can
+report stale configs, but provider clients reject it instead of disabling TLS
+certificate verification.
 
 Local HTTP endpoints such as Ollama, SGLang, and vLLM are allowed by default
 when they use localhost or loopback addresses. For a non-local `http://`
@@ -549,12 +561,10 @@ Rules:
   truncated with a `[…elided]` marker rather than skipped.
 - Missing files are skipped with a tracing warning so a stale
   entry doesn't fail the launch.
-- Project config (`<workspace>/.codewhale/config.toml`, or legacy
-  `<workspace>/.deepseek/config.toml`)
-  **replaces** the user array wholesale rather than merging.
-  If you want both, list `~/global.md` inside the project
-  array. Set `instructions = []` in the project to clear the
-  user list for that repo.
+- Only user-owned config, profiles, and managed config may set this array.
+  Project config (`<workspace>/.codewhale/config.toml`, or legacy
+  `<workspace>/.deepseek/config.toml`) ignores `instructions` so a cloned repo
+  cannot choose arbitrary local files to place into the prompt.
 
 ### `/hooks` listing
 
@@ -839,12 +849,12 @@ codewhale also stores user preferences in:
 - `~/.deepseek/settings.toml` or the legacy platform config-dir
   `deepseek/settings.toml` when an existing settings file is present
 
-Notable settings include `auto_compact` (default `false` for 1M-class models,
-model-aware default-on for 256K-class models), which opts into replacement-style
-summarization before the active model limit. The trigger defaults to
-`auto_compact_threshold_percent = 80`. The default V4 path preserves the stable
-message prefix for cache reuse; use manual `/compact` / Ctrl+L or enable
-`auto_compact` when you explicitly want automatic replacement compaction.
+Notable settings include `auto_compact`, which uses a model-aware default-on
+policy for known context windows up to the 1M-token V4 class. Automatic
+compaction runs before the active model limit and carries the compacted summary
+forward into the next request. The trigger defaults to
+`auto_compact_threshold_percent = 80`. Users who prefer manual continuity can
+persist `auto_compact = false`; manual `/compact` / Ctrl+L remains available.
 You can inspect or update these from the TUI with `/settings` and `/config`
 (interactive editor).
 
@@ -856,7 +866,8 @@ Common settings keys:
   palettes, `grayscale` is the low-opinion black/white theme, and the named
   community presets apply across the TUI. Aliases such as `whale`, `mono`,
   `black-white`, `tokyonight`, and `gruvbox` are accepted.
-- `auto_compact` (on/off, default off)
+- `auto_compact` (on/off, model-aware default on for known context windows
+  unless explicitly configured)
 - `auto_compact_threshold_percent` (10-100, default `80`): pre-send
   auto-compaction threshold used only when `auto_compact` is enabled.
 - `paste_burst_detection` (on/off, default on): fallback rapid-key paste
@@ -930,12 +941,13 @@ separate:
 | Context percent | Active request input estimate divided by the model context window. | Display only; it mirrors the active-input basis used by context safeguards. |
 | Cost estimate | Approximate spend from provider usage and configured DeepSeek rates. | Display only. |
 
-For the default V4 path, replacement compaction remains opt-in
-(`auto_compact = false` by default) and fires at the active model's
-compaction threshold when enabled. For 256K-class models, auto-compaction is
-enabled by default unless the user explicitly configures `auto_compact`. The
-Flash seam manager remains opt-in (`[context].enabled = false`), and the
-capacity controller remains disabled unless configured.
+For known context-window models, including 1M-class V4 models, replacement
+compaction is enabled by default unless the user explicitly configures
+`auto_compact = false`. It fires at the active model's compaction threshold and
+replays the generated summary through the stable system prompt on the next
+request. Unknown model ids remain opt-in. The Flash seam manager remains opt-in
+(`[context].enabled = false`), and the capacity controller remains disabled
+unless configured.
 
 ### Command Migration Notes
 
@@ -958,13 +970,13 @@ If you are upgrading from older releases:
 - `api_key` (string, required for hosted providers): must be non-empty for DeepSeek/hosted providers (or set the provider API key env var). Self-hosted SGLang, vLLM, and Ollama can omit it.
 - `base_url` (string, optional): defaults to `https://api.deepseek.com/beta` for DeepSeek's OpenAI-compatible Chat Completions API, including legacy `provider = "deepseek-cn"` configs. Other defaults are `https://integrate.api.nvidia.com/v1` for `nvidia-nim`, `https://api.openai.com/v1` for `openai`, `https://api.atlascloud.ai/v1` for `atlascloud`, `https://maas-openapi.wanjiedata.com/api/v1` for `wanjie-ark`, `https://ark.cn-beijing.volces.com/api/coding/v3` for `volcengine`, `https://openrouter.ai/api/v1` for `openrouter`, `https://token-plan-sgp.xiaomimimo.com/v1` for `xiaomi-mimo` when the API key starts with `tp-...` and `https://api.xiaomimimo.com/v1` otherwise, `https://api.novita.ai/openai/v1` for `novita`, `https://api.fireworks.ai/inference/v1` for `fireworks`, `https://api.siliconflow.com/v1` for `siliconflow`, `https://api.siliconflow.cn/v1` for `siliconflow-CN`, `https://api.arcee.ai/api/v1` for `arcee`, `https://api.moonshot.ai/v1` for `moonshot`, `https://api.minimax.io/v1` for `minimax`, `https://api.z.ai/api/coding/paas/v4` for `zai`, `https://api.stepfun.ai/v1` for `stepfun`, `https://api.deepinfra.com/v1/openai` for `deepinfra`, `https://router.huggingface.co/v1` for `huggingface`, `https://api.together.xyz/v1` for `together`, `https://chatgpt.com/backend-api` for `openai-codex`, `https://api.anthropic.com` for `anthropic`, `http://localhost:30000/v1` for `sglang`, `http://localhost:8000/v1` for `vllm`, and `http://localhost:11434/v1` for `ollama`. Set `base_url = "https://token-plan-cn.xiaomimimo.com/v1"` explicitly if your Xiaomi MiMo Token Plan account is provisioned in the China region. Set `https://api.deepseek.com` or `https://api.deepseek.com/v1` explicitly to opt out of DeepSeek beta features.
 - `path_suffix` (string, optional provider-table key): override the chat-completions path for OpenAI-compatible gateways that do not serve `/v1/chat/completions`. For example, `[providers.openai] path_suffix = "/chat/completions"` sends chat requests to the unversioned base URL plus `/chat/completions`; `models` and `beta/*` requests keep their normal routing.
-- `insecure_skip_tls_verify` (bool, optional provider-table key): disabled by default. When true on the active provider table, only the LLM provider HTTP client skips TLS certificate verification. Prefer `SSL_CERT_FILE` for corporate or private CA bundles; `codewhale doctor` reports this setting when enabled.
+- `insecure_skip_tls_verify` (bool, optional provider-table key): legacy compatibility key, disabled by default. When true on the active provider table, provider clients reject the configuration instead of skipping TLS certificate verification. Use `SSL_CERT_FILE` for corporate or private CA bundles; `codewhale doctor` reports stale uses of this setting.
 - `default_text_model` (string, optional): defaults to `deepseek-v4-pro` for DeepSeek and generic OpenAI-compatible endpoints, `deepseek-ai/deepseek-v4-pro` for NVIDIA NIM, `deepseek-ai/deepseek-v4-flash` for AtlasCloud, `deepseek-reasoner` for Wanjie Ark, `DeepSeek-V4-Pro` for Volcengine Ark, `deepseek/deepseek-v4-pro` for OpenRouter and Novita, `mimo-v2.5-pro` for Xiaomi MiMo, `accounts/fireworks/models/deepseek-v4-pro` for Fireworks, `deepseek-ai/DeepSeek-V4-Pro` for SiliconFlow and DeepInfra, `trinity-large-thinking` for Arcee AI, `kimi-k2.7-code` for Moonshot, `MiniMax-M3` for MiniMax, `GLM-5.2` for Z.ai, `step-3.7-flash` for StepFun, `deepseek-ai/DeepSeek-V4-Pro` for SGLang/vLLM, and `deepseek-coder:1.3b` for Ollama. Hugging Face and Together AI both default to `deepseek-ai/DeepSeek-V4-Pro`. Current public DeepSeek IDs are `deepseek-v4-pro` and `deepseek-v4-flash`, both with 1M context windows, 384K max output, and thinking mode enabled by default. Legacy `deepseek-chat` and `deepseek-reasoner` remain compatibility aliases for `deepseek-v4-flash` until July 24, 2026, except SiliconFlow maps `deepseek-reasoner` and `deepseek-r1` to its Pro model while `deepseek-chat` and `deepseek-v3` map to Flash. Provider-specific mappings translate `deepseek-v4-pro` / `deepseek-v4-flash` to each provider's model ID where supported. OpenRouter also recognizes recent large IDs such as `arcee-ai/trinity-large-thinking`, `minimax/minimax-m3`, `minimax/minimax-2.7`, `xiaomi/mimo-v2.5-pro`, `qwen/qwen3.6-flash`, `qwen/qwen3.6-35b-a3b`, `qwen/qwen3.6-max-preview`, `qwen/qwen3.6-27b`, `qwen/qwen3.6-plus`, `qwen/qwen3.7-max`, `google/gemma-4-31b-it`, `moonshotai/kimi-k2.7-code`, `moonshotai/kimi-k2.6`, `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`, and `nvidia/nemotron-3-ultra-550b-a55b`; direct Arcee uses bare IDs such as `trinity-large-thinking` and `trinity-large-preview`; direct Moonshot recognizes `kimi-k2.7-code`, `kimi-k2.6`, and Kimi Code's stable `kimi-for-coding`; direct MiniMax recognizes `MiniMax-M3` and the documented M2.x chat model IDs; direct Xiaomi MiMo recognizes chat IDs `mimo-v2.5-pro` and `mimo-v2.5`, while TTS IDs are selected through `codewhale speech` / `tts`. Generic `openai`, `atlascloud`, `wanjie-ark`, `xiaomi-mimo`, `arcee`, `moonshot`, `minimax`, `zai`, `stepfun`, and Ollama model IDs are passed through unchanged after known aliases are normalized. OpenRouter and SiliconFlow provider configs with a custom `base_url` also preserve explicit model values, which lets OpenAI-compatible gateways accept bare model IDs. Use `/models` or `codewhale models` to discover live IDs from your configured endpoint. `CODEWHALE_MODEL` overrides this for a single process; `DEEPSEEK_MODEL` is the legacy alias.
 - `reasoning_effort` (string, optional): `off`, `low`, `medium`, `high`, `max`, `xhigh`, or `ultracode`; defaults to the configured UI tier. DeepSeek Platform receives top-level `thinking` / `reasoning_effort` fields. OpenAI Codex normalizes stale `off` to `low` and sends `max` / `ultracode` as Responses `xhigh`. Z.ai receives documented `thinking` controls and treats enabled thinking as the GLM coding high/max lane. NVIDIA NIM receives equivalent settings through `chat_template_kwargs`.
 - `verbosity` (string, optional): `normal` or `concise`. `normal` keeps the
   default conversational prompt. `concise` appends a prompt discipline block
-  for direct, low-chatter output; CLI noninteractive commands (`exec`, `eval`,
-  and `swebench`) default to `concise` unless config/env/CLI overrides it.
+  for direct, low-chatter output; CLI noninteractive commands (`exec` and
+  `eval`) default to `concise` unless config/env/CLI overrides it.
   Override per process with `CODEWHALE_VERBOSITY` or the legacy
   `DEEPSEEK_VERBOSITY` alias.
 - `allow_shell` (bool, optional): defaults to `false`; shell tools must be explicitly enabled.
@@ -984,6 +996,42 @@ If you are upgrading from older releases:
   modes that can ask; under `approval_policy = "never"`, matching ask rules are
   rejected because no prompt can be shown. This intentionally does not accept
   typed allow/deny records, glob expansion, or approval UI persistence yet.
+- `[auto_review]` (table, optional): deterministic tool-call review policy.
+  This layer sits on top of existing approval modes; it can force a prompt or
+  block a tool call, but it is not an auto-push, auto-merge, or hosted review
+  service. Block rules are checked first, then the built-in safety floor, then
+  allow rules. The safety floor still holds publish-like actions and
+  destructive background/headless actions for review even if an allow rule
+  matches.
+
+  ```toml
+  [auto_review]
+  natural_language_guidance = "Prefer read-only inspection until the user asks for writes."
+
+  [[auto_review.allow]]
+  id = "read-only-inspection"
+  action_kind = "read"
+  reason = "Read-only inspection is safe to run automatically."
+
+  [[auto_review.block]]
+  id = "no-release-publish"
+  action_kind = "publish"
+  reason = "Release and publish actions require maintainer review."
+  ```
+
+  Rule matchers are exact `tool`, `action_kind`, and/or
+  `text_contains` against the current user intent. At least one matcher is
+  required. `action_kind` accepts `read`, `write`, `shell`, `network`, `git`,
+  `mcp_read`, `mcp_action`, `browser`, `secret`, `publish`, `destructive`, or
+  `unknown`; invalid names fail config validation instead of becoming broad
+  rules. `natural_language_guidance` is recorded on the runtime policy and audit
+  event, but deterministic rules and the built-in safety floor are the enforced
+  behavior in v0.8.64.
+
+  Auto-review decisions emit `tool.auto_review_decision` audit events when tool
+  audit logging is enabled. Future PreToolUse/PostToolUse hooks can add
+  observer input around this layer, but the configured auto-review policy is
+  evaluated before a tool call is allowed to proceed.
 - `managed_config_path` (string, optional): managed config file loaded after user/env config.
 - `requirements_path` (string, optional): requirements file used to enforce allowed approval/sandbox values.
 - `max_subagents` (int, optional): defaults to `20` and is clamped to `1..=20`.
@@ -1264,7 +1312,7 @@ for experimental feature flags. It shows each flag's effective enabled/disabled
 state and whether that state comes from the default or a configured override.
 Change feature flags in `[features]` or with `--enable` / `--disable`; the
 `/config` section is an audit surface, not a stability promise. Goal and
-WhaleFlow preview rows may appear there as placeholders until those workflows
+WhaleFlow preview rows may appear there as reserved entries until those workflows
 graduate behind real gated flags.
 
 ## Web Search Provider
@@ -1311,7 +1359,7 @@ Completions API currently accepts text message content, so media attachments are
 sent as explicit local path references instead of native image/video payloads.
 Attachment rows appear above the composer before submit; move to the start of
 the composer, press `↑` to select an attachment row, then press `Backspace` or
-`Delete` to remove it without editing the placeholder text by hand.
+`Delete` to remove it without editing the sample text by hand.
 
 ## Managed Configuration and Requirements
 
@@ -1381,7 +1429,7 @@ configure reasoning effort.
   intentionally not auto-loaded; wire individual scripts into the agent via
   MCP, hooks, or skills.
 - `--plugins` — scaffold `~/.codewhale/plugins/` with a `README.md` and an
-  `example/PLUGIN.md` placeholder using the same frontmatter shape as
+  `example/PLUGIN.md` sample using the same frontmatter shape as
   `SKILL.md`. Plugins are not loaded automatically either; reference them
   from a skill, hook, or MCP wrapper when you want them active.
 - `--all` now scaffolds MCP + skills + tools + plugins together.

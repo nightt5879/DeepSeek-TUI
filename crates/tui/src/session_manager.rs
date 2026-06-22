@@ -961,11 +961,11 @@ pub fn format_session_line(meta: &SessionMetadata) -> String {
     let age = format_age(&meta.updated_at);
     let updated = format_session_updated_at(&meta.updated_at, &age);
     let truncated_title = truncate_title(extract_title(&meta.title), 40);
-    let fork_label = meta
-        .parent_session_id
-        .as_deref()
-        .map(|parent| format!(" | fork {}", truncate_id(parent)))
-        .unwrap_or_default();
+    let fork_label = if meta.parent_session_id.is_some() {
+        " | fork"
+    } else {
+        ""
+    };
 
     format!(
         "{} | {} | {} msgs{} | {}",
@@ -1974,7 +1974,9 @@ mod tests {
             Some(parent.metadata.id.as_str())
         );
         assert_eq!(loaded.metadata.forked_from_message_count, Some(2));
-        assert!(format_session_line(&loaded.metadata).contains("fork "));
+        let line = format_session_line(&loaded.metadata);
+        assert!(line.contains("fork"));
+        assert!(!line.contains(parent.metadata.id.as_str()));
     }
 
     #[test]

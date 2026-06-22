@@ -408,7 +408,7 @@ codewhale doctor`;
               <p className="mt-3 text-sm text-ink-soft leading-relaxed max-w-2xl">
                 {isZh
                   ? "适合本地修改 workspace 或贡献补丁。"
-                  : "Useful for hacking on the workspace itself or contributing patches."}
+                  : "Useful for working on the workspace itself or contributing patches."}
               </p>
             </div>
           </div>

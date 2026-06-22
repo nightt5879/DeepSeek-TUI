@@ -926,21 +926,26 @@ fn apply_pending_writes(pending: &[PendingWrite]) -> Result<(), ToolError> {
 
     for entry in pending {
         let result = if let Some(content) = entry.content.as_ref() {
-            if let Some(parent) = entry.path.parent() {
+            let parent_result = if let Some(parent) = entry.path.parent() {
                 fs::create_dir_all(parent).map_err(|e| {
                     ToolError::execution_failed(format!(
                         "Failed to create directory {}: {}",
                         parent.display(),
                         e
                     ))
-                })?;
-            }
-            fs::write(&entry.path, content).map_err(|e| {
-                ToolError::execution_failed(format!(
-                    "Failed to write {}: {}",
-                    entry.path.display(),
-                    e
-                ))
+                })
+            } else {
+                Ok(())
+            };
+
+            parent_result.and_then(|()| {
+                fs::write(&entry.path, content).map_err(|e| {
+                    ToolError::execution_failed(format!(
+                        "Failed to write {}: {}",
+                        entry.path.display(),
+                        e
+                    ))
+                })
             })
         } else if entry.path.exists() {
             fs::remove_file(&entry.path).map_err(|e| {
@@ -1542,6 +1547,37 @@ diff --git a/same.txt b/same.txt
             fs::read_to_string(tmp.path().join("two.txt")).unwrap(),
             "second\n"
         );
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_changes_list_rolls_back_on_write_failure() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+
+        fs::write(tmp.path().join("one.txt"), "old\n").expect("write");
+        fs::write(tmp.path().join("blocked"), "not a dir\n").expect("write blocker");
+
+        let tool = ApplyPatchTool;
+        let err = tool
+            .execute(
+                json!({
+                    "changes": [
+                        { "path": "one.txt", "content": "new\n" },
+                        { "path": "blocked/two.txt", "content": "second\n" }
+                    ]
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("second write should fail");
+
+        let message = err.to_string();
+        assert!(message.contains("blocked"), "{message}");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("one.txt")).unwrap(),
+            "old\n"
+        );
+        assert!(!tmp.path().join("blocked").join("two.txt").exists());
     }
 
     #[tokio::test]

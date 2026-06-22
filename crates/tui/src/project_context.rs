@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -110,6 +111,10 @@ enum ProjectContextError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("Refusing symlinked context file {path}")]
+    Symlink { path: PathBuf },
+    #[error("Context path {path} is not a regular file")]
+    NotFile { path: PathBuf },
     #[error("Context file {path} is too large ({size} bytes, max {max})")]
     TooLarge {
         path: PathBuf,
@@ -299,8 +304,8 @@ fn load_repo_constitution_block(workspace: &Path) -> (Option<String>, Vec<String
         for component in REPO_CONSTITUTION_RELATIVE_PATH {
             path.push(component);
         }
-        if path.is_file() {
-            match fs::read_to_string(&path) {
+        if context_candidate_exists(&path) {
+            match load_context_file(&path) {
                 Ok(raw) => match serde_json::from_str::<RepoConstitution>(&raw) {
                     Ok(constitution) if !constitution.is_empty() => {
                         if let Some(version) = constitution.schema_version
@@ -634,7 +639,7 @@ pub fn load_project_context(workspace: &Path) -> ProjectContext {
     for filename in PROJECT_CONTEXT_FILES {
         let file_path = workspace.join(filename);
 
-        if file_path.exists() && file_path.is_file() {
+        if context_candidate_exists(&file_path) {
             match load_context_file(&file_path) {
                 Ok(content) => {
                     tracing::info!(
@@ -898,7 +903,7 @@ fn load_global_agents_context(workspace: &Path, home_dir: Option<&Path>) -> Opti
     for candidate in global_context_relative_paths() {
         let path = join_relative_components(home, candidate);
 
-        if path.exists() && path.is_file() {
+        if context_candidate_exists(&path) {
             match load_context_file(&path) {
                 Ok(content) => {
                     if path.file_name().and_then(|n| n.to_str()) == Some(DEPRECATED_WHALE_FILENAME)
@@ -941,12 +946,31 @@ fn generate_ephemeral_context(workspace: &Path) -> Option<String> {
 
 /// Load a context file with size checking
 fn load_context_file(path: &Path) -> Result<String, ProjectContextError> {
-    // Check file size first
-    let metadata = fs::metadata(path).map_err(|source| ProjectContextError::Metadata {
+    let metadata = fs::symlink_metadata(path).map_err(|source| ProjectContextError::Metadata {
         path: path.to_path_buf(),
         source,
     })?;
 
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(ProjectContextError::Symlink {
+            path: path.to_path_buf(),
+        });
+    }
+
+    if !file_type.is_file() {
+        return Err(ProjectContextError::NotFile {
+            path: path.to_path_buf(),
+        });
+    }
+
+    let mut file = open_context_file(path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| ProjectContextError::Metadata {
+            path: path.to_path_buf(),
+            source,
+        })?;
     if metadata.len() > MAX_CONTEXT_SIZE as u64 {
         return Err(ProjectContextError::TooLarge {
             path: path.to_path_buf(),
@@ -955,11 +979,12 @@ fn load_context_file(path: &Path) -> Result<String, ProjectContextError> {
         });
     }
 
-    // Read the file
-    let content = fs::read_to_string(path).map_err(|source| ProjectContextError::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(|source| ProjectContextError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
 
     // Basic validation
     if content.trim().is_empty() {
@@ -969,6 +994,35 @@ fn load_context_file(path: &Path) -> Result<String, ProjectContextError> {
     }
 
     Ok(content)
+}
+
+fn context_candidate_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        let file_type = metadata.file_type();
+        file_type.is_file() || file_type.is_symlink()
+    })
+}
+
+#[cfg(unix)]
+fn open_context_file(path: &Path) -> Result<fs::File, ProjectContextError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|source| ProjectContextError::Read {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+fn open_context_file(path: &Path) -> Result<fs::File, ProjectContextError> {
+    fs::File::open(path).map_err(|source| ProjectContextError::Read {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Check if this project is marked as trusted
@@ -1100,6 +1154,30 @@ mod tests {
                 .contains("Test Instructions")
         );
         assert_eq!(ctx.source_path, Some(agents_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_context_rejects_symlinked_agents_md() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let outside = tempdir().expect("outside tempdir");
+        let outside_agents = outside.path().join("AGENTS.md");
+        fs::write(&outside_agents, "outside instructions").expect("write outside agents");
+        std::os::unix::fs::symlink(&outside_agents, workspace.path().join("AGENTS.md"))
+            .expect("symlink agents");
+
+        let ctx = load_project_context(workspace.path());
+
+        assert!(
+            !ctx.has_instructions(),
+            "symlinked project instructions must not be loaded: {:?}",
+            ctx.instructions
+        );
+        assert!(
+            ctx.warnings.iter().any(|w| w.contains("symlinked")),
+            "expected symlink warning, got {:?}",
+            ctx.warnings
+        );
     }
 
     #[test]
@@ -1354,6 +1432,49 @@ mod tests {
         assert!(
             ctx.warnings.iter().any(|w| w.contains("Failed to parse")),
             "expected parse warning, got {:?}",
+            ctx.warnings
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn constitution_json_rejects_symlinked_file() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let outside = tempdir().expect("outside tempdir");
+        fs::create_dir(workspace.path().join(".git")).expect("mkdir .git");
+        fs::create_dir(workspace.path().join(".codewhale")).expect("mkdir .codewhale");
+        let outside_constitution = outside.path().join("constitution.json");
+        fs::write(
+            &outside_constitution,
+            r#"{"schema_version":1,"authority":["outside authority"]}"#,
+        )
+        .expect("write outside constitution");
+        std::os::unix::fs::symlink(
+            &outside_constitution,
+            workspace
+                .path()
+                .join(".codewhale")
+                .join("constitution.json"),
+        )
+        .expect("symlink constitution");
+
+        let ctx =
+            load_project_context_with_parents_and_home(workspace.path(), Some(outside.path()));
+
+        assert!(
+            ctx.constitution_block.is_none(),
+            "symlinked constitution must not be loaded: {:?}",
+            ctx.constitution_block
+        );
+        assert!(
+            !ctx.as_system_block()
+                .unwrap_or_default()
+                .contains("outside authority"),
+            "symlink target content must not reach the system block"
+        );
+        assert!(
+            ctx.warnings.iter().any(|w| w.contains("symlinked")),
+            "expected symlink warning, got {:?}",
             ctx.warnings
         );
     }

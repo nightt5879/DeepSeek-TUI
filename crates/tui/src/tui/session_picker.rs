@@ -705,11 +705,11 @@ fn format_session_line(session: &SessionMetadata) -> String {
         .as_deref()
         .unwrap_or("unknown")
         .to_ascii_lowercase();
-    let fork_label = session
-        .parent_session_id
-        .as_deref()
-        .map(|parent| format!(" | fork {}", crate::session_manager::truncate_id(parent)))
-        .unwrap_or_default();
+    let fork_label = if session.parent_session_id.is_some() {
+        " | fork"
+    } else {
+        ""
+    };
     format!(
         "{} | {} | {} msgs{} | {} | {}",
         crate::session_manager::truncate_id(&session.id),
@@ -1173,7 +1173,8 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("fork parent"));
+        assert!(rendered.contains("fork"));
+        assert!(!rendered.contains("parent-session-abcdef"));
     }
 
     #[test]

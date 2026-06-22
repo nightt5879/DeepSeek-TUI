@@ -329,7 +329,7 @@ pub fn build_document(app: &App, config: &Config) -> Result<ConfigUiDocument> {
             approval_mode: app.approval_mode.into(),
         },
         settings: SettingsSection {
-            auto_compact: settings.auto_compact,
+            auto_compact: app.auto_compact,
             calm_mode: settings.calm_mode,
             low_motion: settings.low_motion,
             fancy_animations: settings.fancy_animations,

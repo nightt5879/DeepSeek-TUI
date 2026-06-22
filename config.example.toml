@@ -104,7 +104,7 @@ check_for_updates = true
 #   5 mode.yolo         6 palette.open      7 sidebar.toggle   8 trust.toggle
 #
 # Invalid slots are skipped with a warning, duplicate slots use the last entry,
-# and unknown actions are preserved so the UI can show a disabled placeholder.
+# and unknown actions are preserved so the UI can show a disabled entry.
 # Slash commands can be bound as slash.<name>, for example slash.mode. Commands
 # that require arguments pre-fill the composer instead of running incomplete.
 #
@@ -607,7 +607,7 @@ osc8_links = true            # emit OSC 8 escapes around URLs (Cmd+click in iTer
 # Supported keys: mode, model, cost, balance (DeepSeek / DeepSeekCN only),
 # status, agents,
 # reasoning_replay, prefix_stability, cache, context_percent, git_branch,
-# last_tool_elapsed (placeholder), rate_limit (placeholder), tokens.
+# last_tool_elapsed (reserved), rate_limit (reserved), tokens.
 # status_items = ["mode", "model", "status", "git_branch", "tokens", "cache"]
 # notification_condition = "always" # always | never — overrides [notifications].threshold_secs.
 #                                    "always" = notify on every successful turn (no threshold);
@@ -965,7 +965,7 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 # LOGFILE="$LOGDIR/exec_shell.log"
 # input=$(cat)
 # echo "[$(date -Iseconds)] $input" >> "$LOGFILE"
-# printf '%s\n' '{"content":"audit wrapper placeholder: configure an executor","success":false}'
+# printf '%s\n' '{"content":"audit wrapper dry run: configure an executor","success":false}'
 # ```
 
 # ─────────────────────────────────────────────────────────────────────────────────

@@ -161,6 +161,11 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
                 CommandResult::error("The /zidong alias could not be dispatched.")
             });
         }
+        "slop" | "canzha" => {
+            return groups::config::dispatch(app, "debt", arg).unwrap_or_else(|| {
+                CommandResult::error("The /debt command could not be dispatched.")
+            });
+        }
         _ => {}
     }
 

@@ -109,8 +109,9 @@ pub fn build_context_inspector_text(app: &App, locale: Locale) -> String {
     if let Some(session_id) = app.current_session_id.as_deref() {
         let _ = writeln!(
             out,
-            "{}: {session_id}",
-            tr(locale, MessageId::CtxInspSession)
+            "{}: {}",
+            tr(locale, MessageId::CtxInspSession),
+            crate::session_manager::truncate_id(session_id)
         );
     }
     let status_label = match context_status(percent) {
@@ -492,6 +493,17 @@ mod tests {
         assert!(text.contains("Session Context"));
         assert!(text.contains("No file, directory, or media references recorded yet."));
         assert!(text.contains("No tool activity recorded yet."));
+    }
+
+    #[test]
+    fn inspector_uses_compact_session_id() {
+        let mut app = test_app();
+        app.current_session_id = Some("1234567890abcdef".to_string());
+
+        let text = build_context_inspector_text(&app, Locale::En);
+
+        assert!(text.contains("Session: 12345678"), "{text}");
+        assert!(!text.contains("1234567890abcdef"), "{text}");
     }
 
     #[test]

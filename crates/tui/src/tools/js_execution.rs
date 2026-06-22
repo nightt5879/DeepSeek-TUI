@@ -80,10 +80,8 @@ fn node_proxy_env_overrides() -> Vec<(&'static str, OsString)> {
     node_proxy_env_overrides_from(|key| std::env::var_os(key))
 }
 
-fn apply_node_proxy_env(cmd: &mut tokio::process::Command) {
-    for (key, value) in node_proxy_env_overrides() {
-        cmd.env(key, value);
-    }
+fn apply_node_execution_env(cmd: &mut tokio::process::Command) {
+    crate::child_env::apply_to_tokio_command(cmd, node_proxy_env_overrides());
 }
 
 /// Build the `Tool` definition the catalog should advertise when
@@ -144,7 +142,7 @@ pub async fn execute_js_execution_tool(
     })?;
     // Recent Node releases use this startup env to make fetch/http(s) honor
     // standard proxy variables; older runtimes ignore it and keep prior behavior.
-    apply_node_proxy_env(&mut cmd);
+    apply_node_execution_env(&mut cmd);
     cmd.arg(&script_path).current_dir(workspace);
 
     let output = tokio::time::timeout(Duration::from_secs(120), cmd.output())
@@ -174,6 +172,7 @@ pub async fn execute_js_execution_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{EnvVarGuard, lock_test_env};
     use std::ffi::OsString;
     use tempfile::tempdir;
 
@@ -280,6 +279,38 @@ mod tests {
             result.content.contains("intentional fail"),
             "stderr payload must surface the error message; got {}",
             result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_js_does_not_inherit_parent_secret_env() {
+        if !node_present() {
+            return;
+        }
+        let _env_lock = lock_test_env();
+        let _secret = EnvVarGuard::set("CODEWHALE_JS_SECRET_LEAK_TEST", "secret-value");
+        let tmp = tempdir().expect("tempdir");
+        let result = execute_js_execution_tool(
+            &json!({
+                "code": "process.stdout.write(process.env.CODEWHALE_JS_SECRET_LEAK_TEST || 'missing')"
+            }),
+            tmp.path(),
+        )
+        .await
+        .expect("execute");
+        assert!(
+            result.success,
+            "node run should succeed: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("missing"),
+            "sanitized child env must not expose parent secrets; got {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("secret-value"),
+            "secret value must not appear in js_execution output"
         );
     }
 
