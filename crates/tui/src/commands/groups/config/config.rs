@@ -2013,7 +2013,7 @@ mod tests {
     fn sidebar_config_command_reports_width_suppression() {
         let mut app = create_test_app();
         app.sidebar_focus = SidebarFocus::Hidden;
-        app.last_sidebar_host_width = Some(80);
+        app.last_sidebar_host_width = Some(63);
 
         let result = sidebar(&mut app, Some("on"));
 
@@ -2022,9 +2022,22 @@ mod tests {
         assert_eq!(
             result.message.as_deref(),
             Some(
-                "Sidebar is on, but hidden because the terminal is too narrow (80 cols; needs at least 100)"
+                "Sidebar is on, but hidden because the terminal is too narrow (63 cols; needs at least 64)"
             )
         );
+    }
+
+    #[test]
+    fn sidebar_config_command_is_visible_at_minimum_width() {
+        let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Hidden;
+        app.last_sidebar_host_width = Some(64);
+
+        let result = sidebar(&mut app, Some("on"));
+
+        assert!(!result.is_error);
+        assert_eq!(app.sidebar_focus, SidebarFocus::Pinned);
+        assert_eq!(result.message.as_deref(), Some("Sidebar is visible"));
     }
 
     #[test]
