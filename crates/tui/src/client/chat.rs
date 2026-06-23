@@ -50,7 +50,8 @@ use crate::llm_client::sanitize_http_error_body;
 use crate::logging;
 use crate::models::{
     ContentBlock, ContentBlockStart, Delta, Message, MessageDelta, MessageRequest, MessageResponse,
-    StreamEvent, SystemPrompt, Tool, ToolCaller, Usage, model_supports_reasoning,
+    StreamEvent, SystemPrompt, Tool, ToolCaller, Usage, model_is_openai_reasoning_family,
+    model_supports_reasoning,
 };
 
 use super::{
@@ -60,8 +61,15 @@ use super::{
     release_stream_buffer, system_to_instructions, to_api_tool_name,
 };
 
-fn apply_provider_token_limit(body: &mut Value, provider: ApiProvider, max_tokens: u32) {
-    if provider != ApiProvider::XiaomiMimo {
+fn apply_provider_token_limit(
+    body: &mut Value,
+    provider: ApiProvider,
+    model: &str,
+    max_tokens: u32,
+) {
+    let use_max_completion_tokens = provider == ApiProvider::XiaomiMimo
+        || (provider == ApiProvider::Openai && model_is_openai_reasoning_family(model));
+    if !use_max_completion_tokens {
         return;
     }
 
@@ -69,6 +77,33 @@ fn apply_provider_token_limit(body: &mut Value, provider: ApiProvider, max_token
         object.remove("max_tokens");
     }
     body["max_completion_tokens"] = json!(max_tokens);
+}
+
+fn apply_openai_reasoning_effort(
+    body: &mut Value,
+    provider: ApiProvider,
+    model: &str,
+    effort: Option<&str>,
+) {
+    if provider != ApiProvider::Openai || !model_is_openai_reasoning_family(model) {
+        return;
+    }
+    let Some(effort) = effort.and_then(openai_chat_reasoning_effort) else {
+        return;
+    };
+    body["reasoning_effort"] = json!(effort);
+}
+
+fn openai_chat_reasoning_effort(effort: &str) -> Option<&'static str> {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "off" | "disabled" | "none" | "false" => Some("none"),
+        "minimal" => Some("minimal"),
+        "low" => Some("low"),
+        "medium" | "mid" | "" => Some("medium"),
+        "high" => Some("high"),
+        "max" | "highest" | "xhigh" | "ultracode" => Some("xhigh"),
+        _ => None,
+    }
 }
 
 fn mirror_minimax_reasoning_details_for_messages(messages: &mut [Value]) {
@@ -115,11 +150,11 @@ impl DeepSeekClient {
         let messages = build_chat_messages_for_request_and_provider(request, self.api_provider);
         let model = wire_model_for_provider(self.api_provider, &request.model);
         let mut body = json!({
-            "model": model,
+            "model": model.clone(),
             "messages": messages,
             "max_tokens": request.max_tokens,
         });
-        apply_provider_token_limit(&mut body, self.api_provider, request.max_tokens);
+        apply_provider_token_limit(&mut body, self.api_provider, &model, request.max_tokens);
 
         if let Some(temperature) = request.temperature {
             body["temperature"] = json!(temperature);
@@ -157,6 +192,12 @@ impl DeepSeekClient {
             &mut body,
             request.reasoning_effort.as_deref(),
             self.api_provider,
+        );
+        apply_openai_reasoning_effort(
+            &mut body,
+            self.api_provider,
+            &model,
+            request.reasoning_effort.as_deref(),
         );
         mirror_minimax_reasoning_details_for_body(&mut body, self.api_provider);
 
@@ -243,7 +284,7 @@ impl DeepSeekClient {
                 "include_usage": true
             },
         });
-        apply_provider_token_limit(&mut body, self.api_provider, request.max_tokens);
+        apply_provider_token_limit(&mut body, self.api_provider, &model, request.max_tokens);
 
         if let Some(temperature) = request.temperature {
             body["temperature"] = json!(temperature);
@@ -281,6 +322,12 @@ impl DeepSeekClient {
             &mut body,
             request.reasoning_effort.as_deref(),
             self.api_provider,
+        );
+        apply_openai_reasoning_effort(
+            &mut body,
+            self.api_provider,
+            &model,
+            request.reasoning_effort.as_deref(),
         );
 
         // Bulletproof final sanitizer: walk the wire payload and force
@@ -3968,7 +4015,7 @@ mod alias_thinking_detection_tests {
     //! turn. See upstream API docs:
     //! https://api-docs.deepseek.com/guides/thinking_mode
     use super::{
-        apply_provider_token_limit, is_reasoning_model_for_stream,
+        apply_openai_reasoning_effort, apply_provider_token_limit, is_reasoning_model_for_stream,
         provider_accepts_reasoning_content, requires_reasoning_content,
         should_replay_reasoning_content, should_replay_reasoning_content_for_provider,
     };
@@ -4098,7 +4145,7 @@ mod alias_thinking_detection_tests {
             "max_tokens": 8192,
         });
 
-        apply_provider_token_limit(&mut body, ApiProvider::XiaomiMimo, 8192);
+        apply_provider_token_limit(&mut body, ApiProvider::XiaomiMimo, "mimo-v2.5-pro", 8192);
 
         assert!(body.get("max_tokens").is_none());
         assert_eq!(
@@ -4106,6 +4153,73 @@ mod alias_thinking_detection_tests {
                 .and_then(serde_json::Value::as_u64),
             Some(8192)
         );
+    }
+
+    #[test]
+    fn openai_reasoning_model_uses_completion_token_limit_and_effort_field() {
+        let mut body = json!({
+            "model": "gpt-5.5",
+            "messages": [],
+            "max_tokens": 4096,
+        });
+
+        apply_provider_token_limit(&mut body, ApiProvider::Openai, "gpt-5.5", 4096);
+        apply_openai_reasoning_effort(&mut body, ApiProvider::Openai, "gpt-5.5", Some("high"));
+
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(
+            body.get("max_completion_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(4096)
+        );
+        assert_eq!(
+            body.get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn openai_non_reasoning_model_omits_reasoning_only_fields() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "messages": [],
+            "max_tokens": 4096,
+        });
+
+        apply_provider_token_limit(&mut body, ApiProvider::Openai, "gpt-4o", 4096);
+        apply_openai_reasoning_effort(&mut body, ApiProvider::Openai, "gpt-4o", Some("high"));
+
+        assert_eq!(
+            body.get("max_tokens").and_then(serde_json::Value::as_u64),
+            Some(4096)
+        );
+        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn openai_provider_deepseek_compatible_model_keeps_chat_token_field() {
+        let mut body = json!({
+            "model": "deepseek-v4-pro",
+            "messages": [],
+            "max_tokens": 4096,
+        });
+
+        apply_provider_token_limit(&mut body, ApiProvider::Openai, "deepseek-v4-pro", 4096);
+        apply_openai_reasoning_effort(
+            &mut body,
+            ApiProvider::Openai,
+            "deepseek-v4-pro",
+            Some("high"),
+        );
+
+        assert_eq!(
+            body.get("max_tokens").and_then(serde_json::Value::as_u64),
+            Some(4096)
+        );
+        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]

@@ -441,6 +441,12 @@ pub fn model_supports_reasoning(model: &str) -> bool {
         || is_openai_codex_model(&lower)
 }
 
+#[must_use]
+pub(crate) fn model_is_openai_reasoning_family(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    is_openai_gpt_55_api_model(&lower) || is_openai_codex_model(&lower)
+}
+
 fn is_openai_gpt_55_api_model(model_lower: &str) -> bool {
     matches!(model_lower, "gpt-5.5" | "gpt-5.5-pro")
         || has_date_snapshot_suffix(model_lower, "gpt-5.5-")
