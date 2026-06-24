@@ -522,7 +522,12 @@ pub(crate) fn resolve_explicit_route_with_inventory(
         return Some(AutoRouteSelection {
             provider: candidate.provider,
             model: candidate.model.clone(),
-            reasoning_effort: config.reasoning_effort().map(ReasoningEffort::from_setting),
+            reasoning_effort: config.reasoning_effort().map(|setting| {
+                normalize_auto_route_effort_for_provider(
+                    candidate.provider,
+                    ReasoningEffort::from_setting(setting),
+                )
+            }),
             source: AutoRouteSource::Heuristic,
         });
     }
@@ -539,7 +544,12 @@ pub(crate) fn resolve_explicit_route_with_inventory(
     Some(AutoRouteSelection {
         provider: candidate.provider,
         model: candidate.model.clone(),
-        reasoning_effort: config.reasoning_effort().map(ReasoningEffort::from_setting),
+        reasoning_effort: config.reasoning_effort().map(|setting| {
+            normalize_auto_route_effort_for_provider(
+                candidate.provider,
+                ReasoningEffort::from_setting(setting),
+            )
+        }),
         source: AutoRouteSource::Heuristic,
     })
 }
@@ -1042,6 +1052,35 @@ mod tests {
         assert_eq!(route.provider, ApiProvider::WanjieArk);
         assert_eq!(route.model, "deepseek-v4-flash");
         assert_eq!(route.reasoning_effort, Some(ReasoningEffort::Off));
+    }
+
+    #[test]
+    fn explicit_route_to_nonactive_provider_uses_that_providers_effort() {
+        // Active provider is DeepSeek (whose effort floor is low/medium), but the
+        // explicit model `GLM-5.2` only routes to Z.ai. The resolved effort must
+        // be normalized for Z.ai — not left at DeepSeek's raw `low` setting.
+        let _env_lock = crate::test_support::lock_test_env();
+        let _deepseek = crate::test_support::EnvVarGuard::set("DEEPSEEK_API_KEY", "ds-key");
+        let _zai = crate::test_support::EnvVarGuard::set("ZAI_API_KEY", "zai-key");
+        let config = Config {
+            provider: Some("deepseek".to_string()),
+            reasoning_effort: Some("low".to_string()),
+            ..Default::default()
+        };
+
+        let route = resolve_explicit_route_with_inventory(&config, "GLM-5.2")
+            .expect("explicit GLM route should resolve to its provider");
+
+        assert_eq!(
+            route.provider,
+            ApiProvider::Zai,
+            "GLM-5.2 must route to Z.ai, not the active DeepSeek provider"
+        );
+        assert_eq!(
+            route.reasoning_effort,
+            Some(ReasoningEffort::High),
+            "low must be normalized up to high for the Z.ai route, not passed through"
+        );
     }
 
     #[tokio::test]

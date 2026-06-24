@@ -344,6 +344,7 @@ impl Engine {
             let effective_reasoning_effort = resolve_auto_effort(
                 self.session.reasoning_effort.as_deref(),
                 &self.session.messages,
+                self.api_provider,
             );
 
             // Check prefix-cache stability before building the request.
@@ -2809,7 +2810,11 @@ fn should_emit_thinking_only_status(
 /// When the configured effort is `"auto"`, inspects the last user message
 /// and calls [`crate::auto_reasoning::select`] to pick the actual tier.
 /// Non-`"auto"` values pass through unchanged.
-fn resolve_auto_effort(reasoning_effort: Option<&str>, messages: &[Message]) -> Option<String> {
+fn resolve_auto_effort(
+    reasoning_effort: Option<&str>,
+    messages: &[Message],
+    provider: crate::config::ApiProvider,
+) -> Option<String> {
     match reasoning_effort {
         Some("auto") => {
             // Find the last user message in the conversation.
@@ -2841,7 +2846,10 @@ fn resolve_auto_effort(reasoning_effort: Option<&str>, messages: &[Message]) -> 
             // their own turn pass and can pass is_subagent=true when they
             // call this function directly.
             let tier = crate::auto_reasoning::select(false, &last_msg);
-            let resolved = tier.as_setting().to_string();
+            let resolved =
+                crate::model_routing::normalize_auto_route_effort_for_provider(provider, tier)
+                    .as_setting()
+                    .to_string();
             tracing::debug!(
                 reasoning_effort = %resolved,
                 is_subagent = false,
@@ -3077,7 +3085,11 @@ mod tests {
         }];
 
         assert_eq!(
-            resolve_auto_effort(Some("auto"), &messages),
+            resolve_auto_effort(
+                Some("auto"),
+                &messages,
+                crate::config::ApiProvider::Deepseek
+            ),
             Some("high".to_string()),
             "auto thinking should classify the user request, not stored metadata"
         );

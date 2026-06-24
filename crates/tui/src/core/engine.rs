@@ -763,7 +763,7 @@ impl Engine {
                 )
             })?;
         let route_config = route.config;
-        match DeepSeekClient::new(&route_config) {
+        match DeepSeekClient::from_candidate(&route_config, &route.candidate) {
             Ok(client) => {
                 self.api_provider = provider;
                 self.api_config = route_config;

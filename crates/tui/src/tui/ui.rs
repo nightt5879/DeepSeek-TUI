@@ -6730,7 +6730,7 @@ async fn switch_provider(
     let next_config = resolved_route.config;
     let new_model = resolved_route.model;
 
-    if let Err(err) = DeepSeekClient::new(&next_config) {
+    if let Err(err) = DeepSeekClient::from_candidate(&next_config, &resolved_route.candidate) {
         app.pending_provider_switch = None;
         app.add_message(HistoryCell::System {
             content: format!(
@@ -6868,7 +6868,7 @@ async fn apply_provider_fallback_switch(
     let next_config = resolved_route.config;
     let new_model = resolved_route.model;
 
-    if let Err(err) = DeepSeekClient::new(&next_config) {
+    if let Err(err) = DeepSeekClient::from_candidate(&next_config, &resolved_route.candidate) {
         app.api_provider = previous_provider;
         app.last_fallback_reason = Some(format!(
             "Fallback provider {} was unavailable: {err}",
