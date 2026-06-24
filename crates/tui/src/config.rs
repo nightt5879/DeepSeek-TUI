@@ -521,7 +521,16 @@ fn subagent_provider_key_matches(key: &str, provider: ApiProvider) -> bool {
         }
         ApiProvider::Zai => matches!(
             normalized.as_str(),
-            "zai" | "z_ai" | "glm" | "zai_glm" | "z_glm"
+            "zai"
+                | "z_ai"
+                | "glm"
+                | "zai_glm"
+                | "z_glm"
+                | "zhipu"
+                | "zhipuai"
+                | "bigmodel"
+                | "big_model"
+                | "zhipu_glm"
         ),
         _ => false,
     }
@@ -1116,93 +1125,114 @@ fn canonical_minimax_model_id(model: &str) -> Option<&'static str> {
     }
 }
 
-/// Normalize a model selected through the TUI for the active provider.
+/// Resolve a user-entered model id to the canonical family id a provider
+/// understands, without any wire-id translation.
 ///
-/// Official DeepSeek endpoints require bare model IDs. Provider-prefixed
-/// aliases are valid for some compatible backends, but sending them to
-/// DeepSeek's own API causes a 400. Keep the generic normalizer permissive for
-/// config/back-compat, and canonicalize only when the active provider is known.
+/// Model families are treated equally: every provider-owned family (GLM via
+/// Z.ai/Zhipu, Kimi, Xiaomi MiMo, MiniMax, Arcee, OpenRouter slugs, …)
+/// resolves through the same "apply the family's canonical map, else pass the
+/// input through" path. Nothing is rejected just because it is not a
+/// DeepSeek id — the upstream API remains the final authority, mirroring how
+/// the models.dev catalog (the route resolver's source of truth) carries one
+/// authoritative id per offering regardless of vendor.
 ///
-/// Preserves the caller's casing when the model is already a recognised
-/// DeepSeek id (e.g. `DeepSeek-V4-Flash` stays as-is). Only rewrites compact
-/// aliases like `deepseek-v4pro` → `deepseek-v4-pro`.
+/// This is the canonicalization half of what [`normalize_model_name_for_provider`]
+/// used to fuse together. Wire-id translation (e.g. `deepseek-v4-pro` → an
+/// aggregator's `accounts/…/deepseek-v4-pro` slug) belongs to the route
+/// resolver at request time, not to a name typed into `/provider`, so it is
+/// deliberately kept out of here.
+///
+/// Returns `None` only for empty or control-character input; every other id
+/// passes through so a custom/self-hosted endpoint is never wrongly rejected.
 #[must_use]
-pub fn normalize_model_name_for_provider(provider: ApiProvider, model: &str) -> Option<String> {
-    if matches!(provider, ApiProvider::Openrouter)
-        && let Some(canonical) = canonical_openrouter_recent_model_id(model)
-    {
+pub fn canonical_model_id_for_provider(provider: ApiProvider, model: &str) -> Option<String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return None;
+    }
+
+    // Provider-owned model families resolve through their own canonical map,
+    // which defines the authoritative casing (`glm-5.1` → `GLM-5.1`,
+    // `minimax-m2.7` → `MiniMax-M2.7`). Each map recognizes only *its own*
+    // aliases, so an unknown id falls through to passthrough — no family acts
+    // as a gate against any other.
+    let family_canonical: Option<&'static str> = match provider {
+        ApiProvider::Openrouter => canonical_openrouter_recent_model_id(trimmed),
+        ApiProvider::XiaomiMimo => canonical_xiaomi_mimo_model_id(trimmed),
+        ApiProvider::Arcee => canonical_arcee_model_id(trimmed),
+        ApiProvider::Moonshot => canonical_moonshot_model_id(trimmed),
+        ApiProvider::Zai => canonical_zai_model_id(trimmed),
+        ApiProvider::Minimax => canonical_minimax_model_id(trimmed),
+        _ => None,
+    };
+    if let Some(canonical) = family_canonical {
         return Some(canonical.to_string());
     }
 
-    if matches!(provider, ApiProvider::XiaomiMimo)
-        && let Some(canonical) = canonical_xiaomi_mimo_model_id(model)
-    {
-        return Some(canonical.to_string());
-    }
-
-    if matches!(provider, ApiProvider::Arcee) {
-        return canonical_arcee_model_id(model)
-            .map(ToString::to_string)
-            .or_else(|| normalize_custom_model_id(model));
-    }
-
-    if matches!(provider, ApiProvider::Moonshot) {
-        return canonical_moonshot_model_id(model)
-            .map(ToString::to_string)
-            .or_else(|| normalize_custom_model_id(model));
-    }
-
-    if matches!(provider, ApiProvider::Zai) {
-        return canonical_zai_model_id(model)
-            .map(ToString::to_string)
-            .or_else(|| normalize_custom_model_id(model));
-    }
-
-    if matches!(provider, ApiProvider::Minimax) {
-        return canonical_minimax_model_id(model)
-            .map(ToString::to_string)
-            .or_else(|| normalize_custom_model_id(model));
-    }
-
-    if matches!(provider, ApiProvider::Huggingface) {
-        return normalize_custom_model_id(model);
-    }
-
-    let normalized = normalize_model_name(model)?;
-    if matches!(provider, ApiProvider::Together) {
-        let provider_model = model_for_provider(provider, normalized.clone());
-        if provider_model != normalized {
-            return Some(provider_model);
-        }
-    }
+    // The official DeepSeek API is the one legitimate per-family gate: it serves
+    // only its own ids (and 400s anything else), so reject an id it does not
+    // recognize. Compact aliases are rewritten (deepseek-v4pro → deepseek-v4-pro)
+    // and the caller's casing is kept for an already-valid id (`DeepSeek-V4-Flash`
+    // stays as-is). Custom/self-hosted DeepSeek endpoints take the
+    // accepts-custom-model-ids path, so they never reach this gate.
     if matches!(
         provider,
         ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic
-    ) && let Some(canonical) = canonical_official_deepseek_model_id(&normalized)
-    {
-        // When the user's input already matches a known model id
-        // case-insensitively, keep their original casing; only rewrite
-        // compact aliases (e.g. v4pro → v4-pro).
-        if canonical.eq_ignore_ascii_case(&normalized)
-            || normalized.to_ascii_lowercase() == canonical
-        {
-            return Some(normalized);
+    ) {
+        let normalized = normalize_model_name(trimmed)?;
+        if let Some(canonical) = canonical_official_deepseek_model_id(&normalized) {
+            if canonical.eq_ignore_ascii_case(&normalized)
+                || normalized.to_ascii_lowercase() == canonical
+            {
+                return Some(normalized);
+            }
+            return Some(canonical.to_string());
         }
-        return Some(canonical.to_string());
+        return Some(normalized);
     }
+
+    // Aggregators that host DeepSeek (NIM, Novita, Fireworks, SiliconFlow, SGLang,
+    // vLLM, DeepInfra, Wanjie Ark, Volcengine) canonicalize recognized DeepSeek
+    // ids but pass everything else through — they serve more than DeepSeek, so
+    // the upstream API stays the authority. A name is never rejected here.
     if matches!(
         provider,
-        ApiProvider::Siliconflow | ApiProvider::SiliconflowCn
+        ApiProvider::NvidiaNim
+            | ApiProvider::Novita
+            | ApiProvider::Fireworks
+            | ApiProvider::Siliconflow
+            | ApiProvider::SiliconflowCn
+            | ApiProvider::Sglang
+            | ApiProvider::Vllm
+            | ApiProvider::Deepinfra
+            | ApiProvider::WanjieArk
+            | ApiProvider::Volcengine
+    ) && let Some(canonical) = canonical_official_deepseek_model_id(
+        &normalize_model_name(trimmed).unwrap_or_else(|| trimmed.to_string()),
     ) {
-        let provider_model = model_for_provider(provider, normalized.clone());
-        if provider_model != normalized {
-            return Some(provider_model);
-        }
+        return Some(canonical.to_string());
     }
-    if let Some(canonical) = canonical_official_deepseek_model_id(&normalized) {
-        return Some(model_for_provider(provider, canonical.to_string()));
-    }
-    Some(normalized)
+
+    // Everything else (HuggingFace, OpenAI-compatible, Qianfan, StepFun, Codex,
+    // Anthropic) owns no canonical map — the id the user typed is authoritative.
+    Some(trimmed.to_string())
+}
+
+/// Normalize a model selected through the TUI for the active provider, applying
+/// the provider's wire-slug translation on top of the canonical family id.
+///
+/// This is the wire-id half of the split (canonicalization lives in
+/// [`canonical_model_id_for_provider`]). Used by config-file normalization,
+/// where vendor-prefixed ids (e.g. `deepseek-ai/DeepSeek-V4-Pro` on SiliconFlow)
+/// are the stored form. `/provider` deliberately uses the canonical half instead.
+#[must_use]
+pub fn normalize_model_name_for_provider(provider: ApiProvider, model: &str) -> Option<String> {
+    let canonical = canonical_model_id_for_provider(provider, model)?;
+    // Translate the canonical family id to the provider's wire slug when the
+    // provider's API uses vendor-prefixed ids (Together, Siliconflow, NIM, …).
+    // `model_for_provider` is a no-op for providers without a wire-slug map, so
+    // this is one uniform layer over the equal-treatment canonical resolver.
+    Some(model_for_provider(provider, canonical))
 }
 
 #[must_use]
@@ -2735,7 +2765,13 @@ pub struct ProvidersConfig {
     pub openai_codex: ProviderConfig,
     #[serde(default, alias = "claude")]
     pub anthropic: ProviderConfig,
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "zhipu",
+        alias = "zhipuai",
+        alias = "bigmodel",
+        alias = "big-model"
+    )]
     pub zai: ProviderConfig,
     #[serde(default)]
     pub stepfun: ProviderConfig,

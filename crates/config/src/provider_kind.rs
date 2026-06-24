@@ -73,7 +73,15 @@ pub enum ProviderKind {
     OpenaiCodex,
     #[serde(alias = "claude")]
     Anthropic,
-    #[serde(alias = "z-ai", alias = "z_ai", alias = "z.ai")]
+    #[serde(
+        alias = "z-ai",
+        alias = "z_ai",
+        alias = "z.ai",
+        alias = "zhipu",
+        alias = "zhipuai",
+        alias = "bigmodel",
+        alias = "big-model"
+    )]
     Zai,
     #[serde(
         alias = "step-fun",

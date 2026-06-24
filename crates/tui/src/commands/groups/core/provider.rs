@@ -5,10 +5,7 @@
 //! keeps the v0.6.6 CLI form for muscle-memory + scripted use.
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::config::{
-    ApiProvider, normalize_model_name, normalize_model_name_for_provider,
-    provider_passes_model_through,
-};
+use crate::config::{ApiProvider, canonical_model_id_for_provider, provider_passes_model_through};
 use crate::localization::MessageId;
 use crate::tui::app::{App, AppAction};
 
@@ -62,27 +59,26 @@ pub fn provider(app: &mut App, args: Option<&str>) -> CommandResult {
 
     let model = match model_arg {
         None => None,
-        Some(raw) if matches!(target, ApiProvider::XiaomiMimo) => {
-            let expanded = expand_model_alias_for_provider(target, raw);
-            Some(normalize_model_name_for_provider(target, &expanded).unwrap_or(expanded))
-        }
-        Some(raw) if provider_passes_model_through(target) => Some(raw.trim().to_string()),
         Some(raw) => {
+            // Expand provider shorthands (flash/pro, Xiaomi MiMo tts/omni, …)
+            // uniformly, then either keep the id verbatim for providers that take
+            // opaque/custom model tags, or resolve it to the canonical family id.
+            // Families are treated equally: each resolves through its own
+            // canonical map (DeepSeek, GLM via Z.ai/Zhipu, Kimi, MiniMax, …) and
+            // an id matching none passes through unchanged — the upstream API is
+            // the authority. Wire-id translation is deferred to the route
+            // resolver at request time, so `/provider` stores canonical names.
             let expanded = expand_model_alias_for_provider(target, raw);
-            let normalized = if matches!(
-                target,
-                ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::Together
-            ) {
-                normalize_model_name_for_provider(target, &expanded)
+            if provider_passes_model_through(target) {
+                Some(expanded)
             } else {
-                normalize_model_name(&expanded)
-            };
-            match normalized {
-                Some(normalized) => Some(normalized),
-                None => {
-                    return CommandResult::error(format!(
-                        "Invalid model '{raw}'. Try: flash, pro, deepseek-v4-flash, deepseek-v4-pro, or xiaomi-mimo omni."
-                    ));
+                match canonical_model_id_for_provider(target, &expanded) {
+                    Some(canonical) => Some(canonical),
+                    None => {
+                        return CommandResult::error(format!(
+                            "Invalid model '{raw}'. Provide a non-empty model id."
+                        ));
+                    }
                 }
             }
         }
@@ -150,7 +146,8 @@ fn provider_fallback(app: &mut App, subcommand: Option<&str>) -> CommandResult {
 }
 
 fn expand_model_alias_for_provider(provider: ApiProvider, name: &str) -> String {
-    let lower = name.trim().to_ascii_lowercase();
+    let trimmed = name.trim();
+    let lower = trimmed.to_ascii_lowercase();
     if matches!(provider, ApiProvider::XiaomiMimo) {
         return match lower.as_str() {
             "pro" | "mimo" => "mimo-v2.5-pro".to_string(),
@@ -163,21 +160,25 @@ fn expand_model_alias_for_provider(provider: ApiProvider, name: &str) -> String 
             "voiceclone" | "voice-clone" | "mimo-voice-clone" => {
                 "mimo-v2.5-tts-voiceclone".to_string()
             }
-            other => other.to_string(),
+            // Not a shorthand: keep the id as typed (case preserved for custom
+            // token-plan model ids).
+            _ => trimmed.to_string(),
         };
     }
 
     match lower.as_str() {
         "pro" | "v4-pro" => "deepseek-v4-pro".to_string(),
         "flash" | "v4-flash" => "deepseek-v4-flash".to_string(),
-        other => other.to_string(),
+        // Not a shorthand: keep the id as typed (case preserved for opaque
+        // model tags on passthrough providers like Ollama/HuggingFace).
+        _ => trimmed.to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, DEFAULT_TOGETHER_FLASH_MODEL, DEFAULT_TOGETHER_MODEL};
+    use crate::config::Config;
     use crate::tui::app::TuiOptions;
     use std::path::PathBuf;
 
@@ -352,6 +353,31 @@ mod tests {
     }
 
     #[test]
+    fn zhipu_aliases_fold_into_zai_and_canonicalize_glm() {
+        // Zhipu AI and Z.ai are the same vendor: `zhipu`/`zhipuai` select the
+        // single Zai provider and store the canonical GLM family id in Z.ai's own
+        // casing (`glm-5.2` → `GLM-5.2`).
+        let mut app = create_test_app();
+        let result = provider(&mut app, Some("zhipu glm-5.2"));
+        match result.action {
+            Some(AppAction::SwitchProvider { provider, model }) => {
+                assert_eq!(provider, ApiProvider::Zai);
+                assert_eq!(model.as_deref(), Some("GLM-5.2"));
+            }
+            other => panic!("expected SwitchProvider, got {other:?}"),
+        }
+
+        let result = provider(&mut app, Some("zhipuai glm-5-1"));
+        match result.action {
+            Some(AppAction::SwitchProvider { provider, model }) => {
+                assert_eq!(provider, ApiProvider::Zai);
+                assert_eq!(model.as_deref(), Some("GLM-5.1"));
+            }
+            other => panic!("expected SwitchProvider, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn switch_to_novita_emits_action() {
         let mut app = create_test_app();
         let result = provider(&mut app, Some("novita"));
@@ -404,13 +430,17 @@ mod tests {
     }
 
     #[test]
-    fn switch_to_together_accepts_provider_owned_deepseek_aliases() {
+    fn switch_to_together_canonicalizes_deepseek_aliases() {
+        // Together is symmetric with the other DeepSeek-hosting routes: the
+        // canonical family id is stored and the route resolver performs the
+        // wire-id translation (deepseek-v4-pro → Together's catalog slug) at
+        // request time, rather than the command storing a wire slug.
         let mut app = create_test_app();
         let result = provider(&mut app, Some("together deepseek-v4-pro"));
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
                 assert_eq!(provider, ApiProvider::Together);
-                assert_eq!(model.as_deref(), Some(DEFAULT_TOGETHER_MODEL));
+                assert_eq!(model.as_deref(), Some("deepseek-v4-pro"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
         }
@@ -419,7 +449,7 @@ mod tests {
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
                 assert_eq!(provider, ApiProvider::Together);
-                assert_eq!(model.as_deref(), Some(DEFAULT_TOGETHER_FLASH_MODEL));
+                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
         }
@@ -568,11 +598,19 @@ mod tests {
     }
 
     #[test]
-    fn invalid_model_returns_error() {
+    fn aggregator_passes_unrecognized_model_through() {
+        // Equal treatment: a non-DeepSeek id on a DeepSeek-hosting aggregator is
+        // not rejected — it passes through so the upstream API stays the
+        // authority on what it can serve.
         let mut app = create_test_app();
         let result = provider(&mut app, Some("nim gpt-4"));
-        let msg = result.message.expect("expected error message");
-        assert!(msg.contains("Invalid model"));
-        assert!(result.action.is_none());
+        assert!(result.message.is_none());
+        match result.action {
+            Some(AppAction::SwitchProvider { provider, model }) => {
+                assert_eq!(provider, ApiProvider::NvidiaNim);
+                assert_eq!(model.as_deref(), Some("gpt-4"));
+            }
+            other => panic!("expected SwitchProvider action, got {other:?}"),
+        }
     }
 }

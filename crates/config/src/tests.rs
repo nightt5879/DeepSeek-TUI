@@ -598,8 +598,19 @@ struct EnvGuard {
     kimi_model_name: Option<OsString>,
     zai_api_key: Option<OsString>,
     z_ai_api_key: Option<OsString>,
+    zhipu_api_key: Option<OsString>,
+    glm_api_key: Option<OsString>,
     zai_base_url: Option<OsString>,
+    z_ai_base_url: Option<OsString>,
+    zhipu_base_url: Option<OsString>,
+    zhipuai_base_url: Option<OsString>,
+    bigmodel_base_url: Option<OsString>,
     zai_model: Option<OsString>,
+    z_ai_model: Option<OsString>,
+    zhipu_model: Option<OsString>,
+    zhipuai_model: Option<OsString>,
+    bigmodel_model: Option<OsString>,
+    glm_model: Option<OsString>,
     stepfun_api_key: Option<OsString>,
     step_api_key: Option<OsString>,
     stepfun_base_url: Option<OsString>,
@@ -694,8 +705,19 @@ impl EnvGuard {
             kimi_model_name: env::var_os("KIMI_MODEL_NAME"),
             zai_api_key: env::var_os("ZAI_API_KEY"),
             z_ai_api_key: env::var_os("Z_AI_API_KEY"),
+            zhipu_api_key: env::var_os("ZHIPU_API_KEY"),
+            glm_api_key: env::var_os("GLM_API_KEY"),
             zai_base_url: env::var_os("ZAI_BASE_URL"),
+            z_ai_base_url: env::var_os("Z_AI_BASE_URL"),
+            zhipu_base_url: env::var_os("ZHIPU_BASE_URL"),
+            zhipuai_base_url: env::var_os("ZHIPUAI_BASE_URL"),
+            bigmodel_base_url: env::var_os("BIGMODEL_BASE_URL"),
             zai_model: env::var_os("ZAI_MODEL"),
+            z_ai_model: env::var_os("Z_AI_MODEL"),
+            zhipu_model: env::var_os("ZHIPU_MODEL"),
+            zhipuai_model: env::var_os("ZHIPUAI_MODEL"),
+            bigmodel_model: env::var_os("BIGMODEL_MODEL"),
+            glm_model: env::var_os("GLM_MODEL"),
             stepfun_api_key: env::var_os("STEPFUN_API_KEY"),
             step_api_key: env::var_os("STEP_API_KEY"),
             stepfun_base_url: env::var_os("STEPFUN_BASE_URL"),
@@ -785,8 +807,19 @@ impl EnvGuard {
             env::remove_var("KIMI_MODEL_NAME");
             env::remove_var("ZAI_API_KEY");
             env::remove_var("Z_AI_API_KEY");
+            env::remove_var("ZHIPU_API_KEY");
+            env::remove_var("GLM_API_KEY");
             env::remove_var("ZAI_BASE_URL");
+            env::remove_var("Z_AI_BASE_URL");
+            env::remove_var("ZHIPU_BASE_URL");
+            env::remove_var("ZHIPUAI_BASE_URL");
+            env::remove_var("BIGMODEL_BASE_URL");
             env::remove_var("ZAI_MODEL");
+            env::remove_var("Z_AI_MODEL");
+            env::remove_var("ZHIPU_MODEL");
+            env::remove_var("ZHIPUAI_MODEL");
+            env::remove_var("BIGMODEL_MODEL");
+            env::remove_var("GLM_MODEL");
             env::remove_var("STEPFUN_API_KEY");
             env::remove_var("STEP_API_KEY");
             env::remove_var("STEPFUN_BASE_URL");
@@ -908,8 +941,19 @@ impl Drop for EnvGuard {
             Self::restore_var("KIMI_MODEL_NAME", self.kimi_model_name.take());
             Self::restore_var("ZAI_API_KEY", self.zai_api_key.take());
             Self::restore_var("Z_AI_API_KEY", self.z_ai_api_key.take());
+            Self::restore_var("ZHIPU_API_KEY", self.zhipu_api_key.take());
+            Self::restore_var("GLM_API_KEY", self.glm_api_key.take());
             Self::restore_var("ZAI_BASE_URL", self.zai_base_url.take());
+            Self::restore_var("Z_AI_BASE_URL", self.z_ai_base_url.take());
+            Self::restore_var("ZHIPU_BASE_URL", self.zhipu_base_url.take());
+            Self::restore_var("ZHIPUAI_BASE_URL", self.zhipuai_base_url.take());
+            Self::restore_var("BIGMODEL_BASE_URL", self.bigmodel_base_url.take());
             Self::restore_var("ZAI_MODEL", self.zai_model.take());
+            Self::restore_var("Z_AI_MODEL", self.z_ai_model.take());
+            Self::restore_var("ZHIPU_MODEL", self.zhipu_model.take());
+            Self::restore_var("ZHIPUAI_MODEL", self.zhipuai_model.take());
+            Self::restore_var("BIGMODEL_MODEL", self.bigmodel_model.take());
+            Self::restore_var("GLM_MODEL", self.glm_model.take());
             Self::restore_var("STEPFUN_API_KEY", self.stepfun_api_key.take());
             Self::restore_var("STEP_API_KEY", self.step_api_key.take());
             Self::restore_var("STEPFUN_BASE_URL", self.stepfun_base_url.take());
@@ -3127,6 +3171,42 @@ fn zai_aliases_resolve_to_canonical_models() {
     assert_eq!(
         normalize_model_for_provider(ProviderKind::Zai, "custom-glm-preview"),
         "custom-glm-preview"
+    );
+}
+
+#[test]
+fn zhipu_aliases_fold_into_zai_provider() {
+    // Zhipu AI and Z.ai are the same vendor; `zhipu`/`zhipuai`/`bigmodel`
+    // resolve to the single Zai provider rather than a separate one.
+    assert_eq!(ProviderKind::parse("zhipu"), Some(ProviderKind::Zai));
+    assert_eq!(ProviderKind::parse("zhipuai"), Some(ProviderKind::Zai));
+    assert_eq!(ProviderKind::parse("bigmodel"), Some(ProviderKind::Zai));
+    assert_eq!(ProviderKind::parse("big-model"), Some(ProviderKind::Zai));
+
+    // A `[providers.zhipu]` table (BigModel China endpoint) merges into the Zai
+    // provider config through the serde alias.
+    let parsed: ConfigToml = toml::from_str(
+        r#"
+        [providers.zhipu]
+        api_key = "$ZHIPU_API_KEY"
+        base_url = "https://open.bigmodel.cn/api/paas/v4/"
+        model = "glm-5-2"
+        "#,
+    )
+    .expect("zhipu provider table parses");
+
+    let provider = parsed.providers.for_provider(ProviderKind::Zai);
+    assert_eq!(provider.api_key.as_deref(), Some("$ZHIPU_API_KEY"));
+    assert_eq!(
+        provider.base_url.as_deref(),
+        Some("https://open.bigmodel.cn/api/paas/v4/")
+    );
+    assert_eq!(provider.model.as_deref(), Some("glm-5-2"));
+
+    // GLM aliases canonicalize under the Zai umbrella.
+    assert_eq!(
+        normalize_model_for_provider(ProviderKind::Zai, "glm-5-2"),
+        DEFAULT_ZAI_MODEL
     );
 }
 

@@ -496,12 +496,12 @@ provider!(
     Zai,
     Zai,
     "zai",
-    "Z.ai (GLM Coding)",
+    "Zhipu AI / Z.ai",
     DEFAULT_ZAI_BASE_URL,
     DEFAULT_ZAI_MODEL,
-    ["ZAI_API_KEY", "Z_AI_API_KEY"],
+    ["ZAI_API_KEY", "Z_AI_API_KEY", "ZHIPU_API_KEY", "GLM_API_KEY"],
     "zai",
-    aliases: ["z-ai", "z_ai", "z.ai"]
+    aliases: ["z-ai", "z_ai", "z.ai", "zhipu", "zhipuai", "bigmodel", "big-model"]
 );
 
 provider!(

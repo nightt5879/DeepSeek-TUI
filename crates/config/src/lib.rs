@@ -119,7 +119,16 @@ pub struct ProvidersToml {
     pub openai_codex: ProviderConfigToml,
     #[serde(default)]
     pub anthropic: ProviderConfigToml,
-    #[serde(default, alias = "z-ai", alias = "z_ai", alias = "z.ai")]
+    #[serde(
+        default,
+        alias = "z-ai",
+        alias = "z_ai",
+        alias = "z.ai",
+        alias = "zhipu",
+        alias = "zhipuai",
+        alias = "bigmodel",
+        alias = "big-model"
+    )]
     pub zai: ProviderConfigToml,
     #[serde(
         default,
@@ -4134,10 +4143,17 @@ impl EnvRuntimeOverrides {
                 .filter(|v| !v.trim().is_empty()),
             zai_base_url: std::env::var("ZAI_BASE_URL")
                 .or_else(|_| std::env::var("Z_AI_BASE_URL"))
+                .or_else(|_| std::env::var("ZHIPU_BASE_URL"))
+                .or_else(|_| std::env::var("ZHIPUAI_BASE_URL"))
+                .or_else(|_| std::env::var("BIGMODEL_BASE_URL"))
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             zai_model: std::env::var("ZAI_MODEL")
                 .or_else(|_| std::env::var("Z_AI_MODEL"))
+                .or_else(|_| std::env::var("ZHIPU_MODEL"))
+                .or_else(|_| std::env::var("ZHIPUAI_MODEL"))
+                .or_else(|_| std::env::var("BIGMODEL_MODEL"))
+                .or_else(|_| std::env::var("GLM_MODEL"))
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             stepfun_base_url: std::env::var("STEPFUN_BASE_URL")

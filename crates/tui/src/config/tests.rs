@@ -99,7 +99,7 @@ fn deepseek_api_key_reads_metadata_env_vars_for_newer_providers() -> Result<()> 
 fn missing_provider_api_key_message_uses_provider_metadata() -> Result<()> {
     let message = missing_provider_api_key_message(ApiProvider::Zai)?;
 
-    assert!(message.contains("Z.ai (GLM Coding) API key not found"));
+    assert!(message.contains("Zhipu AI / Z.ai API key not found"));
     assert!(message.contains("https://z.ai/model-api"));
     assert!(message.contains("ZAI_API_KEY / Z_AI_API_KEY"));
     assert!(message.contains("[providers.zai] api_key"));
