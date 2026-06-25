@@ -5511,6 +5511,7 @@ fn rollback_provider_after_auth_failure(app: &mut App, config: &mut Config) -> O
         previous_model,
         previous_model_ids_passthrough,
         previous_route_limits,
+        previous_context_window_override,
         previous_config,
         previous_onboarding,
         previous_onboarding_needs_api_key,
@@ -5523,6 +5524,7 @@ fn rollback_provider_after_auth_failure(app: &mut App, config: &mut Config) -> O
     app.provider_models
         .insert(previous_provider.as_str().to_string(), previous_model);
     app.model_ids_passthrough = previous_model_ids_passthrough;
+    app.active_context_window_override = previous_context_window_override;
     app.active_route_limits = previous_route_limits;
     app.update_model_compaction_budget();
     app.clear_model_scoped_telemetry();
@@ -6715,6 +6717,7 @@ async fn switch_provider(
         previous_model: previous_model.clone(),
         previous_model_ids_passthrough,
         previous_route_limits: app.active_route_limits,
+        previous_context_window_override: app.active_context_window_override,
         previous_config: previous_config.clone(),
         previous_onboarding: app.onboarding,
         previous_onboarding_needs_api_key: app.onboarding_needs_api_key,

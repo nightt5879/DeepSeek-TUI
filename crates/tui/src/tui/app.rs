@@ -1508,6 +1508,7 @@ pub(crate) struct PendingProviderSwitch {
     pub previous_model: String,
     pub previous_model_ids_passthrough: bool,
     pub previous_route_limits: Option<RouteLimits>,
+    pub previous_context_window_override: Option<u32>,
     pub previous_config: Config,
     pub previous_onboarding: OnboardingState,
     pub previous_onboarding_needs_api_key: bool,

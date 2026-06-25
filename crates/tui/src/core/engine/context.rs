@@ -75,6 +75,7 @@ pub(super) fn effective_max_output_tokens_for_route(
     };
     u32::try_from(ContextBudget::new(u64::from(window), 0, u64::from(cap)).output_cap_tokens)
         .unwrap_or(cap)
+        .max(1)
 }
 /// Keep this many most recent messages when emergency trimming is required.
 pub(super) const MIN_RECENT_MESSAGES_TO_KEEP: usize = 4;

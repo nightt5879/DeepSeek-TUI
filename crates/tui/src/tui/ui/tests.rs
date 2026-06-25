@@ -9287,6 +9287,7 @@ async fn provider_switch_auth_error_restores_previous_provider_and_model() {
     app.onboarding = OnboardingState::None;
     app.onboarding_needs_api_key = false;
     app.api_key_env_only = true;
+    app.active_context_window_override = Some(1_000_000);
     let mut engine = mock_engine_handle();
     let mut config = Config {
         provider: Some("deepseek".to_string()),
@@ -9295,10 +9296,12 @@ async fn provider_switch_auth_error_restores_previous_provider_and_model() {
         providers: Some(ProvidersConfig {
             deepseek: ProviderConfig {
                 api_key: Some("deepseek-key".to_string()),
+                context_window: Some(1_000_000),
                 ..Default::default()
             },
             moonshot: ProviderConfig {
                 api_key: Some("kimi-key".to_string()),
+                context_window: Some(262_144),
                 ..Default::default()
             },
             ..Default::default()
@@ -9315,6 +9318,7 @@ async fn provider_switch_auth_error_restores_previous_provider_and_model() {
     )
     .await;
     assert_eq!(app.api_provider, ApiProvider::Moonshot);
+    assert_eq!(app.active_context_window_override, Some(262_144));
     assert_eq!(config.provider.as_deref(), Some("moonshot"));
     assert!(app.pending_provider_switch.is_some());
 
@@ -9327,6 +9331,7 @@ async fn provider_switch_auth_error_restores_previous_provider_and_model() {
 
     assert_eq!(app.api_provider, ApiProvider::Deepseek);
     assert_eq!(app.model, "deepseek-v4-pro");
+    assert_eq!(app.active_context_window_override, Some(1_000_000));
     assert!(!app.model_ids_passthrough);
     assert!(!app.offline_mode);
     assert_eq!(app.onboarding, OnboardingState::None);

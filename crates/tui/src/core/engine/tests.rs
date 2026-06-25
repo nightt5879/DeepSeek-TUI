@@ -3231,6 +3231,21 @@ fn effective_max_output_tokens_for_route_caps_to_context_window() {
 }
 
 #[test]
+fn effective_max_output_tokens_for_route_keeps_tiny_window_positive() {
+    let _lock = lock_test_env();
+    let limits = codewhale_config::route::RouteLimits {
+        context_tokens: Some(2_048),
+        input_tokens: None,
+        output_tokens: None,
+    };
+
+    assert_eq!(
+        effective_max_output_tokens_for_route("deepseek-v4-pro", Some(limits)),
+        1
+    );
+}
+
+#[test]
 fn effective_max_output_tokens_caps_api_request_for_large_window_models() {
     // Serialize with other tests that mutate DEEPSEEK_MAX_OUTPUT_TOKENS so
     // v4_cap and flash_cap below see the same env state.
