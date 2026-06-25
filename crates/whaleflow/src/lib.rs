@@ -1009,18 +1009,18 @@ impl MockWorkflowExecutor {
             .remove(&spec.id)
             .unwrap_or_else(|| MockLeafOutcome::succeeded(format!("mock leaf {}", spec.id)));
         let tokens = outcome.usage.total_tokens();
-        if let Some(per_leaf_token_cap) = spec.budget.max_tokens {
-            if tokens > per_leaf_token_cap {
-                return MockLeafOutcome {
-                    status: WorkflowRunStatus::BudgetExceeded,
-                    usage: outcome.usage,
-                    memo_usage: outcome.memo_usage,
-                    output: Some(format!(
-                        "mock workflow leaf token budget exhausted ({tokens} > {per_leaf_token_cap})"
-                    )),
-                    artifacts: outcome.artifacts,
-                };
-            }
+        if let Some(per_leaf_token_cap) = spec.budget.max_tokens
+            && tokens > per_leaf_token_cap
+        {
+            return MockLeafOutcome {
+                status: WorkflowRunStatus::BudgetExceeded,
+                usage: outcome.usage,
+                memo_usage: outcome.memo_usage,
+                output: Some(format!(
+                    "mock workflow leaf token budget exhausted ({tokens} > {per_leaf_token_cap})"
+                )),
+                artifacts: outcome.artifacts,
+            };
         }
         self.leaf_tokens_used = self.leaf_tokens_used.saturating_add(tokens);
         outcome

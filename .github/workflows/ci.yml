@@ -101,7 +101,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: '1.88'
+          toolchain: stable
           components: rustfmt, clippy
       - uses: mozilla-actions/sccache-action@v0.0.10
       - name: Enable sccache
@@ -129,6 +129,7 @@ jobs:
             -A clippy::uninlined_format_args \
             -A clippy::too_many_arguments \
             -A clippy::unnecessary_map_or \
+            -A clippy::collapsible_if \
             -A clippy::assertions_on_constants
       - name: Check provider registry drift
         run: python3 scripts/check-provider-registry.py
