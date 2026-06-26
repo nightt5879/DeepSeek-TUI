@@ -8677,13 +8677,18 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
             content_width,
             budget,
         );
-        let visible_lines = if input_text.is_empty() {
-            1
+        let visual_rows = if input_text.is_empty() {
+            let hint = crate::tui::widgets::composer_empty_hint_text(app);
+            crate::tui::widgets::empty_composer_visual_rows(
+                Some(hint.as_ref()),
+                content_width,
+                budget,
+            )
         } else {
             // Count wrapped lines (approximation matching the render path).
             crate::tui::widgets::wrap_input_lines_for_mouse(input_text, content_width).len()
         };
-        let top_padding = budget.saturating_sub(visible_lines.clamp(1, budget));
+        let top_padding = budget.saturating_sub(visual_rows.clamp(1, budget));
         app.viewport.last_composer_scroll_offset = scroll_offset;
         app.viewport.last_composer_top_padding = top_padding;
     }
