@@ -1047,15 +1047,26 @@ If you are upgrading from older releases:
   records loaded next to `config.toml`, for example
   `~/.codewhale/permissions.toml`. This schema foundation accepts
   `[[rules]]` entries with `tool` plus optional `command` or `path` fields.
-  Loaded rules feed the execution policy engine and force approval in approval
-  modes that can ask; under `approval_policy = "never"`, matching ask rules are
-  rejected because no prompt can be shown. In an `exec_shell` approval card,
-  press `S` to approve the request once and save an ask rule containing that
-  command to this file. Only `exec_shell` cards support this shortcut; saved
-  command rules use existing arity-aware prefix matching. File-path ask rules
-  can be added manually and are matched at runtime, but the approval UI does
-  not save file rules yet. This intentionally does not accept typed allow/deny
-  records or glob expansion.
+  Loaded rules feed the execution policy engine and force approval in
+  non-YOLO approval modes that can ask; under `approval_policy = "never"`,
+  matching ask rules are rejected because no prompt can be shown. YOLO / auto
+  approval retains complete freedom: ask rules do not downgrade YOLO into
+  prompting or blocking.
+
+  In a supported approval card, press `S` to approve the request once and
+  append exact ask rules to this file. Supported saves are intentionally narrow:
+  `exec_shell` stores the exact approved command string; `write_file` and
+  `edit_file` store the exact workspace-relative file path; `apply_patch`
+  stores one exact workspace-relative `path` rule per validated touched file
+  from apply-patch preflight. Existing exec command matching remains
+  arity-aware, and file paths are normalized to the same workspace-relative
+  form used by runtime matching.
+
+  `read_file` rules can still be authored manually when you want future reads
+  of a specific path to ask, but the approval UI does not save `read_file`
+  rules. This schema still does not accept typed allow/deny records, glob
+  expansion, broad directory/recursive rules, or UI editing/deleting of saved
+  rules.
 - `[[hotbar]]` (array of tables, optional): user-owned 1-8 slot bindings for
   the TUI hotbar. Each entry has `slot`, `action`, and optional `label`.
   Omitting `hotbar` uses the built-in default eight slots. Setting

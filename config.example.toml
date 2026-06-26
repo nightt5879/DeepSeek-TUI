@@ -182,14 +182,34 @@ sandbox_mode = "workspace-write" # read-only | workspace-write | danger-full-acc
 
 # Typed permission rules live in a sibling `permissions.toml` file, not in
 # config.toml. This shape is ask-only and feeds the execution policy engine;
-# allow/deny records, glob expansion, and UI persistence are intentionally out
-# of scope here.
+# it does not define allow/deny records, globs, broad directory rules, or a
+# rule editor/deleter UI. YOLO / auto approval is not restricted by ask rules.
+#
+# In supported approval cards, press `S` to approve once and save exact rules:
+#   exec_shell  -> exact approved command string
+#   write_file  -> exact workspace-relative target path
+#   edit_file   -> exact workspace-relative target path
+#   apply_patch -> one exact workspace-relative path per validated touched file
+# `read_file` rules can be written manually, but the approval UI does not save
+# them.
 #
 # Example ~/.codewhale/permissions.toml:
 #
 # [[rules]]
 # tool = "exec_shell"
 # command = "cargo test"
+#
+# [[rules]]
+# tool = "write_file"
+# path = "src/main.rs"
+#
+# [[rules]]
+# tool = "edit_file"
+# path = "src/lib.rs"
+#
+# [[rules]]
+# tool = "apply_patch"
+# path = "src/patch-target.rs"
 #
 # [[rules]]
 # tool = "read_file"

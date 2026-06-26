@@ -71,16 +71,27 @@ stale rather than presented as live processes.
 Shell permission policy is evaluated by `crates/execpolicy`. Deny prefixes are
 checked before trusted prefixes and block matching commands regardless of layer.
 Trusted prefixes only skip approval in modes that permit trust shortcuts. Typed
-ask records are currently a narrow foundation: when one matches under
+ask records are an ask-only layer: when one matches under
 `AskForApproval::Never`, the invocation is rejected because the runtime cannot
-ask the user; existing allow/deny behavior is otherwise unchanged. The TUI
-runtime loads ask-only records from the sibling `permissions.toml` file and
-applies matching `exec_shell` command ask-rules and explicit file-path ask-rules
-before Auto/session approval shortcuts. In an `exec_shell` approval card, `S`
-approves once and saves an ask rule containing that command; only `exec_shell`
-cards support the shortcut, and saved command rules use existing arity-aware
-prefix matching. File-path ask rules can be authored in `permissions.toml` and
-matched at runtime, but cannot yet be saved from the approval UI.
+ask the user; YOLO / auto approval keeps complete freedom and is not limited by
+ask rules. Existing allow/deny behavior is otherwise unchanged.
+
+The TUI runtime loads ask-only records from the sibling `permissions.toml` file
+and applies matching `exec_shell` command ask-rules and explicit file-path
+ask-rules in modes that can ask. In supported approval cards, `S` approves once
+and appends persistent ask rules:
+
+- `exec_shell`: the exact approved command string (matched by the existing
+  arity-aware command matcher).
+- `write_file`: the exact workspace-relative target path.
+- `edit_file`: the exact workspace-relative target path.
+- `apply_patch`: one exact workspace-relative path rule per validated touched
+  file reported by apply-patch preflight.
+
+`read_file` path ask rules can be authored in `permissions.toml` and matched at
+runtime, but the approval UI does not save `read_file` rules. This is still not
+a policy editor: no typed allow/deny records, glob expansion, broad directory
+rules, or UI edit/delete flow exist for saved ask rules.
 
 ### MCP manager and palette discovery
 
