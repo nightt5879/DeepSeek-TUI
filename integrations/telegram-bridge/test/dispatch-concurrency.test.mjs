@@ -59,6 +59,46 @@ test("stale callback acknowledgements cannot skip modal actions", async () => {
   assert.match(callbackHandler, /await handleModalAction\(identity\.chatId, action, query\);/);
 });
 
+test("polling persists offsets only after successful update handling", async () => {
+  const source = await readBridgeSource();
+  const startup = source.slice(
+    source.indexOf("const threadStore = await ThreadStore.open"),
+    source.indexOf("function requestStop")
+  );
+  const pollTelegram = extractFunction(source, "pollTelegram");
+  const markUpdateHandled = extractFunction(source, "markUpdateHandled");
+
+  assert.match(
+    startup,
+    /let updateOffset = threadStore\.getCursor\(\s*"telegram\.update_offset",\s*Number\(process\.env\.TELEGRAM_UPDATE_OFFSET \|\| 0\)\s*\);/
+  );
+  assert.doesNotMatch(pollTelegram, /updateOffset = Math\.max\(updateOffset, update\.update_id \+ 1\)/);
+  assert.match(pollTelegram, /await handleIncomingUpdate\(update\);\s*await markUpdateHandled\(update\);/);
+  assert.match(
+    pollTelegram,
+    /catch \(error\) {\s*console\.error\("failed to handle incoming Telegram update", error\);\s*break;\s*}/
+  );
+  assert.match(markUpdateHandled, /const nextOffset = Math\.max\(updateOffset, Number\(update\.update_id\) \+ 1\);/);
+  assert.match(markUpdateHandled, /await threadStore\.setCursor\("telegram\.update_offset", updateOffset\);/);
+});
+
+test("callback replay is ignored before modal dispatch", async () => {
+  const source = await readBridgeSource();
+  const incomingHandler = extractFunction(source, "handleIncomingUpdate");
+  const replayHelper = extractFunction(source, "isReplayCallbackUpdate");
+  const storedAction = extractFunction(source, "handleStoredAction");
+  const resumeCase = storedAction.slice(storedAction.indexOf('if (stored.kind === "resume")'));
+
+  assert.match(incomingHandler, /if \(await isReplayCallbackUpdate\(update\)\) return;\s*await handleCallbackQuery\(update\.callback_query\);/);
+  assert.match(replayHelper, /if \(update\.update_id == null\) return false;/);
+  assert.match(replayHelper, /return threadStore\.recordMessage\(`callback:\$\{update\.update_id\}`\);/);
+  assert.ok(
+    resumeCase.indexOf("await threadStore.takeAction(action.token);") <
+      resumeCase.indexOf("await resumeThread(chatId, stored.threadId);"),
+    "resume callback actions should be consumed before dispatch"
+  );
+});
+
 test("reattached streams are detached and shutdown preserves active turn state", async () => {
   const source = await readBridgeSource();
   const reattach = extractFunction(source, "reattachActiveTurns");

@@ -3,6 +3,14 @@ import path from "node:path";
 
 const DEFAULT_ACTION_TTL_MS = 24 * 60 * 60 * 1000;
 
+function normalizeCursorValue(value, fallback = 0) {
+  const number = Number(value);
+  if (Number.isFinite(number) && number >= 0) return Math.floor(number);
+  const fallbackNumber = Number(fallback);
+  if (Number.isFinite(fallbackNumber) && fallbackNumber >= 0) return Math.floor(fallbackNumber);
+  return 0;
+}
+
 async function chmodBestEffort(filePath, mode) {
   try {
     await chmod(filePath, mode);
@@ -40,6 +48,9 @@ export class ThreadStore {
     if (this.options.actions && (!this.data.actions || typeof this.data.actions !== "object")) {
       this.data.actions = {};
     }
+    if (this.data.cursors && typeof this.data.cursors !== "object") {
+      this.data.cursors = {};
+    }
   }
 
   async load() {
@@ -60,6 +71,25 @@ export class ThreadStore {
     this.data.messages = this.data.messages.slice(-this.options.messageLimit);
     await this.save();
     return false;
+  }
+
+  getCursor(name, fallback = 0) {
+    if (!name) return normalizeCursorValue(fallback);
+    this.ensureShape();
+    return normalizeCursorValue(this.data.cursors?.[name], fallback);
+  }
+
+  async setCursor(name, value) {
+    if (!name) return normalizeCursorValue(value);
+    this.ensureShape();
+    if (!this.data.cursors || typeof this.data.cursors !== "object") {
+      this.data.cursors = {};
+    }
+    const cursor = normalizeCursorValue(value);
+    if (this.data.cursors[name] === cursor) return cursor;
+    this.data.cursors[name] = cursor;
+    await this.save();
+    return cursor;
   }
 
   async getChat(chatId) {

@@ -130,3 +130,20 @@ test("ThreadStore supports chat state, message dedupe, and action tokens", async
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("ThreadStore persists numeric cursors", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codewhale-bridge-core-"));
+  try {
+    const statePath = path.join(dir, "thread-map.json");
+    const store = await ThreadStore.open(statePath);
+
+    assert.equal(store.getCursor("telegram.update_offset", 7), 7);
+    assert.equal(await store.setCursor("telegram.update_offset", 42), 42);
+    assert.equal(store.getCursor("telegram.update_offset"), 42);
+
+    const saved = await ThreadStore.open(statePath);
+    assert.equal(saved.getCursor("telegram.update_offset"), 42);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

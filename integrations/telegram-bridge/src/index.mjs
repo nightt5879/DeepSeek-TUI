@@ -67,7 +67,10 @@ const config = {
 const threadStore = await ThreadStore.open(config.threadMapPath);
 const activeTurnTasks = new Map();
 let stopping = false;
-let updateOffset = Number(process.env.TELEGRAM_UPDATE_OFFSET || 0);
+let updateOffset = threadStore.getCursor(
+  "telegram.update_offset",
+  Number(process.env.TELEGRAM_UPDATE_OFFSET || 0)
+);
 
 function requestStop() {
   stopping = true;
@@ -115,10 +118,13 @@ async function pollTelegram() {
         allowed_updates: ["message", "callback_query"]
       });
       for (const update of updates || []) {
-        if (update.update_id != null) updateOffset = Math.max(updateOffset, update.update_id + 1);
-        await handleIncomingUpdate(update).catch((error) => {
+        try {
+          await handleIncomingUpdate(update);
+          await markUpdateHandled(update);
+        } catch (error) {
           console.error("failed to handle incoming Telegram update", error);
-        });
+          break;
+        }
       }
     } catch (error) {
       if (looksLikePollingConflict(error)) {
@@ -133,8 +139,18 @@ async function pollTelegram() {
   }
 }
 
+async function markUpdateHandled(update) {
+  if (update.update_id == null) return;
+  if (!Number.isFinite(Number(update.update_id))) return;
+  const nextOffset = Math.max(updateOffset, Number(update.update_id) + 1);
+  if (nextOffset === updateOffset) return;
+  updateOffset = nextOffset;
+  await threadStore.setCursor("telegram.update_offset", updateOffset);
+}
+
 async function handleIncomingUpdate(update) {
   if (update.callback_query) {
+    if (await isReplayCallbackUpdate(update)) return;
     await handleCallbackQuery(update.callback_query);
     return;
   }
@@ -173,6 +189,11 @@ async function handleIncomingUpdate(update) {
 
   const command = parseCommand(scoped.text);
   await handleCommand(identity.chatId, command);
+}
+
+async function isReplayCallbackUpdate(update) {
+  if (update.update_id == null) return false;
+  return threadStore.recordMessage(`callback:${update.update_id}`);
 }
 
 async function handleCommand(chatId, command) {
@@ -296,6 +317,7 @@ async function handleStoredAction(chatId, action, query = null) {
   }
 
   if (stored.kind === "resume") {
+    await threadStore.takeAction(action.token);
     await resumeThread(chatId, stored.threadId);
     return;
   }
