@@ -386,7 +386,14 @@ enum ExecToolSurface {
 fn exec_tool_surface_from_env() -> Option<ExecToolSurface> {
     std::env::var(CODEWHALE_TOOL_SURFACE_ENV)
         .ok()
-        .and_then(|value| parse_exec_tool_surface(&value))
+        .and_then(|value| {
+            if should_warn_unknown_exec_tool_surface(&value) {
+                eprintln!(
+                    "warning: unrecognized {CODEWHALE_TOOL_SURFACE_ENV}; leaving exec tool surface unchanged. Use `shell-only`, `full`, or `native-tools`."
+                );
+            }
+            parse_exec_tool_surface(&value)
+        })
 }
 
 fn parse_exec_tool_surface(value: &str) -> Option<ExecToolSurface> {
@@ -395,6 +402,14 @@ fn parse_exec_tool_surface(value: &str) -> Option<ExecToolSurface> {
         "full" | "native-tools" | "native_tools" | "" => None,
         _ => None,
     }
+}
+
+fn should_warn_unknown_exec_tool_surface(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    !matches!(
+        normalized.as_str(),
+        "" | "shell-only" | "shell_only" | "shell" | "full" | "native-tools" | "native_tools"
+    )
 }
 
 fn normalize_exec_tool_names(tools: &[String]) -> Vec<String> {
@@ -7763,6 +7778,16 @@ mod terminal_mode_tests {
             resolve_exec_allowed_tools(None, exec_tool_surface_from_env()),
             None
         );
+    }
+
+    #[test]
+    fn exec_unknown_tool_surface_env_warns_without_allowlist() {
+        assert!(should_warn_unknown_exec_tool_surface("shell_onyl"));
+        assert!(!should_warn_unknown_exec_tool_surface("shell-only"));
+        assert!(!should_warn_unknown_exec_tool_surface("native-tools"));
+        assert!(!should_warn_unknown_exec_tool_surface("full"));
+        assert!(!should_warn_unknown_exec_tool_surface(" "));
+        assert_eq!(parse_exec_tool_surface("shell_onyl"), None);
     }
 
     #[test]
