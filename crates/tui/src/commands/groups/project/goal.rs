@@ -6,6 +6,7 @@ use crate::commands::traits::{CommandInfo, RegisterCommand};
 use crate::localization::MessageId;
 use crate::tools::goal::GoalStatus;
 use crate::tui::app::{App, AppAction, HuntVerdict};
+use serde_json::{Value, json};
 
 use crate::commands::CommandResult;
 
@@ -28,6 +29,10 @@ fn hunt(app: &mut App, arg: Option<&str>) -> CommandResult {
                 },
             )
         }
+        Some("declare-hunted")
+        | Some("declare_hunted")
+        | Some("force-complete")
+        | Some("force_complete") => declare_hunted(app),
         Some("done") | Some("complete") | Some("hunted") => {
             close_hunt(app, HuntVerdict::Hunted, GoalStatus::Complete)
         }
@@ -92,12 +97,7 @@ fn hunt(app: &mut App, arg: Option<&str>) -> CommandResult {
                         format!(" | tokens: {used}/{b} ({pct:.0}%)")
                     })
                     .unwrap_or_default();
-                let verdict_label = match app.hunt.verdict {
-                    HuntVerdict::Hunting => "[ACTIVE]",
-                    HuntVerdict::Hunted => "[COMPLETE]",
-                    HuntVerdict::Wounded => "[PAUSED]",
-                    HuntVerdict::Escaped => "[BLOCKED]",
-                };
+                let verdict_label = hunt_verdict_label(app.hunt.verdict);
                 CommandResult::message(format!(
                     "Goal {verdict_label}: \"{obj}\" - elapsed: {elapsed}{budget_str} | continuations: {}",
                     app.hunt.continuation_count
@@ -109,17 +109,33 @@ fn hunt(app: &mut App, arg: Option<&str>) -> CommandResult {
     }
 }
 
+fn declare_hunted(app: &mut App) -> CommandResult {
+    let previous = app.hunt.verdict;
+    let result = close_hunt(app, HuntVerdict::Hunted, GoalStatus::Complete);
+    if !result.is_error {
+        crate::audit::log_sensitive_event(
+            "goal.declare_hunted",
+            declare_hunted_audit_details(previous, app),
+        );
+    }
+    result
+}
+
+fn declare_hunted_audit_details(previous: HuntVerdict, app: &App) -> Value {
+    json!({
+        "previous_verdict": hunt_verdict_name(previous),
+        "current_verdict": hunt_verdict_name(app.hunt.verdict),
+        "has_quarry": app.hunt.quarry.as_deref().is_some_and(|quarry| !quarry.is_empty()),
+    })
+}
+
 fn close_hunt(app: &mut App, verdict: HuntVerdict, status: GoalStatus) -> CommandResult {
     if app.hunt.quarry.as_deref().is_none_or(str::is_empty) {
         return CommandResult::error("No goal set. Use /goal <objective> [budget: N] first.");
     }
 
     let prev = app.hunt.verdict;
-    let should_write_trophy = match verdict {
-        HuntVerdict::Hunted => prev != verdict,
-        HuntVerdict::Escaped => true,
-        HuntVerdict::Wounded | HuntVerdict::Hunting => false,
-    };
+    let should_write_trophy = matches!(verdict, HuntVerdict::Hunted) && prev != verdict;
     if should_write_trophy && let Err(err) = write_trophy_card(app, verdict) {
         return CommandResult::error(err);
     }
@@ -141,16 +157,16 @@ fn close_hunt(app: &mut App, verdict: HuntVerdict, status: GoalStatus) -> Comman
                 .map(|t| crate::tui::notifications::humanize_duration(t.elapsed()))
                 .unwrap_or_else(|| "unknown".to_string());
             CommandResult::with_message_and_action(
-                format!("Goal complete. Elapsed: {elapsed}"),
+                format!("Goal hunted. Elapsed: {elapsed}"),
                 action,
             )
         }
         HuntVerdict::Wounded => CommandResult::with_message_and_action(
-            "Goal paused. Progress is saved; use /goal resume to continue.",
+            "Goal wounded. Progress is saved; use /goal resume to continue.",
             action,
         ),
-        HuntVerdict::Escaped => CommandResult::with_message_and_action("Goal blocked.", action),
-        HuntVerdict::Hunting => CommandResult::with_message_and_action("Goal resumed.", action),
+        HuntVerdict::Escaped => CommandResult::with_message_and_action("Goal escaped.", action),
+        HuntVerdict::Hunting => CommandResult::with_message_and_action("Goal hunting.", action),
     }
 }
 
@@ -175,11 +191,29 @@ fn resume_hunt(app: &mut App) -> CommandResult {
 
 fn goal_usage() -> &'static str {
     "No goal set. Use /goal <objective> [budget: N] to set one.\n\
-     /goal complete - mark complete\n\
-     /goal pause - pause without continuing\n\
+     /goal declare-hunted - override verification and mark hunted\n\
+     /goal wounded - pause without continuing\n\
      /goal resume - resume and continue\n\
-     /goal blocked - mark blocked\n\
+     /goal escaped - mark escaped\n\
      /goal clear - remove the current goal."
+}
+
+fn hunt_verdict_label(verdict: HuntVerdict) -> &'static str {
+    match verdict {
+        HuntVerdict::Hunting => "[HUNTING]",
+        HuntVerdict::Hunted => "[HUNTED]",
+        HuntVerdict::Wounded => "[WOUNDED]",
+        HuntVerdict::Escaped => "[ESCAPED]",
+    }
+}
+
+fn hunt_verdict_name(verdict: HuntVerdict) -> &'static str {
+    match verdict {
+        HuntVerdict::Hunting => "hunting",
+        HuntVerdict::Hunted => "hunted",
+        HuntVerdict::Wounded => "wounded",
+        HuntVerdict::Escaped => "escaped",
+    }
 }
 
 /// Parse text like "Implement login | budget: 50000" into (objective, budget).
@@ -244,12 +278,7 @@ fn write_trophy_card(app: &App, verdict: HuntVerdict) -> Result<std::path::PathB
         .as_ref()
         .map(|t| crate::tui::notifications::humanize_duration(t.elapsed()))
         .unwrap_or_else(|| "unknown".to_string());
-    let verdict_str = match verdict {
-        HuntVerdict::Hunting => "active",
-        HuntVerdict::Hunted => "complete",
-        HuntVerdict::Wounded => "paused",
-        HuntVerdict::Escaped => "blocked",
-    };
+    let verdict_str = hunt_verdict_name(verdict);
     let tokens = if app.hunt.tokens_used > 0 {
         u32::try_from(app.hunt.tokens_used).unwrap_or(u32::MAX)
     } else {
@@ -306,7 +335,7 @@ fn write_trophy_card_contents(mut f: impl Write, card: TrophyCard<'_>) -> std::i
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "goal",
     aliases: &["hunt", "mubiao", "狩猎"],
-    usage: "/goal [objective|clear|pause|resume|complete|blocked] [budget: N]",
+    usage: "/goal [objective|clear|wounded|resume|declare-hunted|escaped] [budget: N]",
     description_id: MessageId::CmdGoalDescription,
 };
 
@@ -374,6 +403,13 @@ mod tests {
         let result = hunt(&mut app, None);
         assert!(result.action.is_none());
         assert!(result.message.as_deref().unwrap().contains("No goal set"));
+    }
+
+    #[test]
+    fn test_command_usage_mentions_hunt_verdicts() {
+        assert!(COMMAND_INFO.usage.contains("declare-hunted"));
+        assert!(COMMAND_INFO.usage.contains("wounded"));
+        assert!(COMMAND_INFO.usage.contains("escaped"));
     }
 
     #[test]
@@ -468,16 +504,82 @@ mod tests {
     }
 
     #[test]
+    fn test_show_hunt_uses_hunt_verdict_label() {
+        let mut app = create_test_app();
+        app.hunt.quarry = Some("Review verifier claim".to_string());
+        app.hunt.verdict = HuntVerdict::Escaped;
+
+        let result = hunt(&mut app, None);
+
+        let message = result.message.as_deref().unwrap_or_default();
+        assert!(message.contains("Goal [ESCAPED]"));
+        assert!(!message.contains("[BLOCKED]"));
+    }
+
+    #[test]
     fn test_failed_trophy_write_does_not_mutate_verdict() {
+        let mut app = create_test_app();
+        app.hunt.quarry = Some("!!!".to_string());
+        app.hunt.verdict = HuntVerdict::Hunting;
+
+        let result = hunt(&mut app, Some("hunted"));
+
+        assert!(result.is_error);
+        assert_eq!(app.hunt.verdict, HuntVerdict::Hunting);
+        assert_eq!(app.hunt.quarry.as_deref(), Some("!!!"));
+    }
+
+    #[test]
+    fn test_escaped_verdict_does_not_write_trophy_card() {
         let mut app = create_test_app();
         app.hunt.quarry = Some("!!!".to_string());
         app.hunt.verdict = HuntVerdict::Hunting;
 
         let result = hunt(&mut app, Some("escaped"));
 
+        assert!(!result.is_error);
+        assert_eq!(app.hunt.verdict, HuntVerdict::Escaped);
+        assert_eq!(app.hunt.quarry.as_deref(), Some("!!!"));
+        assert!(matches!(
+            result.action,
+            Some(AppAction::SetGoalStatus {
+                status: crate::tools::goal::GoalStatus::Blocked,
+                clear: false
+            })
+        ));
+    }
+
+    #[test]
+    fn test_declare_hunted_alias_uses_trophy_override_path() {
+        let mut app = create_test_app();
+        app.hunt.quarry = Some("!!!".to_string());
+        app.hunt.verdict = HuntVerdict::Hunting;
+
+        let result = hunt(&mut app, Some("declare-hunted"));
+
         assert!(result.is_error);
         assert_eq!(app.hunt.verdict, HuntVerdict::Hunting);
         assert_eq!(app.hunt.quarry.as_deref(), Some("!!!"));
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Cannot write trophy card")
+        );
+    }
+
+    #[test]
+    fn test_declare_hunted_audit_details_use_hunt_vocabulary() {
+        let mut app = create_test_app();
+        app.hunt.quarry = Some("Verify release gate".to_string());
+        app.hunt.verdict = HuntVerdict::Hunted;
+
+        let details = declare_hunted_audit_details(HuntVerdict::Wounded, &app);
+
+        assert_eq!(details["previous_verdict"], "wounded");
+        assert_eq!(details["current_verdict"], "hunted");
+        assert_eq!(details["has_quarry"], true);
     }
 
     #[test]
