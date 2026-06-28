@@ -60,6 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Restored legacy `.deepseek/sessions` visibility for upgraded installs where
+  an empty `~/.codewhale/sessions` directory already existed, by copying
+  missing legacy session entries into the primary CodeWhale session store
+  without overwriting newer data (#3724).
 - Calmed approval risk classification for read-only shell commands such as
   `codewhale --version`, `codewhale --help`, and `git status --porcelain` so
   the modal no longer labels proven read-only shell as destructive (#3730).
