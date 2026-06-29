@@ -493,13 +493,16 @@ impl SessionManager {
     }
 
     /// Clean up old sessions while preserving an active/resumed session.
+    ///
+    /// Accepts a full id or resume prefix; startup passes the same user-facing
+    /// resume token that `load_session_by_prefix` accepts.
     pub fn cleanup_old_sessions_except(&self, protected_id: Option<&str>) -> std::io::Result<()> {
         let sessions = self.list_sessions()?;
 
         if sessions.len() > MAX_SESSIONS {
             // Delete oldest sessions
             for session in sessions.iter().skip(MAX_SESSIONS) {
-                if protected_id.is_some_and(|id| id == session.id) {
+                if protected_id.is_some_and(|id| session.id == id || session.id.starts_with(id)) {
                     continue;
                 }
                 let _ = self.delete_session(&session.id);
@@ -2217,7 +2220,7 @@ mod tests {
         for idx in 0..(MAX_SESSIONS + 2) {
             write_session_record_without_cleanup(
                 &manager,
-                &format!("session-{idx:02}"),
+                &format!("session-{idx:02}-abcdef"),
                 Path::new("/tmp"),
                 now - chrono::Duration::minutes(idx as i64),
             );
@@ -2229,8 +2232,8 @@ mod tests {
         let sessions = manager.list_sessions().expect("list");
         let ids: Vec<_> = sessions.iter().map(|session| session.id.as_str()).collect();
 
-        assert!(ids.contains(&"session-51"));
-        assert!(!ids.contains(&"session-50"));
+        assert!(ids.contains(&"session-51-abcdef"));
+        assert!(!ids.contains(&"session-50-abcdef"));
         assert_eq!(sessions.len(), MAX_SESSIONS + 1);
     }
 

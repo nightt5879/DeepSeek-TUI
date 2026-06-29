@@ -350,7 +350,7 @@ impl SnapshotRepo {
                     "snapshot storage still over limit after pruning; wiping history"
                 );
                 let _ = self.prune_older_than_locked(Duration::ZERO);
-                let _ = self.prune_unreachable_objects();
+                let _ = self.prune_unreachable_objects_locked();
             }
         }
         // Stage every tracked + untracked path the workspace exposes.
@@ -647,6 +647,10 @@ impl SnapshotRepo {
     /// are preserved — only the parent chain to older snapshots is cut.
     /// Old objects become unreachable and gc reclaims them.
     pub fn prune_keep_last_n(&self, max_count: usize) -> io::Result<usize> {
+        self.with_repo_write_lock(|| self.prune_keep_last_n_locked(max_count))
+    }
+
+    fn prune_keep_last_n_locked(&self, max_count: usize) -> io::Result<usize> {
         let snapshots = self.list(usize::MAX)?;
         if snapshots.len() <= max_count {
             return Ok(0);
@@ -738,6 +742,10 @@ impl SnapshotRepo {
     /// Drop unreachable loose objects left behind by interrupted or
     /// orphaned side-repo operations.
     pub fn prune_unreachable_objects(&self) -> io::Result<()> {
+        self.with_repo_write_lock(|| self.prune_unreachable_objects_locked())
+    }
+
+    fn prune_unreachable_objects_locked(&self) -> io::Result<()> {
         let prune = run_git(&self.git_dir, &self.work_tree, &["prune", "--expire=now"])?;
         if !prune.status.success() {
             return Err(io_other(format!(

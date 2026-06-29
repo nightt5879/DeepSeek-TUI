@@ -6470,10 +6470,12 @@ async fn run_interactive(
         logging::warn(format!("Failed to install system skills: {e}"));
     }
 
+    let protected_session_id =
+        startup_maintenance_protected_session_id(resume_session_id.as_deref(), &workspace);
     spawn_interactive_startup_maintenance(
         workspace.clone(),
         config.snapshots_config(),
-        resume_session_id.clone(),
+        protected_session_id,
     );
 
     // The `deepseek` launcher forwards `--yolo` to this binary via the
@@ -6527,6 +6529,26 @@ fn spawn_interactive_startup_maintenance(
     if let Err(err) = spawn_result {
         logging::warn(format!("Startup maintenance skipped: {err}"));
     }
+}
+
+fn startup_maintenance_protected_session_id(
+    resume_session_id: Option<&str>,
+    workspace: &Path,
+) -> Option<String> {
+    let session_id = resume_session_id?;
+    if session_id != "latest" {
+        return Some(session_id.to_string());
+    }
+
+    session_manager::SessionManager::default_location()
+        .ok()
+        .and_then(|manager| {
+            manager
+                .get_latest_session_for_workspace(workspace)
+                .ok()
+                .flatten()
+        })
+        .map(|session| session.id)
 }
 
 fn run_interactive_startup_maintenance(
