@@ -5,7 +5,7 @@
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -6470,12 +6470,13 @@ async fn run_interactive(
         logging::warn(format!("Failed to install system skills: {e}"));
     }
 
-    let protected_session_id =
-        startup_maintenance_protected_session_id(resume_session_id.as_deref(), &workspace);
+    let startup_maintenance_started_at = SystemTime::now();
+    let protected_session_token = resume_session_id.clone();
     spawn_interactive_startup_maintenance(
         workspace.clone(),
         config.snapshots_config(),
-        protected_session_id,
+        protected_session_token,
+        startup_maintenance_started_at,
     );
 
     // The `deepseek` launcher forwards `--yolo` to this binary via the
@@ -6512,7 +6513,8 @@ async fn run_interactive(
 fn spawn_interactive_startup_maintenance(
     workspace: PathBuf,
     snapshots: crate::config::SnapshotsConfig,
-    protected_session_id: Option<String>,
+    protected_session_token: Option<String>,
+    started_at: SystemTime,
 ) {
     let spawn_result = std::thread::Builder::new()
         .name("codewhale-startup-maintenance".to_string())
@@ -6522,7 +6524,8 @@ fn spawn_interactive_startup_maintenance(
             run_interactive_startup_maintenance(
                 &workspace,
                 &snapshots,
-                protected_session_id.as_deref(),
+                protected_session_token.as_deref(),
+                started_at,
             );
         });
 
@@ -6554,7 +6557,8 @@ fn startup_maintenance_protected_session_id(
 fn run_interactive_startup_maintenance(
     workspace: &Path,
     snapshots: &crate::config::SnapshotsConfig,
-    protected_session_id: Option<&str>,
+    protected_session_token: Option<&str>,
+    started_at: SystemTime,
 ) {
     let started = Instant::now();
 
@@ -6562,7 +6566,7 @@ fn run_interactive_startup_maintenance(
     // Non-fatal: a flaky disk, missing `git`, or read-only home should
     // never block the TUI from starting.
     if snapshots.enabled {
-        session_manager::prune_workspace_snapshots(workspace, snapshots.max_age());
+        session_manager::prune_workspace_snapshots_at(workspace, snapshots.max_age(), started_at);
     }
 
     // Prune stale tool-output spillover files (#422). Non-fatal: home
@@ -6582,9 +6586,11 @@ fn run_interactive_startup_maintenance(
 
     // v0.8.44: prune managed sessions to prevent unbounded growth.
     // Keeps at most MAX_SESSIONS (50) recent sessions; non-fatal on error.
+    let protected_session_id =
+        startup_maintenance_protected_session_id(protected_session_token, workspace);
     match session_manager::SessionManager::default_location() {
         Ok(manager) => {
-            if let Err(err) = manager.cleanup_old_sessions_except(protected_session_id) {
+            if let Err(err) = manager.cleanup_old_sessions_except(protected_session_id.as_deref()) {
                 tracing::warn!(target: "session", ?err, "session cleanup skipped on boot");
             }
         }

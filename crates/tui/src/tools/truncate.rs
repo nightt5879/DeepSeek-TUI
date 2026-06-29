@@ -151,9 +151,19 @@ pub fn write_sha_spillover(sha: &str, content: &str) -> io::Result<PathBuf> {
             )
         })?
         .to_path_buf();
+    if path.exists() {
+        let _ = with_spillover_write_lock(&parent, || {
+            if path.exists() {
+                let _ = refresh_modified(&path);
+            }
+            Ok(())
+        });
+        return Ok(path);
+    }
+
     with_spillover_write_lock(&parent, || {
         if path.exists() {
-            refresh_modified(&path)?;
+            let _ = refresh_modified(&path);
             return Ok(path.clone());
         }
         crate::utils::write_atomic(&path, content.as_bytes())?;
@@ -693,6 +703,27 @@ mod tests {
 
             assert_eq!(reused, path);
             assert!(refreshed > stale_time);
+        });
+    }
+
+    #[test]
+    fn write_sha_spillover_reuses_existing_file_when_refresh_fails() {
+        let _g = setup();
+        let tmp = tempdir().unwrap();
+        with_test_home(tmp.path(), || {
+            let sha = "b".repeat(64);
+            let path = write_sha_spillover(&sha, "first").expect("write sha");
+            let original_permissions = fs::metadata(&path).expect("metadata").permissions();
+            let mut readonly_permissions = original_permissions.clone();
+            readonly_permissions.set_readonly(true);
+            fs::set_permissions(&path, readonly_permissions).expect("make readonly");
+
+            let reused = write_sha_spillover(&sha, "second");
+            fs::set_permissions(&path, original_permissions).expect("restore permissions");
+
+            let reused = reused.expect("reuse readonly sha");
+            assert_eq!(reused, path);
+            assert_eq!(fs::read_to_string(&path).unwrap(), "first");
         });
     }
 

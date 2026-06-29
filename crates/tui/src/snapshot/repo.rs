@@ -559,8 +559,21 @@ impl SnapshotRepo {
         self.with_repo_write_lock(|| self.prune_older_than_locked(max_age))
     }
 
+    pub fn prune_older_than_at(&self, max_age: Duration, now: SystemTime) -> io::Result<usize> {
+        self.with_repo_write_lock(|| self.prune_older_than_locked_at(max_age, now, false))
+    }
+
     fn prune_older_than_locked(&self, max_age: Duration) -> io::Result<usize> {
-        let now = SystemTime::now()
+        self.prune_older_than_locked_at(max_age, SystemTime::now(), true)
+    }
+
+    fn prune_older_than_locked_at(
+        &self,
+        max_age: Duration,
+        now: SystemTime,
+        include_cutoff_second: bool,
+    ) -> io::Result<usize> {
+        let now = now
             .duration_since(UNIX_EPOCH)
             .map_err(|e| io_other(format!("clock error: {e}")))?
             .as_secs() as i64;
@@ -571,13 +584,18 @@ impl SnapshotRepo {
             return Ok(0);
         }
 
-        // Snapshots are newest-first. Find the index of the first one
-        // at-or-older than the cutoff — every entry from that index
-        // onward is a candidate for removal. We use `<=` so a 0-second
-        // retention drops same-second commits (otherwise tests calling
-        // `prune_older_than(Duration::ZERO)` immediately after creating
-        // a snapshot would never prune anything).
-        let cut_index = snapshots.iter().position(|s| s.timestamp <= cutoff);
+        // Snapshots are newest-first. Find the index of the first prune
+        // candidate; every entry from that index onward is removed. The
+        // immediate path includes the cutoff second so zero-age manual prune
+        // remains aggressive. The fixed-cutoff startup path excludes it
+        // because git timestamps cannot distinguish subsecond launch order.
+        let cut_index = snapshots.iter().position(|s| {
+            if include_cutoff_second {
+                s.timestamp <= cutoff
+            } else {
+                s.timestamp < cutoff
+            }
+        });
         let Some(cut) = cut_index else {
             return Ok(0);
         };
