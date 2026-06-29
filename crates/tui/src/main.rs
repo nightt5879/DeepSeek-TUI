@@ -5,7 +5,7 @@
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -6470,37 +6470,7 @@ async fn run_interactive(
         logging::warn(format!("Failed to install system skills: {e}"));
     }
 
-    // Prune stale workspace snapshots from prior sessions (7-day default).
-    // Non-fatal: a flaky disk, missing `git`, or read-only home should
-    // never block the TUI from starting.
-    let snapshots = config.snapshots_config();
-    if snapshots.enabled {
-        session_manager::prune_workspace_snapshots(&workspace, snapshots.max_age());
-    }
-
-    // Prune stale tool-output spillover files (#422). Non-fatal: home
-    // missing or directory unreadable just means nothing got pruned;
-    // we never block startup. Runs unconditionally because the
-    // spillover store is created lazily on first write — there's no
-    // user-facing setting to gate.
-    match crate::tools::truncate::prune_older_than(crate::tools::truncate::SPILLOVER_MAX_AGE) {
-        Ok(0) => {}
-        Ok(n) => tracing::debug!(
-            target: "spillover",
-            "boot prune removed {n} spillover file(s)"
-        ),
-        Err(err) => tracing::warn!(
-            target: "spillover",
-            ?err,
-            "spillover prune skipped on boot"
-        ),
-    }
-
-    // v0.8.44: prune managed sessions on boot to prevent unbounded growth.
-    // Keeps at most MAX_SESSIONS (50) recent sessions; non-fatal on error.
-    if let Ok(manager) = session_manager::SessionManager::default_location() {
-        let _ = manager.cleanup_old_sessions();
-    }
+    spawn_interactive_startup_maintenance(workspace.clone(), config.snapshots_config());
 
     // The `deepseek` launcher forwards `--yolo` to this binary via the
     // DEEPSEEK_YOLO env var (config.yolo), not as a CLI flag. Honour either.
@@ -6531,6 +6501,69 @@ async fn run_interactive(
         },
     )
     .await
+}
+
+fn spawn_interactive_startup_maintenance(
+    workspace: PathBuf,
+    snapshots: crate::config::SnapshotsConfig,
+) {
+    let spawn_result = std::thread::Builder::new()
+        .name("codewhale-startup-maintenance".to_string())
+        .spawn(move || {
+            // Keep the first interactive frame ahead of optional disk cleanup.
+            std::thread::sleep(Duration::from_millis(500));
+            run_interactive_startup_maintenance(&workspace, &snapshots);
+        });
+
+    if let Err(err) = spawn_result {
+        logging::warn(format!("Startup maintenance skipped: {err}"));
+    }
+}
+
+fn run_interactive_startup_maintenance(
+    workspace: &Path,
+    snapshots: &crate::config::SnapshotsConfig,
+) {
+    let started = Instant::now();
+
+    // Prune stale workspace snapshots from prior sessions (7-day default).
+    // Non-fatal: a flaky disk, missing `git`, or read-only home should
+    // never block the TUI from starting.
+    if snapshots.enabled {
+        session_manager::prune_workspace_snapshots(workspace, snapshots.max_age());
+    }
+
+    // Prune stale tool-output spillover files (#422). Non-fatal: home
+    // missing or directory unreadable just means nothing got pruned.
+    match crate::tools::truncate::prune_older_than(crate::tools::truncate::SPILLOVER_MAX_AGE) {
+        Ok(0) => {}
+        Ok(n) => tracing::debug!(
+            target: "spillover",
+            "boot prune removed {n} spillover file(s)"
+        ),
+        Err(err) => tracing::warn!(
+            target: "spillover",
+            ?err,
+            "spillover prune skipped on boot"
+        ),
+    }
+
+    // v0.8.44: prune managed sessions to prevent unbounded growth.
+    // Keeps at most MAX_SESSIONS (50) recent sessions; non-fatal on error.
+    match session_manager::SessionManager::default_location() {
+        Ok(manager) => {
+            if let Err(err) = manager.cleanup_old_sessions() {
+                tracing::warn!(target: "session", ?err, "session cleanup skipped on boot");
+            }
+        }
+        Err(err) => tracing::warn!(target: "session", ?err, "session cleanup skipped on boot"),
+    }
+
+    tracing::debug!(
+        target: "startup",
+        elapsed_ms = started.elapsed().as_millis(),
+        "startup maintenance finished"
+    );
 }
 
 #[derive(Debug)]
