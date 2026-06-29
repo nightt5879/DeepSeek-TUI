@@ -1981,6 +1981,28 @@ fn compaction_config_respects_config_enabled_override() {
 }
 
 #[test]
+fn app_refreshes_compaction_override_from_runtime_config() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.compaction_enabled_override = Some(true);
+
+    let config = Config {
+        compaction: CompactionRuntimeConfig {
+            enabled: Some(false),
+        },
+        ..Default::default()
+    };
+    app.refresh_config_runtime_overrides(&config);
+    assert_eq!(app.compaction_enabled_override, Some(false));
+    assert!(!app.automatic_compaction_enabled());
+
+    let config = Config::default();
+    app.auto_compact = true;
+    app.refresh_config_runtime_overrides(&config);
+    assert_eq!(app.compaction_enabled_override, None);
+    assert!(app.automatic_compaction_enabled());
+}
+
+#[test]
 fn test_update_model_compaction_budget() {
     let mut app = App::new(test_options(false), &Config::default());
     // Pin the inputs so the budget math is deterministic and does not

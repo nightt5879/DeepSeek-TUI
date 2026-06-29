@@ -5694,13 +5694,20 @@ impl App {
 
     pub fn compaction_config(&self) -> CompactionConfig {
         CompactionConfig {
-            enabled: self
-                .compaction_enabled_override
-                .unwrap_or(self.auto_compact),
+            enabled: self.automatic_compaction_enabled(),
             token_threshold: self.compact_threshold,
             model: self.effective_model_for_budget().to_string(),
             ..Default::default()
         }
+    }
+
+    pub fn automatic_compaction_enabled(&self) -> bool {
+        self.compaction_enabled_override
+            .unwrap_or(self.auto_compact)
+    }
+
+    pub fn refresh_config_runtime_overrides(&mut self, config: &Config) {
+        self.compaction_enabled_override = config.compaction.enabled;
     }
 
     pub fn fallback_chain_entries(&self) -> Vec<(usize, ApiProvider, bool)> {
