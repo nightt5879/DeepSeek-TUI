@@ -293,9 +293,8 @@ upload to Hugging Face and does not perform direct Hugging Face Hub HTTP search.
 `xiaomi-mimo` defaults to `mimo-v2.5-pro` for long-context reasoning and coding
 work. The chat picker also exposes `mimo-v2.5-pro-ultraspeed` and the latest
 Omni model `mimo-v2.5`. Xiaomi MiMo TTS is available through
-`codewhale --provider xiaomi-mimo speech "text"
---model tts` (or the `tts` alias) plus model-visible `speech` / `tts` tools in
-Agent/YOLO mode.
+`codewhale --provider xiaomi-mimo speech "text" --model tts` (or the `tts`
+alias) plus model-visible `speech` / `tts` tools in Agent/YOLO mode.
 
 `/provider xiaomi-mimo ultraspeed` and `/provider xiaomi-mimo pro-ultraspeed`
 both select `mimo-v2.5-pro-ultraspeed`. Speech aliases such as `tts`,
