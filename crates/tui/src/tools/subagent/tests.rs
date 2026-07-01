@@ -1,4 +1,5 @@
 use super::*;
+use crate::tools::{AgentToolSurfaceOptions, ToolRegistryBuilder};
 use crate::worker_profile::ShellPolicy;
 use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
 use std::collections::HashSet;
@@ -1994,6 +1995,156 @@ fn test_subagent_tools_respect_nested_agent_depth_budget() {
     assert!(!capped.is_tool_allowed("agent"));
 }
 
+fn tool_names(tools: Vec<Tool>) -> HashSet<String> {
+    tools.into_iter().map(|tool| tool.name).collect()
+}
+
+fn enabled_agent_surface_options() -> AgentToolSurfaceOptions {
+    let mut options = AgentToolSurfaceOptions::new(ShellPolicy::Full);
+    options.apply_patch_enabled = true;
+    options.web_search_enabled = true;
+    options.memory_tool_enabled = true;
+    options.goal_state = Some(crate::tools::goal::new_shared_goal_state());
+    options
+}
+
+fn disabled_feature_agent_surface_options() -> AgentToolSurfaceOptions {
+    let mut options = AgentToolSurfaceOptions::new(ShellPolicy::Full);
+    options.goal_state = Some(crate::tools::goal::new_shared_goal_state());
+    options
+}
+
+#[test]
+fn subagent_general_catalog_matches_parent_agent_surface_when_features_enabled() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let todo_list = crate::tools::todo::new_shared_todo_list();
+    let plan_state = crate::tools::plan::new_shared_plan_state();
+
+    let parent_registry = ToolRegistryBuilder::new()
+        .with_full_agent_surface_options(
+            Some(runtime.client.clone()),
+            runtime.model.clone(),
+            runtime.manager.clone(),
+            runtime.clone(),
+            runtime.agent_tool_surface_options.clone(),
+            todo_list.clone(),
+            plan_state.clone(),
+        )
+        .build(runtime.context.clone());
+    let child_registry =
+        SubAgentToolRegistry::new(runtime, SubAgentType::General, None, todo_list, plan_state);
+
+    let parent_names = tool_names(parent_registry.to_api_tools());
+    let child_names = tool_names(child_registry.tools_for_model(&SubAgentType::General));
+    assert_eq!(
+        child_names, parent_names,
+        "default General sub-agent catalog must stay in parity with the parent Agent surface"
+    );
+}
+
+#[test]
+fn subagent_feature_gates_match_parent_agent_surface() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(disabled_feature_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let todo_list = crate::tools::todo::new_shared_todo_list();
+    let plan_state = crate::tools::plan::new_shared_plan_state();
+
+    let parent_registry = ToolRegistryBuilder::new()
+        .with_full_agent_surface_options(
+            Some(runtime.client.clone()),
+            runtime.model.clone(),
+            runtime.manager.clone(),
+            runtime.clone(),
+            runtime.agent_tool_surface_options.clone(),
+            todo_list.clone(),
+            plan_state.clone(),
+        )
+        .build(runtime.context.clone());
+    let child_registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::Implementer,
+        None,
+        todo_list,
+        plan_state,
+    );
+
+    let parent_names = tool_names(parent_registry.to_api_tools());
+    let child_names = tool_names(child_registry.tools_for_model(&SubAgentType::Implementer));
+    for name in [
+        "apply_patch",
+        "web_search",
+        "fetch_url",
+        "web.run",
+        "wait_for_dev_server",
+        "remember",
+    ] {
+        assert!(
+            !parent_names.contains(name),
+            "{name} should be parent-gated"
+        );
+        assert!(!child_names.contains(name), "{name} should be child-gated");
+    }
+}
+
+#[test]
+fn explore_catalog_inherits_web_but_hides_write_shell_and_fim_tools() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    runtime.context.auto_approve = true;
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::Explore,
+        None,
+        crate::tools::todo::new_shared_todo_list(),
+        crate::tools::plan::new_shared_plan_state(),
+    );
+
+    let names = tool_names(registry.tools_for_model(&SubAgentType::Explore));
+    for name in ["web_search", "fetch_url", "web.run", "wait_for_dev_server"] {
+        assert!(names.contains(name), "Explore should inherit {name}");
+    }
+    for name in [
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "fim_edit",
+        "exec_shell",
+        "task_shell_start",
+    ] {
+        assert!(!names.contains(name), "Explore must hide {name}");
+    }
+}
+
+#[test]
+fn implementer_catalog_inherits_patch_and_fim_when_enabled() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::Implementer,
+        None,
+        crate::tools::todo::new_shared_todo_list(),
+        crate::tools::plan::new_shared_plan_state(),
+    );
+
+    let names = tool_names(registry.tools_for_model(&SubAgentType::Implementer));
+    for name in ["apply_patch", "fim_edit", "write_file", "edit_file"] {
+        assert!(
+            names.contains(name),
+            "Implementer should inherit write-capable tool {name}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn api_timeout_preserves_checkpoint_and_returns_needs_input_without_parking() {
     let tmp = tempdir().expect("tempdir");
@@ -3762,6 +3913,7 @@ fn stub_runtime() -> SubAgentRuntime {
         role_models: std::collections::HashMap::new(),
         context,
         allow_shell: true,
+        agent_tool_surface_options: AgentToolSurfaceOptions::new(ShellPolicy::Full),
         worker_profile: WorkerRuntimeProfile::for_role(SubAgentType::General),
         event_tx: None,
         manager: new_shared_subagent_manager(workspace, 5),
@@ -4100,6 +4252,10 @@ fn child_runtime_inherits_speech_output_dir() {
     let child = runtime.child_runtime();
 
     assert_eq!(child.speech_output_dir, Some(output_dir));
+    assert_eq!(
+        child.agent_tool_surface_options.speech_output_dir,
+        Some(PathBuf::from("configured-speech-output"))
+    );
 }
 
 #[test]

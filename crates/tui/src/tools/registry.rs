@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use crate::client::DeepSeekClient;
 use crate::models::Tool;
+use crate::tools::goal::SharedGoalState;
 
 use super::schema_canonicalize;
 use super::schema_sanitize;
@@ -484,6 +485,37 @@ impl ToolRegistry {
 /// Builder for constructing a `ToolRegistry` with common tools.
 pub struct ToolRegistryBuilder {
     tools: Vec<Arc<dyn ToolSpec>>,
+}
+
+/// Feature/config-dependent native Agent-mode tool surface.
+///
+/// Parent Agent/Yolo turns and default child sub-agents both build through this
+/// options object so the catalog does not drift as new first-party tools are
+/// gated behind feature flags or config state.
+#[derive(Clone)]
+pub struct AgentToolSurfaceOptions {
+    pub shell_policy: crate::worker_profile::ShellPolicy,
+    pub apply_patch_enabled: bool,
+    pub web_search_enabled: bool,
+    pub memory_tool_enabled: bool,
+    pub vision_config: Option<crate::config::VisionModelConfig>,
+    pub speech_output_dir: Option<PathBuf>,
+    pub goal_state: Option<SharedGoalState>,
+}
+
+impl AgentToolSurfaceOptions {
+    #[must_use]
+    pub fn new(shell_policy: crate::worker_profile::ShellPolicy) -> Self {
+        Self {
+            shell_policy,
+            apply_patch_enabled: false,
+            web_search_enabled: false,
+            memory_tool_enabled: false,
+            vision_config: None,
+            speech_output_dir: None,
+            goal_state: None,
+        }
+    }
 }
 
 impl ToolRegistryBuilder {
@@ -968,17 +1000,59 @@ impl ToolRegistryBuilder {
         }
     }
 
-    /// Include the full agent tool surface: every tool family the parent gets
-    /// in Agent mode, including review, RLM, and the sub-agent management
-    /// family (so children can recurse). Used by both the parent's Agent-mode
-    /// registry build (`core/engine.rs`) and by every sub-agent
-    /// (`subagent::SubAgentToolRegistry`) — keeping them in lockstep.
+    /// Include the native Agent-mode surface shared by the parent runtime and
+    /// default child sub-agents, excluding the `agent` launcher itself.
+    #[must_use]
+    pub fn with_agent_runtime_surface(
+        self,
+        client: Option<DeepSeekClient>,
+        model: String,
+        options: AgentToolSurfaceOptions,
+        todo_list: super::todo::SharedTodoList,
+        plan_state: super::plan::SharedPlanState,
+    ) -> Self {
+        let speech_client = client.clone();
+        let mut builder = self
+            .with_agent_tools_policy(options.shell_policy)
+            .with_todo_tool(todo_list)
+            .with_plan_tool(plan_state)
+            .with_review_tool(client.clone(), model.clone())
+            .with_slop_ledger_tools()
+            .with_rlm_tool(client.clone(), model.clone())
+            .with_fim_tool(client, model)
+            .with_speech_tools(speech_client, options.speech_output_dir.clone());
+
+        if let Some(goal_state) = options.goal_state {
+            builder = builder.with_goal_tools(goal_state);
+        }
+        if options.apply_patch_enabled {
+            builder = builder.with_patch_tools();
+        }
+        if options.web_search_enabled {
+            builder = builder.with_web_tools();
+        }
+        if options.memory_tool_enabled {
+            builder = builder.with_remember_tool();
+        }
+        if let Some(vision_config) = options.vision_config {
+            builder = builder.with_vision_tools(vision_config);
+        }
+
+        builder.with_notify_tool()
+    }
+
+    /// Legacy convenience wrapper for the full child-inherited Agent surface.
+    ///
+    /// New production callers should prefer [`Self::with_full_agent_surface_options`]
+    /// so feature/config-gated families (web, patch, memory, vision, etc.)
+    /// stay in parity with the parent Agent-mode registry.
     ///
     /// `allow_shell` mirrors the session's shell permission. `manager` and
     /// `runtime` are the sub-agent runtime — children pass through their own
     /// runtime so grandchildren can spawn within the same depth/cancellation
     /// envelope.
     #[must_use]
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub fn with_full_agent_surface(
         self,
@@ -1001,8 +1075,30 @@ impl ToolRegistryBuilder {
         )
     }
 
-    /// Include the full agent surface under a typed shell policy.
+    /// Include the full child-inherited Agent surface under resolved
+    /// feature/config options.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_full_agent_surface_options(
+        self,
+        client: Option<DeepSeekClient>,
+        model: String,
+        manager: super::subagent::SharedSubAgentManager,
+        runtime: super::subagent::SubAgentRuntime,
+        options: AgentToolSurfaceOptions,
+        todo_list: super::todo::SharedTodoList,
+        plan_state: super::plan::SharedPlanState,
+    ) -> Self {
+        self.with_agent_runtime_surface(client, model, options, todo_list, plan_state)
+            .with_subagent_tools(manager, runtime)
+    }
+
+    /// Legacy typed-shell wrapper for the full child-inherited Agent surface.
+    ///
+    /// New production callers should pass resolved [`AgentToolSurfaceOptions`]
+    /// to [`Self::with_full_agent_surface_options`].
+    #[must_use]
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub fn with_full_agent_surface_policy(
         self,
@@ -1014,15 +1110,11 @@ impl ToolRegistryBuilder {
         todo_list: super::todo::SharedTodoList,
         plan_state: super::plan::SharedPlanState,
     ) -> Self {
-        let speech_client = client.clone();
-        let speech_output_dir = runtime.speech_output_dir.clone();
-        self.with_agent_tools_policy(shell_policy)
-            .with_todo_tool(todo_list)
-            .with_plan_tool(plan_state)
-            .with_review_tool(client.clone(), model.clone())
-            .with_rlm_tool(client, model)
-            .with_speech_tools(speech_client, speech_output_dir)
-            .with_subagent_tools(manager, runtime)
+        let mut options = AgentToolSurfaceOptions::new(shell_policy);
+        options.speech_output_dir = runtime.speech_output_dir.clone();
+        self.with_full_agent_surface_options(
+            client, model, manager, runtime, options, todo_list, plan_state,
+        )
     }
 
     /// Include the todo tool with a shared `TodoList`.

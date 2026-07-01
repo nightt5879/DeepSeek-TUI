@@ -1463,6 +1463,9 @@ impl Engine {
                             self.session.reasoning_effort.clone(),
                             self.session.reasoning_effort_auto,
                         )
+                        .with_agent_tool_surface_options(self.agent_tool_surface_options(
+                            shell_policy_for_mode(AppMode::Agent, self.session.allow_shell),
+                        ))
                         .with_max_spawn_depth(self.config.max_spawn_depth)
                         .with_step_api_timeout(self.config.subagent_api_timeout)
                         .with_speech_output_dir(self.config.speech_output_dir.clone())
@@ -2512,6 +2515,9 @@ impl Engine {
                             self.session.reasoning_effort.clone(),
                             self.session.reasoning_effort_auto,
                         )
+                        .with_agent_tool_surface_options(self.agent_tool_surface_options(
+                            shell_policy_for_mode(AppMode::Agent, self.session.allow_shell),
+                        ))
                         .with_max_spawn_depth(self.config.max_spawn_depth)
                         .with_step_api_timeout(self.config.subagent_api_timeout)
                         .with_speech_output_dir(self.config.speech_output_dir.clone())

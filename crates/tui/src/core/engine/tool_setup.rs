@@ -6,6 +6,7 @@ use std::path::Path;
 
 use super::*;
 use crate::sandbox::SandboxPolicy;
+use crate::tools::AgentToolSurfaceOptions;
 use crate::worker_profile::ShellPolicy;
 
 /// Pick the sandbox policy that gates shell commands for a given UI mode.
@@ -56,6 +57,25 @@ fn should_register_remember_tool(memory_enabled: bool, moraine_fallback: bool) -
 }
 
 impl Engine {
+    pub(super) fn agent_tool_surface_options(
+        &self,
+        shell_policy: ShellPolicy,
+    ) -> AgentToolSurfaceOptions {
+        let mut options = AgentToolSurfaceOptions::new(shell_policy);
+        options.apply_patch_enabled = self.config.features.enabled(Feature::ApplyPatch);
+        options.web_search_enabled = self.config.features.enabled(Feature::WebSearch);
+        options.memory_tool_enabled =
+            should_register_remember_tool(self.config.memory_enabled, self.config.moraine_fallback);
+        options.vision_config = if self.config.features.enabled(Feature::VisionModel) {
+            self.config.vision_config.clone()
+        } else {
+            None
+        };
+        options.speech_output_dir = self.config.speech_output_dir.clone();
+        options.goal_state = Some(self.config.goal_state.clone());
+        options
+    }
+
     pub(super) fn build_turn_tool_registry_builder(
         &self,
         mode: AppMode,
@@ -63,7 +83,17 @@ impl Engine {
         plan_state: SharedPlanState,
     ) -> ToolRegistryBuilder {
         let shell_policy = shell_policy_for_mode(mode, self.session.allow_shell);
-        let mut builder = if mode == AppMode::Plan {
+        if mode != AppMode::Plan {
+            return ToolRegistryBuilder::new().with_agent_runtime_surface(
+                self.deepseek_client.clone(),
+                self.session.model.clone(),
+                self.agent_tool_surface_options(shell_policy),
+                todo_list,
+                plan_state,
+            );
+        }
+
+        let mut builder = {
             let builder = ToolRegistryBuilder::new()
                 .with_read_only_file_tools()
                 .with_search_tools()
@@ -82,12 +112,6 @@ impl Engine {
             } else {
                 builder
             }
-        } else {
-            ToolRegistryBuilder::new()
-                .with_agent_tools_policy(shell_policy)
-                .with_todo_tool(todo_list)
-                .with_plan_tool(plan_state)
-                .with_goal_tools(self.config.goal_state.clone())
         };
 
         builder = builder
@@ -95,33 +119,11 @@ impl Engine {
             .with_user_input_tool()
             .with_parallel_tool();
 
-        // SlopLedger: plan mode only gets read-only query + export,
-        // agent/yolo get the full set including append + update.
-        builder = if mode == AppMode::Plan {
-            builder.with_slop_ledger_read_only_tools()
-        } else {
-            builder.with_slop_ledger_tools()
-        };
-
-        if mode != AppMode::Plan {
-            builder = builder
-                .with_rlm_tool(self.deepseek_client.clone(), self.session.model.clone())
-                .with_fim_tool(self.deepseek_client.clone(), self.session.model.clone())
-                .with_speech_tools(
-                    self.deepseek_client.clone(),
-                    self.config.speech_output_dir.clone(),
-                );
-        }
-
-        if self.config.features.enabled(Feature::ApplyPatch) && mode != AppMode::Plan {
-            builder = builder.with_patch_tools();
-        }
+        // SlopLedger: plan mode only gets read-only query + export.
+        builder = builder.with_slop_ledger_read_only_tools();
         if self.config.features.enabled(Feature::WebSearch) {
             builder = builder.with_web_tools();
         }
-        // Shell tools (exec_shell, task_shell_start, etc.) are already gated
-        // behind `allow_shell` inside `with_agent_tools`. No separate
-        // feature-flag gate here to avoid double-registration.
 
         // Register the `remember` tool only when the user has opted in to
         // user-memory (#489). Without that opt-in the tool would always

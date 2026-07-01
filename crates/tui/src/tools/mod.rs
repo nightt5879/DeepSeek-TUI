@@ -62,7 +62,7 @@ pub mod verifier;
 pub mod web_run;
 pub mod web_search;
 
-pub use registry::{ToolRegistry, ToolRegistryBuilder};
+pub use registry::{AgentToolSurfaceOptions, ToolRegistry, ToolRegistryBuilder};
 pub use review::ReviewOutput;
 pub use spec::ToolContext;
 pub use user_input::UserInputResponse;

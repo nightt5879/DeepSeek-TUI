@@ -35,7 +35,7 @@ use crate::models::{
 use crate::request_tuning::RequestTuning;
 use crate::tools::handle::VarHandle;
 use crate::tools::plan::{PlanState, SharedPlanState};
-use crate::tools::registry::{ToolRegistry, ToolRegistryBuilder};
+use crate::tools::registry::{AgentToolSurfaceOptions, ToolRegistry, ToolRegistryBuilder};
 use crate::tools::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
 };
@@ -44,7 +44,7 @@ use crate::tools::todo::SharedTodoList;
 use crate::tools::todo::TodoList;
 use crate::tui::app::ReasoningEffort;
 use crate::utils::spawn_supervised;
-use crate::worker_profile::{ModelRoute, ToolScope, WorkerRuntimeProfile};
+use crate::worker_profile::{ModelRoute, ShellPolicy, ToolScope, WorkerRuntimeProfile};
 
 pub mod mailbox;
 #[allow(unused_imports)]
@@ -1400,6 +1400,10 @@ pub struct SubAgentRuntime {
     pub role_models: HashMap<String, String>,
     pub context: ToolContext,
     pub allow_shell: bool,
+    /// Native Agent-mode tool surface inherited from the parent turn. Carries
+    /// feature/config-dependent families such as web search, patch, memory,
+    /// vision, notify, and FIM so child catalogs stay in parity with the parent.
+    pub agent_tool_surface_options: AgentToolSurfaceOptions,
     /// Capability contract inherited by descendants. `agent` derives a
     /// child profile from this before registering the worker record so parent,
     /// sub-agent, and fleet projections share one worker contract.
@@ -1484,6 +1488,9 @@ impl SubAgentRuntime {
             role_models: HashMap::new(),
             context,
             allow_shell,
+            agent_tool_surface_options: AgentToolSurfaceOptions::new(
+                ShellPolicy::from_legacy_allow_shell(allow_shell),
+            ),
             worker_profile: WorkerRuntimeProfile::for_role(SubAgentType::General),
             event_tx,
             manager,
@@ -1511,6 +1518,14 @@ impl SubAgentRuntime {
         self
     }
 
+    /// Preserve the parent Agent-mode native tool surface for child registries.
+    #[must_use]
+    pub fn with_agent_tool_surface_options(mut self, options: AgentToolSurfaceOptions) -> Self {
+        self.speech_output_dir = options.speech_output_dir.clone();
+        self.agent_tool_surface_options = options;
+        self
+    }
+
     /// Attach an MCP pool so the subagent can execute MCP tools.
     #[must_use]
     pub fn with_mcp_pool(
@@ -1534,7 +1549,8 @@ impl SubAgentRuntime {
     /// Preserve the configured speech output directory for sub-agent tools.
     #[must_use]
     pub fn with_speech_output_dir(mut self, output_dir: Option<PathBuf>) -> Self {
-        self.speech_output_dir = output_dir;
+        self.speech_output_dir = output_dir.clone();
+        self.agent_tool_surface_options.speech_output_dir = output_dir;
         self
     }
 
@@ -1649,6 +1665,7 @@ impl SubAgentRuntime {
             role_models: self.role_models.clone(),
             context: child_context,
             allow_shell: self.allow_shell,
+            agent_tool_surface_options: self.agent_tool_surface_options.clone(),
             worker_profile: self.worker_profile.clone(),
             event_tx: self.event_tx.clone(),
             manager: self.manager.clone(),
@@ -6372,12 +6389,14 @@ impl SubAgentToolRegistry {
         // retained only when depth budget remains.
         let can_spawn_child = !runtime.would_exceed_depth();
         let context = runtime.context.clone();
-        let mut registry = ToolRegistryBuilder::new().with_full_agent_surface(
+        let mut surface_options = runtime.agent_tool_surface_options.clone();
+        surface_options.shell_policy = ShellPolicy::from_legacy_allow_shell(runtime.allow_shell);
+        let mut registry = ToolRegistryBuilder::new().with_full_agent_surface_options(
             Some(runtime.client.clone()),
             runtime.model.clone(),
             runtime.manager.clone(),
             runtime.clone(),
-            runtime.allow_shell,
+            surface_options,
             todo_list,
             plan_state,
         );
