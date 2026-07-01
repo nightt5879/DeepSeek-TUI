@@ -109,6 +109,13 @@ impl ModalView for ContextMenuView {
         ModalKind::ContextMenu
     }
 
+    /// The context menu is a small anchored popup, not a full-screen modal:
+    /// scope the central backdrop to the menu itself so opening it does not
+    /// blank the transcript behind it (#3868).
+    fn occupied_region(&self, area: Rect) -> Rect {
+        self.menu_rect(area)
+    }
+
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
@@ -270,6 +277,34 @@ mod tests {
                 action: ContextMenuAction::OpenHelp
             })
         ));
+    }
+
+    #[test]
+    fn occupied_region_covers_only_the_menu_popup() {
+        // Regression test for #3868: the central modal backdrop clears each
+        // view's occupied_region. If the context menu reports the whole
+        // frame, right-clicking blanks the entire UI behind the small menu.
+        let view = ContextMenuView::new(
+            vec![
+                entry("Paste", ContextMenuAction::Paste),
+                entry("Help", ContextMenuAction::OpenHelp),
+            ],
+            10,
+            5,
+            " Right click ".to_string(),
+        );
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+
+        let region = ModalView::occupied_region(&view, area);
+
+        assert_eq!(region, view.menu_rect(area));
+        assert!(region.width < area.width);
+        assert!(region.height < area.height);
     }
 
     #[test]
