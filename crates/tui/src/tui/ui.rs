@@ -745,6 +745,7 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
     let mut config = config.clone();
     let config = &mut config;
     let mut app = App::new(options.clone(), config);
+    crate::startup_trace::mark("app_constructed");
     sync_config_provider_from_app(config, &app);
 
     if options.resume_session_id.is_none() {
@@ -880,12 +881,14 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
         handle_store: app.runtime_services.handle_store.clone(),
         rlm_sessions: app.runtime_services.rlm_sessions.clone(),
     };
+    crate::startup_trace::mark("task_manager_ready");
     refresh_active_task_panel(&mut app, &task_manager).await;
 
     let engine_config = build_engine_config(&app, config);
 
     // Spawn the Engine - it will handle all API communication
     let engine_handle = spawn_engine(engine_config, config);
+    crate::startup_trace::mark("engine_spawned");
     // The translation client is optional: it never crashes the TUI on
     // startup, even when the API key is missing, the base URL is malformed,
     // or the network is unavailable.
@@ -930,6 +933,7 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
 
     submit_initial_input_if_ready(&mut app, config, &engine_handle).await?;
 
+    crate::startup_trace::log_summary();
     let result = run_event_loop(
         &mut terminal,
         &mut app,

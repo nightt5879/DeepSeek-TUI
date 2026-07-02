@@ -97,6 +97,7 @@ mod skill_state;
 mod skills;
 mod slop_ledger;
 mod snapshot;
+mod startup_trace;
 mod task_manager;
 #[cfg(test)]
 mod test_support;
@@ -1115,6 +1116,7 @@ enum SandboxCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    startup_trace::mark_process_start();
     configure_windows_console_utf8();
     install_rustls_crypto_provider();
 
@@ -6946,6 +6948,8 @@ async fn run_interactive(
     if let Err(e) = crate::skills::install_system_skills(&skills_dir) {
         logging::warn(format!("Failed to install system skills: {e}"));
     }
+
+    startup_trace::mark("interactive_config");
 
     // Boot janitors — snapshot prune (7-day default), spillover prune
     // (#422), and managed-session cleanup (v0.8.44) — are best-effort disk
