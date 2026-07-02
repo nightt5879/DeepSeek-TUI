@@ -5386,6 +5386,76 @@ async fn run_cache_warmup(app: &App, config: &Config) -> Result<(Usage, String, 
     Ok((response.usage, base_url, inspection))
 }
 
+/// One-shot "draft my constitution" call against the user's first configured
+/// model, requested by `A` on the setup Constitution card. Runs inline in the
+/// event loop like [`fetch_available_models`] (the wizard modal stays open
+/// underneath) with a hard timeout so a slow provider cannot wedge setup.
+///
+/// On success the sanitized, bounded draft is installed into the open wizard
+/// and its ratification preview opens on top — nothing persists until the
+/// user ratifies with `G`. Every failure (no client, timeout, request error,
+/// invalid or empty JSON) is a status line, never an error state: the
+/// deterministic guided draft remains the standing fallback.
+async fn handle_setup_constitution_model_draft(
+    app: &mut App,
+    config: &Config,
+    draft: crate::tui::setup::GuidedConstitutionDraft,
+    locale: crate::localization::Locale,
+) {
+    const DRAFT_TIMEOUT: Duration = Duration::from_secs(20);
+    let model_label = app.model_display_label();
+    let outcome = match DeepSeekClient::new(config) {
+        Err(err) => Err(format!("provider not ready: {err:#}")),
+        Ok(client) => {
+            let request_model = app.model.clone();
+            match tokio::time::timeout(
+                DRAFT_TIMEOUT,
+                crate::tui::setup::draft_constitution_with_model(
+                    &client,
+                    &request_model,
+                    draft,
+                    locale,
+                ),
+            )
+            .await
+            {
+                Err(_) => Err(format!("timed out after {}s", DRAFT_TIMEOUT.as_secs())),
+                Ok(result) => result,
+            }
+        }
+    };
+    match outcome {
+        Ok(constitution) => {
+            // The wizard emitted this event with `Emit` (no close), so it
+            // should still be on top; if the user closed it mid-flight the
+            // draft is simply dropped — never installed, never saved.
+            if app.view_stack.top_kind() == Some(ModalKind::SetupWizard)
+                && let Some(mut boxed) = app.view_stack.pop()
+            {
+                let preview = boxed
+                    .as_any_mut()
+                    .downcast_mut::<crate::tui::setup::SetupWizardView>()
+                    .map(|wizard| wizard.install_model_draft(constitution, model_label.clone()));
+                app.view_stack.push_boxed(boxed);
+                if let Some((title, content)) = preview {
+                    open_text_pager(app, title, content);
+                    app.status_message = Some(crate::tui::setup::model_draft_ready_message(
+                        locale,
+                        &model_label,
+                    ));
+                }
+            }
+        }
+        Err(reason) => {
+            app.status_message = Some(crate::tui::setup::model_draft_failed_message(
+                locale,
+                &model_label,
+                &reason,
+            ));
+        }
+    }
+}
+
 // `format_*` chip/message builders moved to `tui/format_helpers.rs`.
 
 fn build_session_snapshot(app: &App, manager: &SessionManager) -> SavedSession {
@@ -9627,6 +9697,9 @@ async fn handle_view_events(
                         Some(format!("User constitution could not be saved: {err}"));
                 }
             },
+            ViewEvent::SetupConstitutionModelDraftRequested { draft, locale } => {
+                handle_setup_constitution_model_draft(app, config, draft, locale).await;
+            }
             ViewEvent::SetupRuntimePresetApplyRequested {
                 preset,
                 state,

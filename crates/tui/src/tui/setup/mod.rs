@@ -29,10 +29,14 @@ use crate::tui::views::{
 };
 
 use codewhale_config::{
-    AutonomyPreference, ConstitutionChoice, ConstitutionSource, ConstitutionValidity,
-    InheritedConfigFacts, RuntimePostureSource, SetupState, SetupStep, StepEntry, StepStatus,
-    UserConstitution, UserConstitutionLoad,
+    AutonomyPreference, ConstitutionAuthoring, ConstitutionChoice, ConstitutionSource,
+    ConstitutionValidity, InheritedConfigFacts, RuntimePostureSource, SetupState, SetupStep,
+    StepEntry, StepStatus, UserConstitution, UserConstitutionLoad,
 };
+
+mod model_draft;
+
+pub(crate) use model_draft::draft_constitution_with_model;
 
 /// Target lane for the once-per-version constitution checkpoint. The workspace
 /// package remains 0.8.66 until release approval, so this cannot read
@@ -137,6 +141,14 @@ pub struct SetupWizardView {
     facts: SetupRuntimeFacts,
     guided_draft: GuidedConstitutionDraft,
     guided_preview_seen: bool,
+    /// A model-drafted constitution awaiting ratification, installed by the
+    /// host after a successful one-shot draft (already sanitized + bounded).
+    /// Cleared whenever a guided answer changes so a stale draft can never be
+    /// ratified against fresh answers.
+    model_draft: Option<Box<UserConstitution>>,
+    /// Display label of the model that authored `model_draft` (safe metadata,
+    /// e.g. "GLM-5.2"), for provenance copy only.
+    model_draft_label: Option<String>,
     runtime_preset: SetupRuntimePreset,
     runtime_preset_preview_seen: bool,
 }
@@ -470,7 +482,7 @@ impl SetupConstitutionFileState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GuidedConstitutionDraft {
+pub(crate) struct GuidedConstitutionDraft {
     purpose: GuidedPurpose,
     autonomy: AutonomyPreference,
     evidence: GuidedEvidence,
@@ -921,6 +933,8 @@ impl SetupWizardView {
             facts: SetupRuntimeFacts::default(),
             guided_draft: GuidedConstitutionDraft::default(),
             guided_preview_seen: false,
+            model_draft: None,
+            model_draft_label: None,
             runtime_preset: SetupRuntimePreset::default(),
             runtime_preset_preview_seen: false,
         }
@@ -969,6 +983,8 @@ impl SetupWizardView {
             facts,
             guided_draft: GuidedConstitutionDraft::default(),
             guided_preview_seen: false,
+            model_draft: None,
+            model_draft_label: None,
             runtime_preset: SetupRuntimePreset::default(),
             runtime_preset_preview_seen: false,
         }
@@ -987,6 +1003,8 @@ impl SetupWizardView {
             facts,
             guided_draft: GuidedConstitutionDraft::default(),
             guided_preview_seen: false,
+            model_draft: None,
+            model_draft_label: None,
             runtime_preset: SetupRuntimePreset::default(),
             runtime_preset_preview_seen: false,
         }
@@ -1132,7 +1150,15 @@ impl SetupWizardView {
             return self.preview_guided_constitution();
         }
 
-        let constitution = self.guided_draft.to_constitution(self.locale);
+        let (constitution, authoring) = match self.model_draft.as_deref() {
+            // Model drafts arrive sanitized + bounded from the untrusted-JSON
+            // gate; ratify exactly what was previewed.
+            Some(draft) => (draft.clone(), ConstitutionAuthoring::ModelDrafted),
+            None => (
+                self.guided_draft.to_constitution(self.locale),
+                ConstitutionAuthoring::Guided,
+            ),
+        };
         let mut state = self.state.clone();
         state.complete_constitution_checkpoint(
             CONSTITUTION_CHECKPOINT_VERSION,
@@ -1141,6 +1167,7 @@ impl SetupWizardView {
         state.constitution_language = constitution.language.clone();
         state.constitution_source = ConstitutionSource::UserGlobal;
         state.constitution_validity = ConstitutionValidity::Valid;
+        state.constitution_authoring = Some(authoring);
         state.constitution_preview_hash = Some(constitution.preview_hash());
         state.constitution_preview_version =
             state.constitution_preview_version.saturating_add(1).max(1);
@@ -1148,10 +1175,19 @@ impl SetupWizardView {
             .constitution_preview_hash
             .as_deref()
             .unwrap_or("unknown");
+        let result = match authoring {
+            ConstitutionAuthoring::ModelDrafted => format!(
+                "model-drafted constitution ratified ({}) preview_hash={hash}",
+                self.model_draft_label.as_deref().unwrap_or("model")
+            ),
+            ConstitutionAuthoring::Guided => {
+                format!("guided custom constitution preview_hash={hash}")
+            }
+        };
         state.set_step(
             SetupStep::Constitution,
             StepEntry::new(StepStatus::Verified, true, CONSTITUTION_CHECKPOINT_VERSION)
-                .with_result(format!("guided custom constitution preview_hash={hash}")),
+                .with_result(result),
         );
         self.state = state.clone();
         ViewAction::EmitAndClose(ViewEvent::SetupConstitutionCommitRequested {
@@ -1163,17 +1199,70 @@ impl SetupWizardView {
 
     fn preview_guided_constitution(&mut self) -> ViewAction {
         self.guided_preview_seen = true;
+        let (constitution, provenance) = match self.model_draft.as_deref() {
+            Some(draft) => (
+                draft.clone(),
+                DraftProvenance::Model(
+                    self.model_draft_label
+                        .clone()
+                        .unwrap_or_else(|| "model".to_string()),
+                ),
+            ),
+            None => (
+                self.guided_draft.to_constitution(self.locale),
+                DraftProvenance::Guided,
+            ),
+        };
         ViewAction::Emit(ViewEvent::OpenTextPager {
-            title: "Guided Constitution Preview".to_string(),
-            content: guided_constitution_preview_text(self.locale, self.guided_draft),
+            title: ratification_preview_title(self.locale).to_string(),
+            content: constitution_ratification_text(self.locale, &constitution, &provenance),
         })
     }
 
     fn cycle_guided_answer(&mut self, key: char) -> ViewAction {
         if self.guided_draft.cycle(key) {
             self.guided_preview_seen = false;
+            // Answers changed under the draft: the model draft is stale law
+            // and must be re-drafted or replaced by the guided rendering.
+            self.model_draft = None;
+            self.model_draft_label = None;
         }
         ViewAction::None
+    }
+
+    /// `A` on the constitution step: ask the first configured model to draft.
+    /// Requires a ready provider route; otherwise the key is inert and the
+    /// deterministic guided flow stands untouched.
+    fn request_model_draft(&self) -> ViewAction {
+        if !self.facts.provider_ready {
+            return ViewAction::None;
+        }
+        ViewAction::Emit(ViewEvent::SetupConstitutionModelDraftRequested {
+            draft: self.guided_draft,
+            locale: self.locale,
+        })
+    }
+
+    /// Install a model-drafted constitution (already sanitized + bounded by
+    /// the untrusted-JSON gate) and return the `(title, content)` of the
+    /// ratification preview the host must open in the same breath — that is
+    /// what satisfies the preview gate. Ratifying still takes the explicit
+    /// `G` keypress afterwards.
+    #[must_use]
+    pub(crate) fn install_model_draft(
+        &mut self,
+        constitution: Box<UserConstitution>,
+        model_label: String,
+    ) -> (String, String) {
+        let content = constitution_ratification_text(
+            self.locale,
+            &constitution,
+            &DraftProvenance::Model(model_label.clone()),
+        );
+        self.model_draft = Some(constitution);
+        self.model_draft_label = Some(model_label);
+        self.guided_preview_seen = true;
+        (ratification_preview_title(self.locale).to_string(), content)
     }
 
     fn commit_constitution(&self, kind: SetupCommitKind) -> ViewAction {
@@ -1185,6 +1274,7 @@ impl SetupWizardView {
         state.complete_constitution_checkpoint(CONSTITUTION_CHECKPOINT_VERSION, choice);
         state.constitution_source = ConstitutionSource::Bundled;
         state.constitution_validity = ConstitutionValidity::Unknown;
+        state.constitution_authoring = None;
         state.constitution_preview_hash = None;
         state.set_step(
             SetupStep::Constitution,
@@ -1282,6 +1372,9 @@ impl ModalView for SetupWizardView {
             {
                 self.cycle_guided_answer(key)
             }
+            KeyCode::Char('a') if self.selected_step() == SetupStep::Constitution => {
+                self.request_model_draft()
+            }
             KeyCode::Char('u') => self.commit_constitution(SetupCommitKind::BundledConstitution),
             KeyCode::Char('d') => self.commit_constitution(SetupCommitKind::DeferredConstitution),
             KeyCode::Enter if self.selected_step() == SetupStep::Constitution => {
@@ -1349,6 +1442,12 @@ impl ModalView for SetupWizardView {
                 "1-6",
                 tr(self.locale, MessageId::SetupActionTuneGuided).to_string(),
             ));
+            if self.facts.provider_ready {
+                hints.push(ActionHint::new(
+                    "A",
+                    tr(self.locale, MessageId::SetupActionModelDraft).to_string(),
+                ));
+            }
             hints.push(ActionHint::new(
                 "G",
                 tr(self.locale, MessageId::SetupActionGuided).to_string(),
@@ -1495,7 +1594,7 @@ impl SetupWizardView {
             .as_deref()
             .unwrap_or("not accepted yet")
             .to_string();
-        vec![
+        let mut lines = vec![
             self.detail_row(MessageId::SetupConstitutionChoiceLabel, choice),
             self.detail_row(MessageId::SetupConstitutionSourceLabel, &source_state),
             self.detail_row(MessageId::SetupConstitutionPreviewLabel, &preview),
@@ -1538,11 +1637,27 @@ impl SetupWizardView {
                 MessageId::SetupConstitutionPrinciplesLabel,
                 self.guided_draft.principles.label(self.locale),
             ),
-            Line::from(Span::styled(
-                tr(self.locale, MessageId::SetupConstitutionGuidedHint).to_string(),
-                Style::default().fg(palette::TEXT_MUTED),
-            )),
-        ]
+        ];
+        if let Some(label) = self
+            .model_draft_label
+            .as_deref()
+            .filter(|_| self.model_draft.is_some())
+        {
+            lines.push(Line::from(Span::styled(
+                model_draft_ready_line(self.locale, label),
+                Style::default().fg(palette::WHALE_ACCENT_PRIMARY),
+            )));
+        } else if self.facts.provider_ready {
+            lines.push(Line::from(Span::styled(
+                model_draft_invitation_line(self.locale, &self.facts.model),
+                Style::default().fg(palette::WHALE_ACCENT_PRIMARY),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            tr(self.locale, MessageId::SetupConstitutionGuidedHint).to_string(),
+            Style::default().fg(palette::TEXT_MUTED),
+        )));
+        lines
     }
 
     fn runtime_posture_detail_lines(&self) -> Vec<Line<'static>> {
@@ -1882,24 +1997,138 @@ fn guided_constitution_template(locale: Locale) -> UserConstitution {
     GuidedConstitutionDraft::default().to_constitution(locale)
 }
 
-fn guided_constitution_preview_text(locale: Locale, draft: GuidedConstitutionDraft) -> String {
-    let constitution = draft.to_constitution(locale);
-    let intro = match locale {
-        Locale::ZhHans => {
-            "这是将要保存的用户全局宪法预览。关闭预览后再次按 G 保存，或返回设置选择内置/稍后。"
-        }
-        _ => {
-            "This is the user-global constitution preview that will be saved. Close this preview and press G again to save, or return to setup and choose bundled/defer."
-        }
-    };
+/// Who authored the draft being previewed for ratification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DraftProvenance {
+    /// Rendered deterministically from the guided answers.
+    Guided,
+    /// Drafted by the named model, then sanitized and bounded by CodeWhale.
+    Model(String),
+}
+
+fn ratification_preview_title(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhHans => "用户宪法 — 批准前草案",
+        _ => "User Constitution — Draft for Ratification",
+    }
+}
+
+/// The ratification artifact shown in the pager: provenance, what a
+/// constitution is, the exact block that will be injected (byte-identical to
+/// prompt assembly's rendering), its authority boundaries, and how to ratify
+/// or amend. Only the scaffold differs between guided and model drafts — the
+/// law itself always comes from the same renderer.
+fn constitution_ratification_text(
+    locale: Locale,
+    constitution: &UserConstitution,
+    provenance: &DraftProvenance,
+) -> String {
+    const RULE: &str = "──────────────────────────────────────────────────────";
     let rendered = constitution
         .render_block(None)
-        .unwrap_or_else(|| "The structured constitution is empty.".to_string());
+        .unwrap_or_else(|| match locale {
+            Locale::ZhHans => "结构化宪法为空。".to_string(),
+            _ => "The structured constitution is empty.".to_string(),
+        });
+    let layer_order = tr(locale, MessageId::SetupCheckpointLayerOrder);
 
-    format!(
-        "{intro}\n\n{rendered}\n\n{}",
-        tr(locale, MessageId::SetupCheckpointLayerOrder)
-    )
+    match locale {
+        Locale::ZhHans => {
+            let drafted_by = match provenance {
+                DraftProvenance::Model(label) => format!(
+                    "由 {label} 根据你的引导式答案起草，并已由 CodeWhale 完成结构校验与边界限制。"
+                ),
+                DraftProvenance::Guided => "由你的引导式答案确定性生成。".to_string(),
+            };
+            format!(
+                "CODEWHALE · 用户宪法\n{RULE}\n\n{drafted_by}\n\n\
+                 这是 CodeWhale 与你协作的长期准则。像优秀的宪法一样：足够简短因而可用，由持久原则而非详尽规则构成，并且可以随你修订。\n\n\
+                 {rendered}\n\n\
+                 权限层级\n{layer_order}\n你的直接指令始终高于本文件。\n\n\
+                 它不能做什么\n\
+                 它只提供行为指导，不能授予或更改审批策略、沙箱、Shell、网络、信任、MCP 权限、默认模式、发布或支出权限——这些始终由你在运行时掌控。\n\n\
+                 批准\n\
+                 未经你确认，任何内容都不会成为准则。关闭此预览后按 G 批准并保存；之后可随时用 /constitution 或 /setup 修订。"
+            )
+        }
+        _ => {
+            let drafted_by = match provenance {
+                DraftProvenance::Model(label) => format!(
+                    "Drafted by {label} from your guided answers, then schema-checked and bounded by CodeWhale."
+                ),
+                DraftProvenance::Guided => {
+                    "Rendered deterministically from your guided answers.".to_string()
+                }
+            };
+            format!(
+                "CODEWHALE · USER CONSTITUTION\n{RULE}\n\n{drafted_by}\n\n\
+                 This is the standing law for how CodeWhale works with you. Like the best \
+                 constitutions, it is short enough to use, made of durable principles rather \
+                 than exhaustive rules, and amendable as you change.\n\n\
+                 {rendered}\n\n\
+                 HIERARCHY OF AUTHORITY\n{layer_order}\nYour direct requests always outrank this document.\n\n\
+                 WHAT THIS CANNOT DO\n\
+                 It guides behavior. It cannot grant or change approval policy, sandbox, shell, \
+                 network, trust, MCP permissions, default mode, publishing, or spending \
+                 authority — those stay under your hand at runtime.\n\n\
+                 RATIFICATION\n\
+                 Nothing becomes law until you confirm. Close this preview, then press G to \
+                 ratify and save. Amend anytime with /constitution or /setup."
+            )
+        }
+    }
+}
+
+/// Card line inviting the user to let their configured model draft the law.
+fn model_draft_invitation_line(locale: Locale, model_label: &str) -> String {
+    match locale {
+        Locale::ZhHans => {
+            format!("A 让 {model_label} 根据你的答案起草宪法——保存前由你批准。")
+        }
+        _ => format!(
+            "A Ask {model_label} to draft it from your answers — you ratify before anything is saved."
+        ),
+    }
+}
+
+/// Card line shown while a model draft awaits ratification.
+fn model_draft_ready_line(locale: Locale, model_label: &str) -> String {
+    match locale {
+        Locale::ZhHans => {
+            format!("{model_label} 的草案待批准——按 G 查看并批准；按 1-6 会丢弃草案。")
+        }
+        _ => format!(
+            "Draft by {model_label} awaits ratification — G to review and ratify; 1-6 discards it."
+        ),
+    }
+}
+
+/// Host-facing status line after a successful model draft.
+pub(crate) fn model_draft_ready_message(locale: Locale, model_label: &str) -> String {
+    match locale {
+        Locale::ZhHans => format!("{model_label} 已起草你的宪法。请查看预览，然后按 G 批准。"),
+        _ => format!(
+            "{model_label} drafted your constitution. Review the preview, then press G to ratify."
+        ),
+    }
+}
+
+/// Host-facing status line when model drafting fails or is unavailable. The
+/// guided deterministic draft always remains the standing fallback.
+pub(crate) fn model_draft_failed_message(
+    locale: Locale,
+    model_label: &str,
+    reason: &str,
+) -> String {
+    match locale {
+        Locale::ZhHans => {
+            format!("{model_label} 未能完成起草（{reason}）。引导式草案仍然有效——按 G 预览并批准。")
+        }
+        _ => format!(
+            "{model_label} could not draft your constitution ({reason}). Your guided draft still \
+             stands — press G to preview and ratify."
+        ),
+    }
 }
 
 fn constitution_choice_label(choice: ConstitutionChoice) -> &'static str {
@@ -2139,9 +2368,9 @@ mod tests {
         let ViewAction::Emit(ViewEvent::OpenTextPager { title, content }) = action else {
             panic!("expected guided constitution preview event");
         };
-        assert!(title.contains("Guided Constitution Preview"));
+        assert!(title.contains("Draft for Ratification"));
         assert!(content.contains("<codewhale_user_constitution"));
-        assert!(content.contains("press G again to save"));
+        assert!(content.contains("press G to ratify and save"));
         assert_eq!(view.state().constitution_choice, ConstitutionChoice::Unset);
 
         let action = view.handle_key(key(KeyCode::Char('g')));
@@ -2168,7 +2397,7 @@ mod tests {
         );
         assert_eq!(state.status(SetupStep::Constitution), StepStatus::Verified);
         assert_eq!(state.runtime_posture_source, RuntimePostureSource::Unset);
-        assert!(message.contains("Guided user-global constitution saved"));
+        assert!(message.contains("Constitution ratified"));
     }
 
     #[test]
@@ -2320,6 +2549,227 @@ mod tests {
         );
     }
 
+    fn ready_facts(model: &str) -> SetupRuntimeFacts {
+        SetupRuntimeFacts {
+            provider_ready: true,
+            model: model.to_string(),
+            ..SetupRuntimeFacts::default()
+        }
+    }
+
+    fn sample_model_draft() -> Box<UserConstitution> {
+        Box::new(UserConstitution {
+            language: Some("en".to_string()),
+            about: Some("A GLM-5.2 user shipping Rust.".to_string()),
+            working_style: vec!["Keep diffs scoped.".to_string()],
+            priorities: vec!["Evidence over vibes.".to_string()],
+            autonomy_preference: AutonomyPreference::Balanced,
+            notes: Some("Advisory only.".to_string()),
+            ..UserConstitution::default()
+        })
+    }
+
+    #[test]
+    fn model_draft_key_is_inert_without_a_ready_provider() {
+        // Fallback contract: no route, no drafting offer — the deterministic
+        // guided flow stands untouched.
+        let mut view = SetupWizardView::new(SetupState::default(), Locale::En);
+        assert_eq!(view.selected_step(), SetupStep::Constitution);
+
+        let action = view.handle_key(key(KeyCode::Char('a')));
+
+        assert!(matches!(action, ViewAction::None));
+        assert_eq!(view.state().constitution_choice, ConstitutionChoice::Unset);
+    }
+
+    #[test]
+    fn model_draft_key_requests_drafting_with_current_answers() {
+        let mut view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::Constitution,
+            ready_facts("GLM-5.2"),
+        );
+        // Tune one answer first: the request must carry the tuned draft.
+        assert!(matches!(
+            view.handle_key(key(KeyCode::Char('2'))),
+            ViewAction::None
+        ));
+
+        let action = view.handle_key(key(KeyCode::Char('a')));
+
+        let ViewAction::Emit(ViewEvent::SetupConstitutionModelDraftRequested { draft, locale }) =
+            action
+        else {
+            panic!("expected model draft request event");
+        };
+        assert_eq!(locale, Locale::En);
+        assert_eq!(draft.autonomy, AutonomyPreference::Autonomous);
+        // The wizard stays open (Emit, not EmitAndClose) and nothing commits.
+        assert_eq!(view.state().constitution_choice, ConstitutionChoice::Unset);
+    }
+
+    #[test]
+    fn installed_model_draft_previews_then_ratifies_with_provenance() {
+        let mut view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::Constitution,
+            ready_facts("GLM-5.2"),
+        );
+
+        let (title, content) =
+            view.install_model_draft(sample_model_draft(), "GLM-5.2".to_string());
+        assert!(title.contains("Draft for Ratification"));
+        assert!(content.contains("Drafted by GLM-5.2"));
+        assert!(content.contains("A GLM-5.2 user shipping Rust."));
+        assert!(content.contains("<codewhale_user_constitution"));
+
+        // The install satisfied the preview gate; G ratifies the model draft.
+        let action = view.handle_key(key(KeyCode::Char('g')));
+        let ViewAction::EmitAndClose(ViewEvent::SetupConstitutionCommitRequested {
+            constitution,
+            state,
+            message,
+        }) = action
+        else {
+            panic!("expected ratification commit event");
+        };
+        assert_eq!(constitution, *sample_model_draft());
+        assert_eq!(state.constitution_choice, ConstitutionChoice::GuidedCustom);
+        assert_eq!(
+            state.constitution_authoring,
+            Some(ConstitutionAuthoring::ModelDrafted)
+        );
+        assert_eq!(
+            state.constitution_preview_hash.as_deref(),
+            Some(constitution.preview_hash().as_str())
+        );
+        let step = state.steps.get(&SetupStep::Constitution).expect("step");
+        let result = step.result.as_deref().expect("result");
+        assert!(result.contains("model-drafted constitution ratified (GLM-5.2)"));
+        assert!(message.contains("Constitution ratified"));
+    }
+
+    #[test]
+    fn deterministic_ratification_records_guided_authoring() {
+        let mut view = SetupWizardView::new(SetupState::default(), Locale::En);
+
+        view.handle_key(key(KeyCode::Char('g')));
+        let action = view.handle_key(key(KeyCode::Char('g')));
+
+        let ViewAction::EmitAndClose(ViewEvent::SetupConstitutionCommitRequested { state, .. }) =
+            action
+        else {
+            panic!("expected guided commit event");
+        };
+        assert_eq!(
+            state.constitution_authoring,
+            Some(ConstitutionAuthoring::Guided)
+        );
+    }
+
+    #[test]
+    fn cycling_answers_discards_the_model_draft() {
+        let mut view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::Constitution,
+            ready_facts("GLM-5.2"),
+        );
+        let _ = view.install_model_draft(sample_model_draft(), "GLM-5.2".to_string());
+
+        // Changing any answer makes the model draft stale law.
+        assert!(matches!(
+            view.handle_key(key(KeyCode::Char('1'))),
+            ViewAction::None
+        ));
+
+        // The next G must preview afresh — and preview the guided rendering,
+        // not the discarded model draft.
+        let action = view.handle_key(key(KeyCode::Char('g')));
+        let ViewAction::Emit(ViewEvent::OpenTextPager { content, .. }) = action else {
+            panic!("stale draft should force a fresh preview");
+        };
+        assert!(content.contains("Rendered deterministically"));
+        assert!(!content.contains("Drafted by GLM-5.2"));
+
+        let action = view.handle_key(key(KeyCode::Char('g')));
+        let ViewAction::EmitAndClose(ViewEvent::SetupConstitutionCommitRequested { state, .. }) =
+            action
+        else {
+            panic!("expected guided commit after discard");
+        };
+        assert_eq!(
+            state.constitution_authoring,
+            Some(ConstitutionAuthoring::Guided)
+        );
+    }
+
+    #[test]
+    fn constitution_card_gates_the_model_draft_invitation() {
+        // No ready provider: no invitation (and the blocker-size layout holds).
+        let not_ready = SetupWizardView::new(SetupState::default(), Locale::En);
+        let text = lines_to_text(not_ready.constitution_detail_lines());
+        assert!(!text.contains("Ask"));
+        assert!(!text.contains("awaits ratification"));
+
+        // Ready provider: the invitation names the first configured model.
+        let ready = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::Constitution,
+            ready_facts("GLM-5.2"),
+        );
+        let text = lines_to_text(ready.constitution_detail_lines());
+        assert!(text.contains("Ask GLM-5.2 to draft it from your answers"));
+
+        // Installed draft: the card flips to the awaiting-ratification line.
+        let mut with_draft = ready.clone();
+        let _ = with_draft.install_model_draft(sample_model_draft(), "GLM-5.2".to_string());
+        let text = lines_to_text(with_draft.constitution_detail_lines());
+        assert!(text.contains("Draft by GLM-5.2 awaits ratification"));
+        assert!(!text.contains("Ask GLM-5.2 to draft"));
+    }
+
+    #[test]
+    fn model_drafted_commit_round_trips_through_the_setup_transaction() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+
+        let mut view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::Constitution,
+            ready_facts("GLM-5.2"),
+        );
+        let _ = view.install_model_draft(sample_model_draft(), "GLM-5.2".to_string());
+        let ViewAction::EmitAndClose(ViewEvent::SetupConstitutionCommitRequested {
+            constitution,
+            state,
+            ..
+        }) = view.handle_key(key(KeyCode::Char('g')))
+        else {
+            panic!("expected ratification commit event");
+        };
+
+        persist_user_constitution_choice(&constitution, &state).expect("persist");
+
+        let loaded = UserConstitution::load().expect("load constitution");
+        let loaded = loaded.constitution().expect("valid constitution");
+        assert_eq!(loaded.render_body(), constitution.render_body());
+        let loaded_state = SetupState::load().expect("load state").expect("state");
+        assert_eq!(
+            loaded_state.constitution_authoring,
+            Some(ConstitutionAuthoring::ModelDrafted)
+        );
+        assert_eq!(
+            loaded_state.constitution_preview_hash.as_deref(),
+            Some(constitution.preview_hash().as_str())
+        );
+    }
+
     #[test]
     fn guided_constitution_template_localizes_content() {
         let english = guided_constitution_template(Locale::En).render_body();
@@ -2331,18 +2781,56 @@ mod tests {
     }
 
     #[test]
-    fn guided_constitution_preview_uses_rendered_block_and_layer_order() {
-        let english =
-            guided_constitution_preview_text(Locale::En, GuidedConstitutionDraft::default());
-        let zh_hans =
-            guided_constitution_preview_text(Locale::ZhHans, GuidedConstitutionDraft::default());
+    fn ratification_preview_uses_rendered_block_and_layer_order() {
+        let draft = GuidedConstitutionDraft::default();
+        let english = constitution_ratification_text(
+            Locale::En,
+            &draft.to_constitution(Locale::En),
+            &DraftProvenance::Guided,
+        );
+        let zh_hans = constitution_ratification_text(
+            Locale::ZhHans,
+            &draft.to_constitution(Locale::ZhHans),
+            &DraftProvenance::Guided,
+        );
 
         assert!(english.contains("<codewhale_user_constitution"));
         assert!(english.contains("Layer order"));
-        assert!(english.contains("press G again to save"));
+        assert!(english.contains("press G to ratify and save"));
         assert!(zh_hans.contains("<codewhale_user_constitution"));
-        assert!(zh_hans.contains("再次按 G 保存"));
+        assert!(zh_hans.contains("按 G 批准并保存"));
         assert_ne!(english, zh_hans);
+    }
+
+    #[test]
+    fn ratification_preview_states_authority_boundaries_and_provenance() {
+        let draft = GuidedConstitutionDraft::default();
+        let constitution = draft.to_constitution(Locale::En);
+
+        let guided =
+            constitution_ratification_text(Locale::En, &constitution, &DraftProvenance::Guided);
+        assert!(guided.contains("HIERARCHY OF AUTHORITY"));
+        assert!(guided.contains("WHAT THIS CANNOT DO"));
+        assert!(guided.contains("cannot grant or change approval policy"));
+        assert!(guided.contains("Nothing becomes law until you confirm"));
+        assert!(guided.contains("Rendered deterministically"));
+
+        let drafted = constitution_ratification_text(
+            Locale::En,
+            &constitution,
+            &DraftProvenance::Model("GLM-5.2".to_string()),
+        );
+        assert!(drafted.contains("Drafted by GLM-5.2"));
+        assert!(drafted.contains("schema-checked and bounded by CodeWhale"));
+
+        let zh = constitution_ratification_text(
+            Locale::ZhHans,
+            &draft.to_constitution(Locale::ZhHans),
+            &DraftProvenance::Model("GLM-5.2".to_string()),
+        );
+        assert!(zh.contains("权限层级"));
+        assert!(zh.contains("它不能做什么"));
+        assert!(zh.contains("由 GLM-5.2 根据你的引导式答案起草"));
     }
 
     #[test]
@@ -2477,7 +2965,7 @@ mod tests {
                 "Choice:",
                 "Existing file:",
                 "Purpose:",
-                "preview/save",
+                "preview/ratify",
                 "use bundled",
                 "cancel",
             ] {
