@@ -1,14 +1,17 @@
 import Link from "next/link";
+import { buildPageMetadata } from "@/lib/page-meta";
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
   const isZh = locale === "zh";
-  return {
+  return buildPageMetadata({
+    path: "/docs/constitution",
+    locale,
     title: isZh ? "宪法与 /constitution · CodeWhale 文档" : "Constitution and /constitution · CodeWhale Docs",
     description: isZh
-      ? "用户全局宪法、仓库本地 law、项目说明和运行时边界。"
+      ? "用户全局宪法、仓库本地法、项目说明和运行时边界。"
       : "User-global constitution, repo-local law, project instructions, and runtime boundaries.",
-  };
+  });
 }
 
 export default async function ConstitutionPage({ params }: { params: Promise<{ locale: string }> }) {
