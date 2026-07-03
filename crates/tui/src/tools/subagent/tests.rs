@@ -2317,6 +2317,17 @@ fn transient_provider_classifier_matches_sse_header_timeout() {
     assert!(is_transient_subagent_provider_error(&err));
 }
 
+#[test]
+fn transient_provider_classifier_matches_structured_rate_limit() {
+    let err = anyhow::Error::new(crate::llm_client::LlmError::RateLimited {
+        message: "please slow down".to_string(),
+        retry_after: Some(Duration::from_secs(2)),
+    })
+    .context("Responses API request failed");
+
+    assert!(is_transient_subagent_provider_error(&err));
+}
+
 #[tokio::test]
 async fn subagent_retries_transient_provider_header_timeout_before_succeeding() {
     let tmp = tempdir().expect("tempdir");

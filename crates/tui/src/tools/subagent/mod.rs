@@ -4578,6 +4578,10 @@ fn subagent_transient_provider_retry_delay(retry_number: u32) -> Duration {
 }
 
 fn is_transient_subagent_provider_error(error: &anyhow::Error) -> bool {
+    if let Some(LlmError::RateLimited { .. }) = error.downcast_ref::<LlmError>() {
+        return true;
+    }
+
     let message = format!("{error:#}").to_ascii_lowercase();
     [
         "did not receive response headers",
@@ -4593,6 +4597,11 @@ fn is_transient_subagent_provider_error(error: &anyhow::Error) -> bool {
         "bad gateway",
         "gateway timeout",
         "service unavailable",
+        "rate limited",
+        "rate_limit",
+        "rate_limited",
+        "too many requests",
+        "429",
         "502",
         "503",
         "504",

@@ -1140,6 +1140,42 @@ fn auth_status_all_providers(store: &ConfigStore, secrets: &Secrets) -> Vec<Stri
     lines
 }
 
+fn auth_list_lines(store: &ConfigStore, secrets: &Secrets) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push("provider     config store env  active".to_string());
+    for provider in ProviderKind::ALL {
+        let slot = provider_slot(provider);
+        let file = provider_config_set(store, provider);
+        let keyring = (!file).then(|| provider_keyring_set(secrets, provider));
+        let env = provider_env_set(provider);
+        let oauth_file = provider_oauth_file_path(provider).is_some_and(|p| p.exists());
+        let active = if provider == ProviderKind::OpenaiCodex {
+            if env {
+                "env"
+            } else if oauth_file {
+                "oauth"
+            } else {
+                "missing"
+            }
+        } else if file {
+            "config"
+        } else if keyring == Some(true) {
+            "store"
+        } else if env {
+            "env"
+        } else {
+            "missing"
+        };
+        lines.push(format!(
+            "{slot:<12}  {}     {}      {}   {active}",
+            yes_no(file),
+            keyring_status_short(keyring),
+            yes_no(env)
+        ));
+    }
+    lines
+}
+
 fn auth_status_lines_for_provider(
     store: &ConfigStore,
     secrets: &Secrets,
@@ -1346,27 +1382,8 @@ fn run_auth_command_with_secrets(
             Ok(())
         }
         AuthCommand::List => {
-            println!("provider     config store env  active");
-            for provider in ProviderKind::ALL {
-                let slot = provider_slot(provider);
-                let file = provider_config_set(store, provider);
-                let keyring = (!file).then(|| provider_keyring_set(secrets, provider));
-                let env = provider_env_set(provider);
-                let active = if file {
-                    "config"
-                } else if keyring == Some(true) {
-                    "store"
-                } else if env {
-                    "env"
-                } else {
-                    "missing"
-                };
-                println!(
-                    "{slot:<12}  {}     {}      {}   {active}",
-                    yes_no(file),
-                    keyring_status_short(keyring),
-                    yes_no(env)
-                );
+            for line in auth_list_lines(store, secrets) {
+                println!("{line}");
             }
             Ok(())
         }
@@ -3615,6 +3632,36 @@ mod tests {
             "Codex OAuth file: {} (present)",
             auth_path.display()
         )));
+        assert!(!output.contains("secret-token"));
+    }
+
+    #[test]
+    fn auth_list_treats_openai_codex_oauth_file_as_active() {
+        use codewhale_secrets::InMemoryKeyringStore;
+        use std::sync::Arc;
+
+        let _lock = env_lock();
+        let _access_token = ScopedEnvVar::set("OPENAI_CODEX_ACCESS_TOKEN", "");
+        let _codex_token = ScopedEnvVar::set("CODEX_ACCESS_TOKEN", "");
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let auth_path = dir.path().join("auth.json");
+        std::fs::write(&auth_path, r#"{"tokens":{"access_token":"secret-token"}}"#)
+            .expect("write auth file");
+        let auth_path_str = auth_path.to_string_lossy().into_owned();
+        let _auth_file = ScopedEnvVar::set("OPENAI_CODEX_AUTH_FILE", &auth_path_str);
+
+        let mut store = ConfigStore::load(Some(config_path)).expect("store should load");
+        store.config.provider = ProviderKind::OpenaiCodex;
+        let secrets = Secrets::new(Arc::new(InMemoryKeyringStore::new()));
+
+        let output = auth_list_lines(&store, &secrets).join("\n");
+        let row = output
+            .lines()
+            .find(|line| line.starts_with("openai-codex"))
+            .unwrap_or_else(|| panic!("missing openai-codex row:\n{output}"));
+        assert!(row.ends_with("oauth"), "{row}");
         assert!(!output.contains("secret-token"));
     }
 
