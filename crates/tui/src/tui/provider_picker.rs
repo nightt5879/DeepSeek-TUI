@@ -1543,7 +1543,13 @@ impl ProviderPickerView {
             } else {
                 Style::default().fg(palette::STATUS_WARNING)
             };
-            let hint = row.list_row_hint(self.view);
+            let prefix = format!(" {arrow} {}{active_dot}  ", row.display_name);
+            let hint = crate::tui::ui_text::semantic_truncate_between_affixes(
+                &prefix,
+                &row.list_row_hint(self.view),
+                "",
+                usize::from(layout.list.width),
+            );
             let mut line = Line::from(vec![
                 Span::styled(" ", spacer_style),
                 Span::styled(arrow, label_style),
@@ -2245,6 +2251,22 @@ mod tests {
             .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn provider_picker_semantically_truncates_dense_rows_at_narrow_width() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        picker.toggle_view();
+
+        let text = render_text(&picker, 64, 16);
+        assert!(text.contains('…'), "{text}");
+        for (idx, line) in text.lines().enumerate() {
+            assert!(
+                crate::tui::ui_text::text_display_width(line) <= 64,
+                "line {idx} overflows: {line:?}"
+            );
+        }
     }
 
     #[test]

@@ -2295,7 +2295,7 @@ impl ModalView for ConfigView {
                 selected_hint.unwrap_or_default()
             };
             lines.push(Line::from(Span::styled(
-                truncate_view_text(&bottom_text, usize::from(inner.width)),
+                crate::tui::ui_text::semantic_truncate(&bottom_text, usize::from(inner.width)),
                 Style::default().fg(palette::TEXT_MUTED),
             )));
 

@@ -256,7 +256,13 @@ impl ModalView for ThemePickerView {
             ));
             spans.extend(swatch);
             spans.push(Span::raw("  "));
-            spans.push(Span::styled(id.tagline(), tagline_style));
+
+            let prefix_width = Line::from(spans.clone()).width();
+            let tagline = crate::tui::ui_text::semantic_truncate(
+                id.tagline(),
+                usize::from(content.width).saturating_sub(prefix_width),
+            );
+            spans.push(Span::styled(tagline, tagline_style));
 
             lines.push(Line::from(spans));
         }
@@ -400,6 +406,30 @@ mod tests {
         let area = ratatui::layout::Rect::new(0, 0, 20, 6);
         let mut buf = ratatui::buffer::Buffer::empty(area);
         v.render(area, &mut buf);
+    }
+
+    #[test]
+    fn render_semantically_truncates_taglines_at_narrow_width() {
+        let v = ThemePickerView::new("system".to_string());
+        let area = ratatui::layout::Rect::new(0, 0, 56, 12);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        v.render(area, &mut buf);
+        let rows = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let text = rows.join("\n");
+
+        assert!(text.contains('…'), "{text}");
+        for (idx, row) in rows.iter().enumerate() {
+            assert!(
+                crate::tui::ui_text::text_display_width(row) <= usize::from(area.width),
+                "line {idx} overflows: {row:?}"
+            );
+        }
     }
 
     /// The four terminal sizes the v0.8.66 modal blocker (#3732) requires

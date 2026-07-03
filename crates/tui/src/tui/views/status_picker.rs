@@ -19,7 +19,7 @@ use ratatui::{
 };
 
 use crate::config::{ApiProvider, StatusItem};
-use crate::localization::{Locale, MessageId, tr, truncate_to_width};
+use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
@@ -258,13 +258,22 @@ impl ModalView for StatusPickerView {
                 let line = status_row_text(pointer, mark, item, content.width as usize);
                 lines.push(Line::from(Span::styled(line, selected_style)));
             } else {
+                let label = item.label();
+                let hint = item.hint();
+                let prefix = format!(" {pointer} {mark} {label}  (");
+                let truncated_hint = crate::tui::ui_text::semantic_truncate_between_affixes(
+                    &prefix,
+                    hint,
+                    ")",
+                    usize::from(content.width),
+                );
                 lines.push(Line::from(vec![
                     Span::styled(format!(" {pointer} "), row_style),
                     Span::styled(mark.to_string(), row_style),
                     Span::styled(" ", row_style),
-                    Span::styled(item.label().to_string(), row_style),
+                    Span::styled(label.to_string(), row_style),
                     Span::styled("  ", row_style),
-                    Span::styled(format!("({})", item.hint()), hint_style),
+                    Span::styled(format!("({})", truncated_hint), hint_style),
                 ]));
             }
         }
@@ -285,8 +294,9 @@ fn visible_row_start(total_rows: usize, cursor: usize, visible_rows: usize) -> u
 }
 
 fn status_row_text(pointer: &str, mark: &str, item: &StatusItem, width: usize) -> String {
-    let text = format!(" {pointer} {mark} {}  ({})", item.label(), item.hint());
-    let mut text = truncate_to_width(&text, width);
+    let prefix = format!(" {pointer} {mark} {}  (", item.label());
+    let mut text =
+        crate::tui::ui_text::semantic_truncate_with_affixes(&prefix, item.hint(), ")", width);
     let current_width = text.width();
     if current_width < width {
         text.push_str(&" ".repeat(width - current_width));
@@ -398,6 +408,14 @@ mod tests {
         let text = status_row_text("▸", "[ ]", &StatusItem::LastToolElapsed, 40);
         assert_eq!(text.width(), 40);
         assert!(text.starts_with(" ▸ [ ] Last tool elapsed"));
+    }
+
+    #[test]
+    fn selected_row_text_semantically_truncates_hint_at_narrow_width() {
+        let text = status_row_text("▸", "[ ]", &StatusItem::LastToolElapsed, 49);
+        assert_eq!(text.width(), 49);
+        assert!(text.contains("ms of the most…"), "{text:?}");
+        assert!(!text.contains("ms of the most r"), "{text:?}");
     }
 
     #[test]

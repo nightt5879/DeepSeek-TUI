@@ -17,6 +17,8 @@ use crate::tui::views::{
     centered_modal_area, render_modal_footer, render_modal_surface,
 };
 
+#[cfg(test)]
+use super::actions::HotbarRecommendation;
 use super::actions::{
     HotbarActionCategory, HotbarActionMetadata, HotbarArgsBehavior, HotbarRecommendationOptions,
     HotbarSafetyClass, recommend_hotbar_actions,
@@ -392,7 +394,7 @@ impl HotbarSetupView {
         };
 
         for (idx, row) in self.actions_for_source(source).iter().enumerate() {
-            lines.push(self.action_row_line(source, idx, row));
+            lines.push(self.action_row_line(source, idx, row, 80));
         }
 
         lines.push(Line::from(""));
@@ -497,6 +499,7 @@ impl HotbarSetupView {
         source: HotbarActionCategory,
         idx: usize,
         row: &HotbarSetupActionRow,
+        max_width: u16,
     ) -> Line<'static> {
         let selected = idx == self.selected_action_idx(source);
         let marker = if selected { ">" } else { " " };
@@ -514,18 +517,23 @@ impl HotbarSetupView {
         } else {
             ""
         };
-        let mut text = format!(
-            "{marker}{checked} {:<3} {:<22} {:<8} {}",
+        let prefix = format!(
+            "{marker}{checked} {:<3} {:<22} {:<8} ",
             recommended,
             row.metadata.display_name,
-            row.status_label(),
-            row.metadata.description
+            row.status_label()
         );
-        if let Some(reason) = row.disabled_reason.as_deref() {
-            text.push_str(" (");
-            text.push_str(reason);
-            text.push(')');
-        }
+        let suffix = if let Some(reason) = row.disabled_reason.as_deref() {
+            format!(" ({reason})")
+        } else {
+            String::new()
+        };
+        let text = crate::tui::ui_text::semantic_truncate_with_affixes(
+            &prefix,
+            &row.metadata.description,
+            &suffix,
+            usize::from(max_width),
+        );
         Line::from(Span::styled(
             text,
             Style::default()
@@ -573,7 +581,7 @@ impl HotbarSetupView {
                 .add_modifier(Modifier::BOLD),
         ))];
         for (idx, row) in rows.iter().enumerate() {
-            lines.push(self.action_row_line(source, idx, row));
+            lines.push(self.action_row_line(source, idx, row, area.width));
         }
         Paragraph::new(lines)
             .style(Style::default().fg(palette::TEXT_PRIMARY))
@@ -1199,6 +1207,33 @@ mod tests {
 
         assert!(rendered.contains("After save: Alt+1 through Alt+8 dispatch Hotbar slots"));
         assert!(rendered.contains("Bare 1-8 stay composer text outside setup"));
+    }
+
+    #[test]
+    fn action_rows_semantically_truncate_descriptions_at_narrow_width() {
+        let app = test_app();
+        let view = HotbarSetupView::new(&app, &Config::default());
+        let row = HotbarSetupActionRow {
+            metadata: HotbarActionMetadata {
+                id: "test.long-description".to_string(),
+                source_id: "test".to_string(),
+                display_name: "Open settings row".to_string(),
+                compact_label: "test".to_string(),
+                description: "Open a detailed settings panel without clipping".to_string(),
+                category: HotbarActionCategory::App,
+                args: HotbarArgsBehavior::None,
+                safety: HotbarSafetyClass::LocalUi,
+                recommendation: HotbarRecommendation::Eligible,
+            },
+            disabled_reason: None,
+        };
+
+        let text = view
+            .action_row_line(HotbarActionCategory::App, 0, &row, 58)
+            .to_string();
+        assert!(crate::tui::ui_text::text_display_width(&text) <= 58);
+        assert!(text.contains("Open a detailed…"), "{text:?}");
+        assert!(!text.contains("Open a detailed s"), "{text:?}");
     }
 
     #[test]
