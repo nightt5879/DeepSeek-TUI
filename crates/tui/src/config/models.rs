@@ -163,3 +163,5 @@ pub const DEFAULT_MINIMAX_BASE_URL: &str = "https://api.minimax.io/v1";
 pub const DEFAULT_SAKANA_MODEL: &str = "fugu";
 pub const SAKANA_FUGU_ULTRA_MODEL: &str = "fugu-ultra-20260615";
 pub const DEFAULT_SAKANA_BASE_URL: &str = "https://api.sakana.ai/v1";
+pub const DEFAULT_LONGCAT_MODEL: &str = "LongCat-2.0";
+pub const DEFAULT_LONGCAT_BASE_URL: &str = "https://api.longcat.chat/openai/v1";

@@ -130,3 +130,6 @@ pub(crate) const DEFAULT_DEEPINFRA_BASE_URL: &str = "https://api.deepinfra.com/v
 // Sakana AI Fugu defaults
 pub(crate) const DEFAULT_SAKANA_MODEL: &str = "fugu";
 pub(crate) const DEFAULT_SAKANA_BASE_URL: &str = "https://api.sakana.ai/v1";
+// Meituan LongCat defaults
+pub(crate) const DEFAULT_LONGCAT_MODEL: &str = "LongCat-2.0";
+pub(crate) const DEFAULT_LONGCAT_BASE_URL: &str = "https://api.longcat.chat/openai/v1";

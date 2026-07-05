@@ -70,6 +70,7 @@ pub enum ApiProvider {
     Minimax,
     Deepinfra,
     Sakana,
+    LongCat,
     /// User-defined OpenAI-compatible endpoint (#1519).
     ///
     /// Selected when `provider = "<name>"` names a `[providers.<name>]
@@ -203,6 +204,7 @@ impl ApiProvider {
             Self::Minimax => "https://platform.minimax.io/docs/guides/quickstart-preparation",
             Self::Deepinfra => "https://deepinfra.com/dash/api_keys",
             Self::Sakana => "https://api.sakana.ai/",
+            Self::LongCat => "https://longcat.chat/platform",
             Self::OpenaiCodex | Self::Sglang | Self::Vllm | Self::Ollama => return None,
             // Custom endpoints have no canonical credential page; the user
             // supplies the key via their own `api_key_env`.
@@ -218,7 +220,7 @@ impl ApiProvider {
 
     /// `ApiProvider` discriminant → `ProviderKind` lookup.
     /// Index 1 is `None` for the legacy `DeepseekCN` variant.
-    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 31] = [
+    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 32] = [
         Some(codewhale_config::ProviderKind::Deepseek),
         None, // DeepseekCN
         Some(codewhale_config::ProviderKind::DeepseekAnthropic),
@@ -249,11 +251,12 @@ impl ApiProvider {
         Some(codewhale_config::ProviderKind::Minimax),
         Some(codewhale_config::ProviderKind::Deepinfra),
         Some(codewhale_config::ProviderKind::Sakana),
+        Some(codewhale_config::ProviderKind::LongCat),
         Some(codewhale_config::ProviderKind::Custom),
     ];
 
     /// `ProviderKind` discriminant → `ApiProvider` lookup.
-    const FROM_KIND_LOOKUP: [Self; 30] = [
+    const FROM_KIND_LOOKUP: [Self; 31] = [
         Self::Deepseek,
         Self::DeepseekAnthropic,
         Self::NvidiaNim,
@@ -283,6 +286,7 @@ impl ApiProvider {
         Self::Minimax,
         Self::Deepinfra,
         Self::Sakana,
+        Self::LongCat,
         Self::Custom,
     ];
 
@@ -371,6 +375,10 @@ fn subagent_provider_key_matches(key: &str, provider: ApiProvider) -> bool {
                 | "bigmodel"
                 | "big_model"
                 | "zhipu_glm"
+        ),
+        ApiProvider::LongCat => matches!(
+            normalized.as_str(),
+            "longcat" | "long_cat" | "meituan_longcat" | "meituan"
         ),
         _ => false,
     }
@@ -1156,6 +1164,7 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
             MINIMAX_M2_MODEL,
         ],
         ApiProvider::Sakana => vec![DEFAULT_SAKANA_MODEL, SAKANA_FUGU_ULTRA_MODEL],
+        ApiProvider::LongCat => vec![DEFAULT_LONGCAT_MODEL],
         // Custom endpoints expose no built-in completion names; the user
         // supplies their own model id (#1519).
         ApiProvider::Custom => Vec::new(),
@@ -2571,6 +2580,13 @@ pub struct ProvidersConfig {
     pub minimax: ProviderConfig,
     #[serde(default, alias = "sakana-ai", alias = "sakana_ai", alias = "fugu")]
     pub sakana: ProviderConfig,
+    #[serde(
+        default,
+        alias = "long-cat",
+        alias = "meituan-longcat",
+        alias = "meituan"
+    )]
+    pub longcat: ProviderConfig,
     /// Arbitrary user-named custom providers (#1519).
     ///
     /// Captures every `[providers.<name>]` table whose key is not one of the
@@ -2960,6 +2976,7 @@ impl Config {
             ApiProvider::Stepfun => &providers.stepfun,
             ApiProvider::Minimax => &providers.minimax,
             ApiProvider::Sakana => &providers.sakana,
+            ApiProvider::LongCat => &providers.longcat,
             // Handled by the name-keyed early return above (#1519).
             ApiProvider::Custom => unreachable!("custom provider resolved by name above"),
         })
@@ -3020,6 +3037,7 @@ impl Config {
             ApiProvider::Stepfun => &mut providers.stepfun,
             ApiProvider::Minimax => &mut providers.minimax,
             ApiProvider::Sakana => &mut providers.sakana,
+            ApiProvider::LongCat => &mut providers.longcat,
             // Handled by the name-keyed early return above (#1519).
             ApiProvider::Custom => unreachable!("custom provider resolved by name above"),
         }
@@ -3212,6 +3230,7 @@ impl Config {
             ApiProvider::Anthropic => DEFAULT_ANTHROPIC_MODEL,
             ApiProvider::Minimax => DEFAULT_MINIMAX_MODEL,
             ApiProvider::Sakana => DEFAULT_SAKANA_MODEL,
+            ApiProvider::LongCat => DEFAULT_LONGCAT_MODEL,
             // Custom endpoints have no built-in default model; pass through the
             // descriptor placeholder when nothing is configured (#1519).
             ApiProvider::Custom => codewhale_config::ProviderKind::Custom
@@ -3265,6 +3284,7 @@ impl Config {
             | ApiProvider::Stepfun
             | ApiProvider::Minimax
             | ApiProvider::Sakana
+            | ApiProvider::LongCat
             // Custom reads its base_url from the named `[providers.<name>]`
             // table (via provider_base), never from the legacy root field.
             | ApiProvider::Custom => None,
@@ -3325,6 +3345,7 @@ impl Config {
                         ApiProvider::Anthropic => DEFAULT_ANTHROPIC_BASE_URL,
                         ApiProvider::Minimax => DEFAULT_MINIMAX_BASE_URL,
                         ApiProvider::Sakana => DEFAULT_SAKANA_BASE_URL,
+                        ApiProvider::LongCat => DEFAULT_LONGCAT_BASE_URL,
                         // No built-in endpoint; descriptor placeholder keeps the
                         // fallback total. A real custom route configures
                         // `[providers.<name>] base_url` which wins above (#1519).
@@ -4456,6 +4477,13 @@ fn apply_env_overrides(config: &mut Config) {
                     .sakana
                     .base_url = Some(value);
             }
+            ApiProvider::LongCat => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .longcat
+                    .base_url = Some(value);
+            }
             // Custom resolves to the named `[providers.<name>]` table; route the
             // override through the name-keyed mutable accessor (#1519).
             ApiProvider::Custom => {
@@ -4684,6 +4712,7 @@ fn apply_env_overrides(config: &mut Config) {
             ApiProvider::Stepfun => &mut providers.stepfun,
             ApiProvider::Minimax => &mut providers.minimax,
             ApiProvider::Sakana => &mut providers.sakana,
+            ApiProvider::LongCat => &mut providers.longcat,
             ApiProvider::Custom => providers
                 .custom
                 .entry(custom_key.expect("custom key captured for custom provider"))
@@ -4906,6 +4935,7 @@ fn apply_env_overrides(config: &mut Config) {
                 ApiProvider::Stepfun => &mut providers.stepfun,
                 ApiProvider::Minimax => &mut providers.minimax,
                 ApiProvider::Sakana => &mut providers.sakana,
+                ApiProvider::LongCat => &mut providers.longcat,
             };
             entry.model = Some(value);
         }
@@ -5677,6 +5707,7 @@ fn merge_providers(
             stepfun: merge_provider_config(base.stepfun, override_cfg.stepfun),
             minimax: merge_provider_config(base.minimax, override_cfg.minimax),
             sakana: merge_provider_config(base.sakana, override_cfg.sakana),
+            longcat: merge_provider_config(base.longcat, override_cfg.longcat),
             custom: merge_custom_providers(base.custom, override_cfg.custom),
         }),
     }

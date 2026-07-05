@@ -864,6 +864,14 @@ impl Default for ModelRegistry {
                 supports_tools: true,
                 supports_reasoning: true,
             },
+            // Meituan LongCat (https://longcat.chat/platform)
+            ModelInfo {
+                id: "LongCat-2.0".to_string(),
+                provider: ProviderKind::LongCat,
+                aliases: vec!["longcat".to_string(), "longcat-2.0".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
         ];
         Self::new(models)
     }

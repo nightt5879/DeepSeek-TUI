@@ -64,6 +64,8 @@ enum ProviderArg {
     Deepinfra,
     #[value(alias = "fugu", alias = "sakana-ai", alias = "sakana_ai")]
     Sakana,
+    #[value(alias = "long-cat", alias = "meituan-longcat", alias = "meituan")]
+    LongCat,
 }
 
 impl From<ProviderArg> for ProviderKind {
@@ -96,6 +98,7 @@ impl From<ProviderArg> for ProviderKind {
             ProviderArg::Minimax => ProviderKind::Minimax,
             ProviderArg::Deepinfra => ProviderKind::Deepinfra,
             ProviderArg::Sakana => ProviderKind::Sakana,
+            ProviderArg::LongCat => ProviderKind::LongCat,
         }
     }
 }
