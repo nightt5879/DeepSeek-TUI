@@ -18,11 +18,12 @@ export interface RepoFacts {
 }
 
 export const FACTS: RepoFacts = {
-  "generatedAt": "2026-06-30T05:41:26.332Z",
+  "generatedAt": "2026-07-05T18:08:58.886Z",
   "version": "0.8.66",
   "crates": [
     "agent",
     "app-server",
+    "build-support",
     "cli",
     "config",
     "core",
@@ -35,7 +36,8 @@ export const FACTS: RepoFacts = {
     "state",
     "tools",
     "tui",
-    "whaleflow"
+    "whaleflow",
+    "whaleflow-js"
   ],
   "sandboxBackends": [
     "bwrap",
@@ -189,6 +191,11 @@ export const FACTS: RepoFacts = {
       "id": "sakana",
       "label": "Sakana AI",
       "env": "FUGU_API_KEY / SAKANA_API_KEY"
+    },
+    {
+      "id": "longcat",
+      "label": "LongCat",
+      "env": "LONGCAT_API_KEY"
     }
   ],
   "defaultModel": "deepseek-v4-pro",

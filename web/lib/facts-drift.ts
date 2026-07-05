@@ -105,6 +105,7 @@ function deriveProvidersFromConfig(cfg: string): ProviderFact[] {
     Minimax: { id: "minimax", label: "MiniMax", env: "MINIMAX_API_KEY" },
     Openmodel: { id: "openmodel", label: "OpenModel", env: "OPENMODEL_API_KEY" },
     Sakana: { id: "sakana", label: "Sakana AI", env: "FUGU_API_KEY / SAKANA_API_KEY" },
+    LongCat: { id: "longcat", label: "LongCat", env: "LONGCAT_API_KEY" },
   };
   // Log loudly on unmapped variants so a new provider can never be silently
   // dropped from the drift-derived facts again. DeepseekCN (#1104) and the
