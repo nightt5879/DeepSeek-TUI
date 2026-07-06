@@ -8085,6 +8085,20 @@ async fn apply_command_result(
                     );
                 }
             }
+            AppAction::OpenProviderSetup { provider } => {
+                if app.view_stack.top_kind() != Some(ModalKind::ProviderPicker) {
+                    let runtime_status = query_provider_runtime_status(engine_handle).await;
+                    app.view_stack.push(
+                        crate::tui::provider_picker::ProviderPickerView::new_for_setup(
+                            app.api_provider,
+                            provider,
+                            config,
+                            runtime_status,
+                        ),
+                    );
+                    app.status_message = Some("Provider setup catalog opened.".to_string());
+                }
+            }
             AppAction::OpenModePicker => {
                 if app.view_stack.top_kind() != Some(ModalKind::ModePicker) {
                     app.view_stack
@@ -10173,8 +10187,9 @@ async fn handle_view_events(
                 if app.view_stack.top_kind() != Some(ModalKind::ProviderPicker) {
                     let runtime_status = query_provider_runtime_status(engine_handle).await;
                     app.view_stack.push(
-                        crate::tui::provider_picker::ProviderPickerView::new_with_runtime_status(
+                        crate::tui::provider_picker::ProviderPickerView::new_for_setup(
                             app.api_provider,
+                            None,
                             config,
                             runtime_status,
                         ),

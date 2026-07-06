@@ -5948,6 +5948,11 @@ pub enum AppAction {
     /// Open the `/provider` picker modal — DeepSeek / NVIDIA NIM / OpenRouter
     /// / Novita with inline API-key prompt for un-configured providers (#52).
     OpenProviderPicker,
+    /// Open the `/provider` picker in setup/catalog mode, optionally focused on
+    /// a built-in provider that needs credentials before first use.
+    OpenProviderSetup {
+        provider: Option<ApiProvider>,
+    },
     /// Open the `/mode` picker modal for Agent / Plan / YOLO.
     OpenModePicker,
     /// Refresh the engine prompt after the UI operating mode changes.

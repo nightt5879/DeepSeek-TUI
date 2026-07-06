@@ -1143,6 +1143,30 @@ impl ProviderPickerView {
         }
     }
 
+    /// Open the picker as a first-run/setup catalog: every built-in provider is
+    /// visible, and an optional target is focused. Missing-auth targets jump
+    /// straight to the existing masked key-entry stage; configured/local
+    /// targets stay on the list so Enter applies them normally.
+    #[must_use]
+    pub fn new_for_setup(
+        active: ApiProvider,
+        target: Option<ApiProvider>,
+        config: &Config,
+        runtime_status: Option<ProviderRuntimeStatus>,
+    ) -> Self {
+        let mut picker = Self::new_with_runtime_status(active, config, runtime_status);
+        picker.view = ProviderListView::Catalog;
+        if let Some(target) = target
+            && let Some(idx) = picker.rows.iter().position(|row| row.provider == target)
+        {
+            picker.selected_idx = idx;
+            if !picker.selected_has_key() {
+                picker.enter_key_entry();
+            }
+        }
+        picker
+    }
+
     /// Open the picker already focused on `target` in its key-entry stage —
     /// the missing-auth handoff (#3830): when a route switch is rejected for
     /// want of a key, drop the user straight onto that provider's key prompt
@@ -3116,6 +3140,56 @@ mod tests {
         .expect("Anthropic has a picker row");
         assert_eq!(picker.stage, Stage::KeyEntry);
         assert_eq!(picker.selected_provider(), ApiProvider::Anthropic);
+    }
+
+    #[test]
+    fn setup_catalog_shows_all_providers_from_configured_view() {
+        let config = Config::default();
+        let picker = ProviderPickerView::new_for_setup(ApiProvider::Deepseek, None, &config, None);
+
+        assert_eq!(picker.stage, Stage::List);
+        assert_eq!(picker.view, ProviderListView::Catalog);
+        assert_eq!(picker.visible_row_count(), picker.rows.len());
+    }
+
+    #[test]
+    fn setup_catalog_focuses_missing_provider_key_entry() {
+        let config = Config::default();
+        let picker = ProviderPickerView::new_for_setup(
+            ApiProvider::Deepseek,
+            Some(ApiProvider::Anthropic),
+            &config,
+            None,
+        );
+
+        assert_eq!(picker.view, ProviderListView::Catalog);
+        assert_eq!(picker.stage, Stage::KeyEntry);
+        assert_eq!(picker.selected_provider(), ApiProvider::Anthropic);
+        assert!(picker.api_key_input.is_empty());
+    }
+
+    #[test]
+    fn setup_catalog_focuses_configured_provider_without_rekeying() {
+        let config = Config {
+            providers: Some(crate::config::ProvidersConfig {
+                openai: crate::config::ProviderConfig {
+                    api_key: Some("openai-key".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let picker = ProviderPickerView::new_for_setup(
+            ApiProvider::Deepseek,
+            Some(ApiProvider::Openai),
+            &config,
+            None,
+        );
+
+        assert_eq!(picker.view, ProviderListView::Catalog);
+        assert_eq!(picker.stage, Stage::List);
+        assert_eq!(picker.selected_provider(), ApiProvider::Openai);
     }
 
     #[test]
