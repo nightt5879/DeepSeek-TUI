@@ -6176,7 +6176,7 @@ mod tests {
         );
         // Narrow-width readability: no rendered line overflows content_width.
         for line in &lines {
-            let display = lines_to_text(&vec![line.clone()]);
+            let display = lines_to_text(std::slice::from_ref(line));
             let width = display
                 .first()
                 .map(|s| unicode_width::UnicodeWidthStr::width(s.as_str()))

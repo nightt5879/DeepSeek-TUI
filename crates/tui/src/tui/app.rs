@@ -3122,10 +3122,10 @@ impl App {
         self.yolo_compat_notified = true;
         // Per-install suppression: check the persisted flag so the toast
         // appears exactly once across sessions, not every launch.
-        if let Ok(settings) = crate::settings::Settings::load() {
-            if settings.yolo_deprecation_shown {
-                return;
-            }
+        if let Ok(settings) = crate::settings::Settings::load()
+            && settings.yolo_deprecation_shown
+        {
+            return;
         }
         // Persist the flag best-effort; toast still fires even if the write
         // fails (retries on the next attempt).
