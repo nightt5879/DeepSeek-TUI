@@ -64,7 +64,8 @@ pub fn fleet_task_to_worker_spec_with_profiles(
     let objective = fleet_task_prompt_with_profile(task_spec, agent_profile);
     let max_spawn_depth = codewhale_config::FleetExecConfig::default().max_spawn_depth;
     let loadout = effective_fleet_loadout(worker_profile, agent_profile);
-    let effective_model = effective_fleet_model(model, worker_profile, agent_profile);
+    let (effective_model, model_source) =
+        effective_fleet_model_with_source(model, worker_profile, agent_profile);
     let mut requested_runtime = fleet_worker_runtime_profile_for_loadout(
         &agent_type,
         &tool_profile,
@@ -72,7 +73,10 @@ pub fn fleet_task_to_worker_spec_with_profiles(
         0,
         max_spawn_depth,
         &loadout,
+        model_source,
     );
+    requested_runtime.provider =
+        explicit_fleet_provider(agent_profile).map(|provider| provider.as_str().to_string());
     if let Some(agent_profile) = agent_profile
         && let Some(profile_depth) = agent_profile.profile.delegation.max_spawn_depth
     {
@@ -595,6 +599,7 @@ fn fleet_worker_runtime_profile_for_loadout(
     spawn_depth: u32,
     max_spawn_depth: u32,
     loadout: &codewhale_config::FleetLoadout,
+    model_source: &'static str,
 ) -> WorkerRuntimeProfile {
     let mut profile = fleet_worker_runtime_profile(
         agent_type,
@@ -603,7 +608,11 @@ fn fleet_worker_runtime_profile_for_loadout(
         spawn_depth,
         max_spawn_depth,
     );
-    profile.model = fleet_model_route_for_loadout(model, loadout);
+    profile.model = if matches!(model_source, "task.model" | "agent_profile.model") {
+        fleet_model_route_for_loadout(model, &codewhale_config::FleetLoadout::Inherit)
+    } else {
+        fleet_model_route_for_loadout("auto", loadout)
+    };
     profile
 }
 
@@ -1554,6 +1563,171 @@ mod tests {
     }
 
     #[test]
+    fn fleet_worker_spec_carries_agent_profile_provider_through_runtime_contract() {
+        let mut profile = agent_profile(
+            "scout-openrouter",
+            "scout",
+            Some("Use the OpenRouter scout route."),
+            codewhale_config::FleetLoadout::Fast,
+        );
+        profile.profile.model = Some("deepseek-v4-flash".to_string());
+        profile.profile.provider = Some("openrouter".to_string());
+        let task = fleet_task(
+            "scout",
+            Some(worker_profile(
+                Some("scout-openrouter"),
+                None,
+                None,
+                None,
+                None,
+                vec![],
+            )),
+        );
+        let worker = FleetWorkerSpec {
+            id: "worker-1".to_string(),
+            name: "Worker".to_string(),
+            host: FleetHostSpec::Local,
+            trust_level: None,
+            labels: Default::default(),
+            capabilities: vec![],
+            max_concurrent_tasks: None,
+        };
+        let mut parent = WorkerRuntimeProfile::for_role(SubAgentType::General);
+        parent.provider = Some("deepseek".to_string());
+        parent.max_spawn_depth = 3;
+
+        let spec = fleet_task_to_worker_spec_with_profiles(
+            "worker-1",
+            "run-1",
+            &task,
+            &worker,
+            "deepseek-v4-pro",
+            std::path::Path::new("/tmp"),
+            &[profile],
+            Some(&parent),
+        )
+        .unwrap();
+
+        assert_eq!(spec.model, "deepseek-v4-flash");
+        assert_eq!(
+            spec.runtime_profile.model,
+            ModelRoute::Fixed("deepseek-v4-flash".to_string())
+        );
+        assert_eq!(spec.runtime_profile.provider.as_deref(), Some("openrouter"));
+        assert_eq!(spec.runtime_profile.max_spawn_depth, 2);
+    }
+
+    #[test]
+    fn fleet_worker_spec_model_route_precedence_is_task_profile_role_then_session() {
+        let worker = FleetWorkerSpec {
+            id: "worker-1".to_string(),
+            name: "Worker".to_string(),
+            host: FleetHostSpec::Local,
+            trust_level: None,
+            labels: Default::default(),
+            capabilities: vec![],
+            max_concurrent_tasks: None,
+        };
+        let run_model = "deepseek-v4-pro";
+
+        let mut profile =
+            agent_profile("scout", "scout", None, codewhale_config::FleetLoadout::Fast);
+        profile.profile.model = Some("deepseek-v4-flash".to_string());
+
+        let task_model = fleet_task_to_worker_spec_with_profiles(
+            "worker-task",
+            "run-1",
+            &fleet_task(
+                "task-model",
+                Some(worker_profile(
+                    Some("scout"),
+                    None,
+                    None,
+                    None,
+                    Some("deepseek-v4.1"),
+                    vec![],
+                )),
+            ),
+            &worker,
+            run_model,
+            std::path::Path::new("/tmp"),
+            &[profile.clone()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(task_model.model, "deepseek-v4.1");
+        assert_eq!(
+            task_model.runtime_profile.model,
+            ModelRoute::Fixed("deepseek-v4.1".to_string())
+        );
+
+        let profile_model = fleet_task_to_worker_spec_with_profiles(
+            "worker-profile",
+            "run-1",
+            &fleet_task(
+                "profile-model",
+                Some(worker_profile(
+                    Some("scout"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    vec![],
+                )),
+            ),
+            &worker,
+            run_model,
+            std::path::Path::new("/tmp"),
+            &[profile],
+            None,
+        )
+        .unwrap();
+        assert_eq!(profile_model.model, "deepseek-v4-flash");
+        assert_eq!(
+            profile_model.runtime_profile.model,
+            ModelRoute::Fixed("deepseek-v4-flash".to_string())
+        );
+
+        let role_default = fleet_task_to_worker_spec_with_profiles(
+            "worker-role",
+            "run-1",
+            &fleet_task(
+                "role-default",
+                Some(worker_profile(
+                    None,
+                    Some("scout"),
+                    Some("fast"),
+                    None,
+                    None,
+                    vec![],
+                )),
+            ),
+            &worker,
+            run_model,
+            std::path::Path::new("/tmp"),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(role_default.model, run_model);
+        assert_eq!(role_default.runtime_profile.model, ModelRoute::Faster);
+
+        let inherited = fleet_task_to_worker_spec_with_profiles(
+            "worker-inherit",
+            "run-1",
+            &fleet_task("inherit", None),
+            &worker,
+            run_model,
+            std::path::Path::new("/tmp"),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(inherited.model, run_model);
+        assert_eq!(inherited.runtime_profile.model, ModelRoute::Inherit);
+    }
+
+    #[test]
     fn fleet_worker_spec_intersects_task_tools_with_parent_runtime_profile() {
         let task = fleet_task(
             "build",
@@ -1783,7 +1957,7 @@ mod tests {
             );
             assert_eq!(
                 spec.runtime_profile.model,
-                ModelRoute::Fixed(model.to_string()),
+                ModelRoute::Inherit,
                 "role {role}"
             );
             assert_eq!(spec.runtime_profile.role, expected_type, "role {role}");
