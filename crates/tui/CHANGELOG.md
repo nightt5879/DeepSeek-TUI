@@ -47,14 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   draft-preview ratify keypress no longer competes with a separate pager's
   `g`/`G` scroll bindings — the exact TOML preview now renders inline on the
   same Review step that ratifies it (#4093).
-- Fleet workers now actually launch on their profile-pinned route, not just
-  record it on the receipt: `codewhale exec` gains a non-secret `--provider`
-  flag, and a worker whose profile pins provider B is dispatched with
-  `--provider B --model <B's model>` even when the parent session is on
-  provider A (credentials still resolve from the worker's own environment;
-  provider is never inferred from the model id). Workers with no
-  profile-bound provider are unchanged — no `--provider`, run-level model
-  (#4093).
+- The headless `codewhale fleet run` CLI now launches workers on their profile-pinned route, not just records it on the receipt: `codewhale exec` gains a non-secret `--provider` flag, and a worker whose profile pins provider B is dispatched with `--provider B --model <B's model>` even when the parent session is on provider A (credentials still resolve from the worker's own environment; provider is never inferred from the model id). Workers with no profile-bound provider are unchanged — no `--provider`, run-level model. The interactive TUI spawns roster members in-process and does not yet honor the pinned provider (it uses the session provider); that remainder is tracked in #4193 (#4093).
 - The Fleet setup `m` model-assisted redraft no longer drops a picked
   cross-provider route: the provider/model the operator chose are re-pinned
   onto the drafted profile (a model draft is always `provider: None`), so
