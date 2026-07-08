@@ -1038,22 +1038,18 @@ fn turn_files_changed(app: &App, start: usize, end: usize) -> Vec<String> {
             continue;
         };
         match tool {
-            ToolCell::PatchSummary(patch) => {
-                if seen.insert(patch.path.clone()) {
-                    lines.push(format!(
-                        "• {} — {}",
-                        truncate_line_to_width(&patch.path, 60),
-                        activity_status_label(patch.status)
-                    ));
-                }
+            ToolCell::PatchSummary(patch) if seen.insert(patch.path.clone()) => {
+                lines.push(format!(
+                    "• {} — {}",
+                    truncate_line_to_width(&patch.path, 60),
+                    activity_status_label(patch.status)
+                ));
             }
-            ToolCell::DiffPreview(diff) => {
-                if seen.insert(diff.title.clone()) {
-                    lines.push(format!(
-                        "• {} (diff)",
-                        truncate_line_to_width(&diff.title, 60)
-                    ));
-                }
+            ToolCell::DiffPreview(diff) if seen.insert(diff.title.clone()) => {
+                lines.push(format!(
+                    "• {} (diff)",
+                    truncate_line_to_width(&diff.title, 60)
+                ));
             }
             _ => {}
         }
