@@ -663,6 +663,11 @@ pub enum ViewEvent {
         role: String,
         /// Target model for the worker: a concrete model id, or "inherit".
         model: String,
+        /// Canonical provider id for a concrete cross-provider route pick, or
+        /// `None` for `inherit` (#4093). Carried so the model-drafted profile
+        /// keeps the picked provider instead of collapsing to an ambiguous,
+        /// provider-scoped profile — the exact bug #4093 fixes.
+        provider: Option<String>,
         locale: crate::localization::Locale,
     },
     /// Emitted by the `/fleet` roster view (`s` / Enter) to hand off to the

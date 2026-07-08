@@ -194,6 +194,7 @@ impl FleetRoster {
                 },
                 loadout,
                 model: None,
+                provider: None,
                 permissions: FleetProfilePermissions::default(),
                 delegation: FleetDelegationHints::default(),
             },
@@ -276,6 +277,7 @@ mod tests {
             },
             loadout: FleetLoadout::Inherit,
             model: model.map(str::to_string),
+            provider: None,
             permissions: FleetProfilePermissions::default(),
             delegation: FleetDelegationHints::default(),
         }
@@ -408,7 +410,14 @@ mod tests {
     #[test]
     fn broken_workspace_dir_degrades_to_built_ins_and_config() {
         let tmp = TempDir::new().unwrap();
-        write_workspace_profile(tmp.path(), "broken.toml", "provider = \"openrouter\"\n");
+        // An unrecognized provider id is still a load failure (#4093):
+        // `provider` is now a first-class field, but it's validated against
+        // the known `ApiProvider` vocabulary, not accepted as any string.
+        write_workspace_profile(
+            tmp.path(),
+            "broken.toml",
+            "provider = \"not-a-real-provider\"\n",
+        );
         let config = config_with_profiles(BTreeMap::from([(
             "extra".to_string(),
             config_profile("scout", None),

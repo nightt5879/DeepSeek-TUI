@@ -55,6 +55,14 @@ struct AgentProfileToml {
     loadout: Option<String>,
     #[serde(default, alias = "model_hint", alias = "model_id")]
     model: Option<String>,
+    /// Explicit provider id for `model` (#4093), e.g. `"deepseek"` or
+    /// `"openrouter"`. Validated against the known `ApiProvider` vocabulary at
+    /// load time — never inferred by sniffing `model` for a provider-shaped
+    /// substring (EPIC #2608). `deny_unknown_fields` no longer needs to guard
+    /// this name: it is now a first-class, validated field instead of a
+    /// smuggled one.
+    #[serde(default)]
+    provider: Option<String>,
     #[serde(default)]
     instructions: Option<AgentProfileInstructions>,
     #[serde(default)]
@@ -162,6 +170,11 @@ fn agent_profile_from_toml(path: &Path, parsed: AgentProfileToml) -> Result<Agen
     let model = non_empty_trimmed(parsed.model.as_deref()).map(str::to_string);
     validate_agent_profile_model_hint(path, model.as_deref())?;
 
+    let provider = non_empty_trimmed(parsed.provider.as_deref())
+        .map(str::to_string)
+        .map(|provider| validate_agent_profile_provider(path, &provider).map(|()| provider))
+        .transpose()?;
+
     let instructions = parsed
         .instructions
         .as_ref()
@@ -179,6 +192,7 @@ fn agent_profile_from_toml(path: &Path, parsed: AgentProfileToml) -> Result<Agen
         },
         loadout,
         model,
+        provider,
         permissions: FleetProfilePermissions::default(),
         delegation: FleetDelegationHints::default(),
     };
@@ -261,6 +275,21 @@ fn validate_agent_profile_model_hint(path: &Path, value: Option<&str>) -> Result
     Ok(())
 }
 
+/// Validate an explicit `provider` field against the known `ApiProvider`
+/// vocabulary (#4093). This is the ONLY place a profile's provider is
+/// established — a name that doesn't parse is rejected outright rather than
+/// silently ignored or guessed from `model` (EPIC #2608: explicit config
+/// only, never a model-id prefix/substring sniff).
+fn validate_agent_profile_provider(path: &Path, value: &str) -> Result<()> {
+    if crate::config::ApiProvider::parse(value).is_none() {
+        bail!(
+            "agent profile {} provider {value:?} is not a recognized provider id",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 fn is_agent_profile_token_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')
 }
@@ -305,6 +334,13 @@ pub enum UntrustedProfileParse {
 /// validation, prose bounds, and control-character stripping. The persisted
 /// TOML is rendered deterministically from this struct — model bytes are
 /// never written to disk verbatim.
+///
+/// `provider` (#4093) is set ONLY by the structured Fleet setup picker (a
+/// user's explicit, credential-checked selection) — never by
+/// [`Self::from_untrusted_json`], whose wire schema
+/// ([`FleetProfileDraftJson`]) has no `provider` field and rejects one via
+/// `deny_unknown_fields`. A model's untrusted reply can never smuggle a
+/// provider; only an interactive pick can set this field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetProfileDraft {
     pub id: String,
@@ -313,6 +349,10 @@ pub struct FleetProfileDraft {
     pub role_hint: String,
     pub model_class_hint: Option<String>,
     pub model: Option<String>,
+    /// Explicit provider id for `model` (e.g. `"deepseek"`), set only by the
+    /// structured picker. `None` means "no route pin" (inherit) — matching
+    /// `model: None` — or a legacy/untrusted draft that predates this field.
+    pub provider: Option<String>,
     pub instructions: Option<String>,
 }
 
@@ -418,6 +458,9 @@ impl FleetProfileDraft {
             role_hint,
             model_class_hint,
             model,
+            // Never set from untrusted model output — `FleetProfileDraftJson`
+            // has no `provider` field, so there is nothing to read here.
+            provider: None,
             instructions,
         };
         if draft.description.is_none() && draft.instructions.is_none() {
@@ -457,6 +500,15 @@ impl FleetProfileDraft {
         }
         if let Some(ref model) = self.model {
             root.insert("model".to_string(), toml::Value::String(model.clone()));
+            // A provider pin is only meaningful alongside a concrete model
+            // (#4093): an `inherit` draft (`model: None`) never carries one,
+            // so the rendered TOML can't imply a route it doesn't have.
+            if let Some(ref provider) = self.provider {
+                root.insert(
+                    "provider".to_string(),
+                    toml::Value::String(provider.clone()),
+                );
+            }
         }
         if let Some(ref instructions) = self.instructions {
             let mut table = toml::value::Table::new();
@@ -625,6 +677,59 @@ mod tests {
         assert_eq!(path, loaded.source);
     }
 
+    #[test]
+    fn draft_with_explicit_provider_round_trips_through_the_loader() {
+        // A structured (picker-driven) draft that pins a model on a provider
+        // other than whatever the parent session happens to use (#4093): the
+        // rendered TOML must carry both fields explicitly, and the loader
+        // must read the provider back out verbatim — never re-derive it by
+        // sniffing `model` for a provider-shaped substring.
+        let draft = FleetProfileDraft {
+            id: "scout-deepseek".to_string(),
+            display_name: Some("Scout".to_string()),
+            description: Some("Cross-provider scout profile.".to_string()),
+            role_hint: "scout".to_string(),
+            model_class_hint: None,
+            model: Some("deepseek-v4-flash".to_string()),
+            provider: Some("deepseek".to_string()),
+            instructions: None,
+        };
+
+        let rendered = draft.render_toml();
+        assert!(
+            rendered.contains("provider = \"deepseek\""),
+            "rendered TOML must persist the explicit provider: {rendered}"
+        );
+        assert!(rendered.contains("model = \"deepseek-v4-flash\""));
+
+        let dir = TempDir::new().unwrap();
+        write_profile(dir.path(), &draft.file_name(), &rendered);
+        let profiles = load_agent_profiles_from_dir(dir.path()).expect("rendered TOML loads");
+        assert_eq!(profiles.len(), 1);
+        let loaded = &profiles[0];
+        assert_eq!(loaded.profile.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(loaded.profile.provider.as_deref(), Some("deepseek"));
+    }
+
+    #[test]
+    fn inherit_draft_never_renders_a_provider_without_a_model() {
+        // `provider` is only meaningful alongside a concrete model pin; an
+        // `inherit` draft (no `model`) must never render one even if a stale
+        // caller sets the field.
+        let draft = FleetProfileDraft {
+            id: "inherit".to_string(),
+            display_name: None,
+            description: None,
+            role_hint: "general".to_string(),
+            model_class_hint: None,
+            model: None,
+            provider: Some("deepseek".to_string()),
+            instructions: None,
+        };
+        let rendered = draft.render_toml();
+        assert!(!rendered.contains("provider"), "{rendered}");
+    }
+
     fn write_profile(dir: &Path, filename: &str, contents: &str) -> PathBuf {
         let path = dir.join(filename);
         std::fs::write(&path, contents).unwrap();
@@ -771,7 +876,10 @@ posture = "read-only"
     }
 
     #[test]
-    fn agent_profile_loader_rejects_hidden_provider_policy_fields() {
+    fn agent_profile_loader_accepts_and_round_trips_explicit_provider_field() {
+        // #4093: `provider` is now a first-class, validated field — a Fleet
+        // profile can name its own route explicitly, independent of whatever
+        // provider is active when the profile is later loaded/launched.
         let tmp = TempDir::new().unwrap();
         write_profile(
             tmp.path(),
@@ -783,12 +891,37 @@ model = "deepseek/deepseek-v4-pro"
 "#,
         );
 
+        let profiles = load_agent_profiles_from_dir(tmp.path()).expect("profile loads");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].profile.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            profiles[0].profile.model.as_deref(),
+            Some("deepseek/deepseek-v4-pro")
+        );
+    }
+
+    #[test]
+    fn agent_profile_loader_rejects_unrecognized_provider_name() {
+        // EPIC #2608 explicit-config-only mandate: an unrecognized provider
+        // name is rejected outright at load time — never silently ignored,
+        // and never guessed from `model`.
+        let tmp = TempDir::new().unwrap();
+        write_profile(
+            tmp.path(),
+            "reviewer.toml",
+            r#"
+name = "reviewer"
+provider = "not-a-real-provider"
+model = "some-model"
+"#,
+        );
+
         let err = load_agent_profiles_from_dir(tmp.path())
             .unwrap_err()
             .to_string();
 
         assert!(
-            err.contains("provider") || err.contains("unknown field"),
+            err.contains("not a recognized provider"),
             "unexpected error: {err}"
         );
     }

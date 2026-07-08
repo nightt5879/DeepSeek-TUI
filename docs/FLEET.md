@@ -48,11 +48,15 @@ profiles). `/fleet status` opens the worker-status view; `/subagents` is a
 compatibility shortcut for that status view.
 
 The wizard is progressive: you make one focused choice at a time — a **role**,
-then a **model** (`inherit`, or a concrete model from the active provider) — and
-then review the full posture (model/route,
-permissions, tools, workspace/org scope, and review policy) before doing
-anything. Pressing **Enter** ("start") on the review step inserts a safe
-profile-authoring prompt into the composer; it does not write a file itself.
+then a **model** (`inherit`, or a concrete model from *any configured
+provider*, not only the one the parent session is currently using) — and then
+review the full posture (model/route, permissions, tools, workspace/org
+scope, and review policy) before doing anything. Picking a concrete model
+pins its provider explicitly: the saved profile records both `model` and
+`provider` fields, so the route it names doesn't depend on whichever provider
+happens to be active when the profile is later loaded. Pressing **Enter**
+("start") on the review step previews the exact starter profile TOML inline
+on that same screen; nothing is written until you ratify it.
 
 When a provider is configured, the review step also offers model-assisted
 drafting behind a ratify gate:
@@ -61,9 +65,10 @@ drafting behind a ratify gate:
   draft arrives sanitized and bounded — permissions stay at the **fleet floor**
   (no shell, no trust, approval required) regardless of what the model
   proposes.
-- **Drafting is not ratifying.** The exact rendered TOML preview is shown and
-  nothing is saved until you press **`g`** to ratify (or press `m` again to
-  redraft). Ratifying writes the profile to `.codewhale/agents/<role>`.
+- **Drafting is not ratifying.** The exact rendered TOML preview renders
+  inline on the review step (not in a separate scrollable viewer), so nothing
+  is saved until you press **`g`** or **Enter** to ratify (or press `m` again
+  to redraft). Ratifying writes the profile to `.codewhale/agents/<role>`.
 
 ## Naming: Modes, Workflow, and Fleet
 

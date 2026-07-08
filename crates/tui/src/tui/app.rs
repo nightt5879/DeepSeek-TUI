@@ -2051,6 +2051,12 @@ pub struct App {
             Option<(
                 u64,
                 String,
+                // The `(provider, model)` route the operator picked when they
+                // pressed `m` (#4093). Carried alongside the async draft so the
+                // ratified profile keeps the picked cross-provider route even if
+                // the model draft (which is always `provider: None`) omitted or
+                // changed it. `None` for an `inherit` pick.
+                Option<(String, String)>,
                 Result<Box<crate::fleet::profile::FleetProfileDraft>, String>,
             )>,
         >,

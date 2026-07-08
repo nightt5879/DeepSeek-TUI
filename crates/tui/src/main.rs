@@ -340,6 +340,13 @@ struct ExecArgs {
     /// Override model for this run
     #[arg(long)]
     model: Option<String>,
+    /// Override the provider for this run (e.g. `deepseek`, `openrouter`).
+    /// Non-secret identifier only — credentials still resolve from the
+    /// environment/config. Fleet uses this to launch a worker on its
+    /// profile-pinned provider even when the parent session is on another
+    /// one (#4093).
+    #[arg(long)]
+    provider: Option<String>,
     /// Enable tool-backed agent mode with auto-approvals
     #[arg(long, default_value_t = false)]
     auto: bool,
@@ -1255,6 +1262,29 @@ async fn main() -> Result<()> {
                     if !trimmed.is_empty() {
                         config.base_url = Some(trimmed.to_string());
                     }
+                }
+                // Honour `--provider` (#4093): a Fleet worker whose profile pins
+                // a provider launches on that provider even when the parent
+                // session is on another one. This sets ONLY the non-secret
+                // provider identity (`config.provider`); credentials/base URL
+                // still resolve from the worker's own env/config, and for a
+                // non-DeepSeek provider the legacy root `base_url` above is
+                // ignored by `deepseek_base_url()`. Must precede model
+                // resolution so an `auto`/default model resolves to the
+                // overridden provider's default.
+                if let Some(provider_arg) = args
+                    .provider
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                {
+                    let Some(provider) = crate::config::ApiProvider::parse(provider_arg) else {
+                        bail!(
+                            "Unrecognized --provider {provider_arg:?}. Known providers: {}",
+                            crate::config::ApiProvider::names_hint()
+                        );
+                    };
+                    config.provider = Some(provider.as_str().to_string());
                 }
                 let model = resolve_exec_model(&config, args.model.as_deref());
                 let prompt = join_prompt_parts(&args.prompt);
@@ -9352,6 +9382,34 @@ mod terminal_mode_tests {
 
         assert!(args.json);
         assert_eq!(args.prompt, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn exec_parses_provider_flag_alongside_model() {
+        // #4093: Fleet threads `--provider <id>` so a worker launches on its
+        // profile-pinned provider even when the parent session is elsewhere.
+        let cli = parse_cli(&[
+            "codewhale",
+            "exec",
+            "--provider",
+            "openrouter",
+            "--model",
+            "glm-5.2",
+            "audit",
+        ]);
+        let Some(Commands::Exec(args)) = cli.command else {
+            panic!("expected exec command");
+        };
+
+        assert_eq!(args.provider.as_deref(), Some("openrouter"));
+        assert_eq!(args.model.as_deref(), Some("glm-5.2"));
+        assert_eq!(args.prompt, vec!["audit"]);
+        // The threaded id round-trips through the provider vocabulary the exec
+        // handler validates against — never a model-id sniff (EPIC #2608).
+        assert_eq!(
+            crate::config::ApiProvider::parse(args.provider.as_deref().unwrap()),
+            Some(crate::config::ApiProvider::Openrouter)
+        );
     }
 
     #[test]

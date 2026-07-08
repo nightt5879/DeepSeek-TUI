@@ -715,6 +715,7 @@ mod tests {
                 },
                 loadout: codewhale_config::FleetLoadout::Fast,
                 model: None,
+                provider: None,
                 permissions: codewhale_config::FleetProfilePermissions::default(),
                 delegation: codewhale_config::FleetDelegationHints::default(),
             },

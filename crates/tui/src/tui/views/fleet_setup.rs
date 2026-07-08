@@ -12,6 +12,7 @@
 //! provider/model picker that will churn most of this text. The command entry
 //! (`CmdFleetDescription`) is already localized.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -36,9 +37,9 @@ const PROFILE_DIR: &str = ".codewhale/agents";
 /// A selectable choice in a wizard step: a short identifier `label`, a one-line
 /// `summary`, and a longer `description` shown (wrapped) in the detail pane.
 struct Choice {
-    label: &'static str,
-    summary: &'static str,
-    description: &'static str,
+    label: Cow<'static, str>,
+    summary: Cow<'static, str>,
+    description: Cow<'static, str>,
 }
 
 const CHOICE_LIST_WIDTH: u16 = 22;
@@ -49,54 +50,73 @@ const CHOICE_TWO_COLUMN_MIN_WIDTH: u16 = CHOICE_LIST_WIDTH + CHOICE_DETAIL_MIN_W
 /// so these strings are part of the generated-profile contract.
 const ROLES: [Choice; 8] = [
     Choice {
-        label: "manager",
-        summary: "Plan & split queued work",
-        description: "Coordinates the Fleet run: plans the work, splits it into bounded tasks, and dispatches workers.",
+        label: Cow::Borrowed("manager"),
+        summary: Cow::Borrowed("Plan & split queued work"),
+        description: Cow::Borrowed(
+            "Coordinates the Fleet run: plans the work, splits it into bounded tasks, and dispatches workers.",
+        ),
     },
     Choice {
-        label: "scout",
-        summary: "Read-first research",
-        description: "Research and repo reconnaissance. Reads and summarizes before anything is written.",
+        label: Cow::Borrowed("scout"),
+        summary: Cow::Borrowed("Read-first research"),
+        description: Cow::Borrowed(
+            "Research and repo reconnaissance. Reads and summarizes before anything is written.",
+        ),
     },
     Choice {
-        label: "builder",
-        summary: "Implements bounded changes",
-        description: "Implements changes strictly inside its assigned task scope; writes only what the slice needs.",
+        label: Cow::Borrowed("builder"),
+        summary: Cow::Borrowed("Implements bounded changes"),
+        description: Cow::Borrowed(
+            "Implements changes strictly inside its assigned task scope; writes only what the slice needs.",
+        ),
     },
     Choice {
-        label: "reviewer",
-        summary: "Read-only review",
-        description: "Checks regressions, tests, and diffs. Read-only — it never writes.",
+        label: Cow::Borrowed("reviewer"),
+        summary: Cow::Borrowed("Read-only review"),
+        description: Cow::Borrowed(
+            "Checks regressions, tests, and diffs. Read-only — it never writes.",
+        ),
     },
     Choice {
-        label: "verifier",
-        summary: "Runs focused validation",
-        description: "Runs targeted validation and reports receipts back to the orchestrator.",
+        label: Cow::Borrowed("verifier"),
+        summary: Cow::Borrowed("Runs focused validation"),
+        description: Cow::Borrowed(
+            "Runs targeted validation and reports receipts back to the orchestrator.",
+        ),
     },
     Choice {
-        label: "synthesizer",
-        summary: "Reduce receipts to handoff",
-        description: "Turns worker receipts into bounded handoff state instead of raw transcript replay.",
+        label: Cow::Borrowed("synthesizer"),
+        summary: Cow::Borrowed("Reduce receipts to handoff"),
+        description: Cow::Borrowed(
+            "Turns worker receipts into bounded handoff state instead of raw transcript replay.",
+        ),
     },
     Choice {
-        label: "general",
-        summary: "General-purpose worker",
-        description: "A flexible worker with no specialized posture — use it when the task doesn't fit a named role.",
+        label: Cow::Borrowed("general"),
+        summary: Cow::Borrowed("General-purpose worker"),
+        description: Cow::Borrowed(
+            "A flexible worker with no specialized posture — use it when the task doesn't fit a named role.",
+        ),
     },
     Choice {
-        label: "custom",
-        summary: "Author a profile by hand",
-        description: "Define the posture yourself in a workspace agent TOML profile under .codewhale/agents/.",
+        label: Cow::Borrowed("custom"),
+        summary: Cow::Borrowed("Author a profile by hand"),
+        description: Cow::Borrowed(
+            "Define the posture yourself in a workspace agent TOML profile under .codewhale/agents/.",
+        ),
     },
 ];
 
 /// The `inherit` row shown first in the Model step (#3167). Concrete provider
-/// models follow it, built per-run from the active provider's catalog, so the
-/// user picks a real model instead of an abstract class.
+/// models follow it, built per-run from EVERY configured provider's catalog
+/// (#4093), so the user picks a real route — including cross-provider ones —
+/// instead of an abstract class or only the active provider's models.
 const MODEL_INHERIT: Choice = Choice {
-    label: "inherit",
-    summary: "Same model as now",
-    description: "Reuse the active provider, model, and reasoning for this worker — the operator's route. Recommended default.",
+    label: Cow::Borrowed("inherit"),
+    summary: Cow::Borrowed("Same model as now"),
+    description: Cow::Borrowed(
+        "Reuse the active provider, model, and reasoning for this worker — the operator's route. Recommended default.",
+    ),
 };
 
 #[derive(Debug, Clone)]
@@ -122,9 +142,14 @@ pub struct FleetSetupSnapshot {
     /// config / project), so the wizard can say when a chosen role would
     /// override an existing roster member.
     roster_members: Vec<(String, String)>,
-    /// Concrete model ids selectable for a worker on the active provider,
-    /// shown after `inherit` in the Model step.
-    available_models: Vec<&'static str>,
+    /// `(canonical provider id, model id)` pairs selectable for a worker,
+    /// drawn from ALL configured providers — not only the active one (#4093).
+    /// Shown after `inherit` in the Model step so a Fleet worker can be pinned
+    /// to a route independent of the parent/current provider. The provider id
+    /// is the canonical [`crate::config::ApiProvider::as_str`] identifier
+    /// (e.g. `"deepseek"`), not a display label — see
+    /// [`cross_provider_model_routes`].
+    available_models: Vec<(String, String)>,
 }
 
 impl FleetSetupSnapshot {
@@ -170,9 +195,43 @@ impl FleetSetupSnapshot {
             heartbeat_timeout_secs: config
                 .subagent_heartbeat_timeout_secs_for_provider(app.api_provider),
             roster_members,
-            available_models: crate::config::model_completion_names_for_provider(app.api_provider),
+            available_models: cross_provider_model_routes(config, app.api_provider),
         }
     }
+}
+
+/// Build the `(canonical provider id, model id)` pairs selectable for a worker
+/// from EVERY configured provider — not only the active one (#4093). Fleet
+/// workers can be pinned to a route independent of the parent/current provider,
+/// so the Model step must offer the same cross-provider catalog the model
+/// picker does, instead of the active provider's models alone.
+///
+/// The provider id here is the canonical [`crate::config::ApiProvider::as_str`]
+/// identifier (e.g. `"deepseek"`), not a display label — this is the exact
+/// value persisted into the saved profile's `provider` field and read back by
+/// the loader (#4093), so it must round-trip through `ApiProvider::parse`.
+/// Callers derive a human-readable label from it for UI text.
+fn cross_provider_model_routes(
+    config: &Config,
+    active: crate::config::ApiProvider,
+) -> Vec<(String, String)> {
+    let mut routes = Vec::new();
+    for provider in crate::provider_lake::configured_providers(config, active) {
+        for model in crate::provider_lake::models_for_provider(config, active, provider) {
+            routes.push((provider.as_str().to_string(), model));
+        }
+    }
+    routes
+}
+
+/// Human-readable label for a canonical provider id, falling back to the raw
+/// id verbatim when it doesn't parse (defensive — every id this module hands
+/// out itself comes from [`crate::config::ApiProvider::as_str`], so this only
+/// matters for a foreign/stale id read back from an old snapshot).
+fn provider_display_label(provider_id: &str) -> String {
+    crate::config::ApiProvider::parse(provider_id)
+        .map(|provider| provider.display_name().to_string())
+        .unwrap_or_else(|| provider_id.to_string())
 }
 
 /// Which focused screen of the wizard is showing.
@@ -198,8 +257,21 @@ pub struct FleetSetupView {
     model_draft: Option<Box<crate::fleet::profile::FleetProfileDraft>>,
     /// Display label of the model that authored `model_draft`.
     model_draft_label: Option<String>,
-    /// Model-step rows: `inherit` followed by the active provider's models.
+    /// Exact rendered TOML preview for `model_draft` (header comment + the
+    /// deterministic bytes ratifying would persist). Rendered inline on the
+    /// Review step — never in a separate pager (#4093): a standalone pager
+    /// view owns its own `g`/`G` scroll bindings, which silently swallowed
+    /// the ratify keypress and left users unable to save without first
+    /// pressing Esc. Keeping the preview and the ratify control in the same
+    /// view means the footer's `g`/Enter hints are never a lie.
+    model_draft_preview: Option<String>,
+    /// Model-step rows: `inherit` followed by one row per concrete model from
+    /// every configured provider (#4093).
     model_choices: Vec<Choice>,
+    /// `(provider, model)` aligned with `model_choices`. Index 0 is `inherit`
+    /// (the active route); later rows pin a concrete, possibly cross-provider
+    /// route. Drives the review/copy so a pinned route names its own provider.
+    model_routes: Vec<(String, String)>,
 }
 
 impl FleetSetupView {
@@ -210,12 +282,21 @@ impl FleetSetupView {
 
     fn from_snapshot(snapshot: FleetSetupSnapshot) -> Self {
         let mut model_choices = vec![MODEL_INHERIT];
-        for &name in &snapshot.available_models {
+        // `inherit` (index 0) maps to the active route; every later row pins a
+        // concrete (provider, model) drawn from all configured providers.
+        let mut model_routes = vec![(snapshot.provider.clone(), snapshot.model.clone())];
+        for (provider, model) in &snapshot.available_models {
+            let provider_label = provider_display_label(provider);
             model_choices.push(Choice {
-                label: name,
-                summary: "Pin this model",
-                description: "Route this worker to this specific model on the active provider instead of inheriting the session route.",
+                label: Cow::Owned(model.clone()),
+                summary: Cow::Owned(format!("Pin this model ({provider_label})")),
+                description: Cow::Owned(format!(
+                    "Route this worker to {model} on {provider_label} instead of inheriting the session route."
+                )),
             });
+            // Canonical provider id (not the display label above) — this is
+            // what gets persisted into the saved profile (#4093).
+            model_routes.push((provider.clone(), model.clone()));
         }
         Self {
             snapshot,
@@ -225,18 +306,36 @@ impl FleetSetupView {
             review_scroll: 0,
             model_draft: None,
             model_draft_label: None,
+            model_draft_preview: None,
             model_choices,
+            model_routes,
         }
     }
 
-    /// Install a sanitized, bounded model draft and return the preview the
-    /// host must open in the same breath — that preview is the exact TOML the
-    /// ratify keypress would persist.
+    /// Install a sanitized, bounded model draft. The exact TOML preview
+    /// (returned here for the caller's status message) renders inline on the
+    /// Review step — not in a separate pager — so the footer's `g`/Enter
+    /// ratify hints stay true the instant the draft lands (#4093).
     pub fn install_model_draft(
         &mut self,
-        draft: Box<crate::fleet::profile::FleetProfileDraft>,
+        mut draft: Box<crate::fleet::profile::FleetProfileDraft>,
         model_label: String,
+        picked_route: Option<(String, String)>,
     ) -> (String, String) {
+        // Re-inject the route the operator picked at `m`-press time (#4093). A
+        // model draft comes from `from_untrusted_json`, which hard-sets
+        // `provider: None` and echoes whatever `model` the model happened to
+        // emit — so ratifying it verbatim would drop a concrete cross-provider
+        // pick and persist the ambiguous, provider-scoped profile #4093 exists
+        // to prevent. Pinning BOTH fields from the CARRIED route keeps the route
+        // the user actually chose (the model only authored the prose), and is
+        // immune to the selection changing while the async draft is in flight.
+        // `inherit` (a `None` route) leaves `model`/`provider` untouched,
+        // matching the deterministic Enter path.
+        if let Some((provider, model)) = picked_route {
+            draft.model = Some(model);
+            draft.provider = Some(provider);
+        }
         let (title, header) = match self.snapshot.locale {
             crate::localization::Locale::ZhHans => (
                 format!("Fleet 配置 — 由 {model_label} 起草（按 g 批准）"),
@@ -256,12 +355,14 @@ impl FleetSetupView {
         let content = format!("{header}{}", draft.render_toml());
         self.model_draft = Some(draft);
         self.model_draft_label = Some(model_label);
+        self.model_draft_preview = Some(content.clone());
+        self.review_scroll = 0;
         (title, content)
     }
 
     /// The planner role chosen (drives the profile file name and `role_hint`).
-    fn selected_role(&self) -> &'static str {
-        ROLES[self.role_idx.min(ROLES.len() - 1)].label
+    fn selected_role(&self) -> String {
+        ROLES[self.role_idx.min(ROLES.len() - 1)].label.to_string()
     }
 
     /// Copy note when the chosen role would override an existing roster
@@ -276,13 +377,20 @@ impl FleetSetupView {
             .map(|(id, origin)| format!("Overrides the {origin} '{id}' roster member."))
     }
 
-    /// The concrete model chosen for this worker, or `None` for `inherit`
-    /// (reuse the session route). Written to the profile `model` field.
+    /// The concrete model chosen for this worker, written to the profile
+    /// `model` field. `None` means `inherit` (reuse the session route).
     fn selected_model(&self) -> Option<String> {
-        match self.model_choices.get(self.model_idx) {
-            Some(choice) if choice.label != "inherit" => Some(choice.label.to_string()),
-            _ => None,
+        self.selected_route().map(|(_, model)| model)
+    }
+
+    /// The concrete `(provider, model)` chosen for this worker — a pinned route
+    /// independent of the parent/current provider (#4093) — or `None` when
+    /// `inherit` is selected (reuse the session route).
+    fn selected_route(&self) -> Option<(String, String)> {
+        if self.model_idx == 0 {
+            return None;
         }
+        self.model_routes.get(self.model_idx).cloned()
     }
 
     /// Number of selectable rows on the current step (0 on the review step).
@@ -312,6 +420,7 @@ impl FleetSetupView {
     fn discard_model_draft(&mut self) {
         self.model_draft = None;
         self.model_draft_label = None;
+        self.model_draft_preview = None;
     }
 
     fn move_down(&mut self) {
@@ -361,42 +470,50 @@ impl FleetSetupView {
         }
     }
 
+    /// Preview the exact starter profile TOML the next ratify keypress would
+    /// persist. Renders inline within the Review step's own scrollable pane —
+    /// deliberately NOT via `ViewEvent::OpenTextPager` (#4093): a standalone
+    /// pager view has its own `g`/`G` scroll bindings and would swallow the
+    /// ratify keypress, forcing an Esc-then-g round trip to actually save.
     fn preview_starter_profile_action(&mut self) -> ViewAction {
         let draft = self.starter_profile_draft();
-        let (title, header) = match self.snapshot.locale {
-            crate::localization::Locale::ZhHans => (
-                "Fleet 配置 — 起始草案（Enter/g 批准）".to_string(),
-                format!(
-                    "# .codewhale/agents/{}\n# CodeWhale 根据当前角色和模型选择确定性渲染。\n# 权限保持在 Fleet 底线：无 shell、无 trust、需审批。\n# 在向导中按 Enter 或 g 之前不会保存任何内容。\n\n",
-                    draft.file_name()
-                ),
+        let header = match self.snapshot.locale {
+            crate::localization::Locale::ZhHans => format!(
+                "# .codewhale/agents/{}\n# CodeWhale 根据当前角色和模型选择确定性渲染。\n# 权限保持在 Fleet 底线：无 shell、无 trust、需审批。\n# 在向导中按 Enter 或 g 之前不会保存任何内容。\n\n",
+                draft.file_name()
             ),
-            _ => (
-                "Fleet profile — starter draft (Enter/g ratifies)".to_string(),
-                format!(
-                    "# .codewhale/agents/{}\n# Deterministic starter profile rendered by CodeWhale from your role/model choices.\n# Permissions stay at the fleet floor: no shell, no trust, approval required.\n# Nothing is saved until you press Enter or g in the wizard.\n\n",
-                    draft.file_name()
-                ),
+            _ => format!(
+                "# .codewhale/agents/{}\n# Deterministic starter profile rendered by CodeWhale from your role/model choices.\n# Permissions stay at the fleet floor: no shell, no trust, approval required.\n# Nothing is saved until you press Enter or g in the wizard.\n\n",
+                draft.file_name()
             ),
         };
-        let content = format!("{header}{}", draft.render_toml());
+        self.model_draft_preview = Some(format!("{header}{}", draft.render_toml()));
         self.model_draft = Some(draft);
         self.model_draft_label = Some("CodeWhale starter".to_string());
-        ViewAction::Emit(ViewEvent::OpenTextPager { title, content })
+        self.review_scroll = 0;
+        ViewAction::None
     }
 
     /// Build a deterministic starter profile for the current role/model
     /// selection. The same ratify event persists this as model-drafted profiles,
     /// so duplicate-id checks and atomic writes stay in one host path.
+    ///
+    /// `provider` is seeded from whatever the user actually picked in the
+    /// Model step (#4093) — a concrete route names its own provider
+    /// explicitly, so the saved profile is never ambiguously scoped to
+    /// whatever provider happens to be active at launch time. `inherit`
+    /// carries no provider, matching its `model: None`.
     fn starter_profile_draft(&self) -> Box<crate::fleet::profile::FleetProfileDraft> {
         let role = &ROLES[self.role_idx.min(ROLES.len() - 1)];
+        let route = self.selected_route();
         Box::new(crate::fleet::profile::FleetProfileDraft {
-            id: profile_file_stem(role.label),
+            id: profile_file_stem(&role.label),
             display_name: Some(role.label.to_string()),
             description: Some(format!("{} - {}", role.summary, role.description)),
             role_hint: role.label.to_string(),
             model_class_hint: None,
-            model: self.selected_model(),
+            model: route.as_ref().map(|(_, model)| model.clone()),
+            provider: route.map(|(provider, _)| provider),
             instructions: Some(format!(
                 "Role: {}. Work only within the assigned Fleet slice. Report concise evidence and stop when the assignment is complete. Do not widen permissions, trust, route configuration, or topology.",
                 role.label
@@ -459,11 +576,18 @@ impl ModalView for FleetSetupView {
                 ViewAction::None
             }
             KeyCode::Char('m') if self.step == Step::Review && self.snapshot.provider_ready => {
+                let route = self.selected_route();
                 ViewAction::Emit(ViewEvent::FleetProfileModelDraftRequested {
-                    role: self.selected_role().to_string(),
-                    model: self
-                        .selected_model()
+                    role: self.selected_role(),
+                    model: route
+                        .as_ref()
+                        .map(|(_, model)| model.clone())
                         .unwrap_or_else(|| "inherit".to_string()),
+                    // Carry the picked provider so the redrafted profile keeps
+                    // the cross-provider route (#4093). `install_model_draft`
+                    // re-injects it authoritatively from the wizard's current
+                    // selection, but the event stays self-describing.
+                    provider: route.map(|(provider, _)| provider),
                     locale: self.snapshot.locale,
                 })
             }
@@ -590,6 +714,10 @@ impl FleetSetupView {
                 "Choose a model",
                 "Pick this worker's model, or inherit your current route.",
             ),
+            Step::Review if self.model_draft.is_some() => (
+                "Ratify the draft",
+                "Exact TOML shown below. Press Enter or g to ratify, m to redraft.",
+            ),
             Step::Review => (
                 "Review & start",
                 "Confirm the posture below, preview exact TOML, then ratify to save.",
@@ -611,9 +739,18 @@ impl FleetSetupView {
     }
 
     fn render_review(&self, area: Rect, buf: &mut Buffer) {
+        // A ratify-ready draft is on screen: show the exact TOML preview
+        // inline, scrolled by the same `review_scroll` state, so `g`/Enter in
+        // THIS view's own `handle_key` ratify it directly — no separate pager
+        // in the way to swallow the keypress (#4093).
+        if let Some(preview) = self.model_draft_preview.as_deref() {
+            render_scrollable_text(area, buf, preview, self.review_scroll);
+            return;
+        }
+
         let role = &ROLES[self.role_idx.min(ROLES.len() - 1)];
         let (profile_value, _) = profile_file_status(&self.snapshot.workspace);
-        let file_stem = profile_file_stem(role.label);
+        let file_stem = profile_file_stem(&role.label);
         let token_budget = self
             .snapshot
             .token_budget
@@ -644,8 +781,13 @@ impl FleetSetupView {
         section(
             &mut lines,
             "Model",
-            match self.selected_model() {
-                Some(model) => format!("{model}  ·  provider {}", self.snapshot.provider),
+            // The picked route's OWN provider, not the parent/current
+            // session's — a cross-provider pin must never be misreported as
+            // running on the active provider (#4093).
+            match self.selected_route() {
+                Some((provider, model)) => {
+                    format!("{model}  ·  provider {}", provider_display_label(&provider))
+                }
                 None => format!(
                     "inherit  ·  route {} / {}, reasoning {}",
                     self.snapshot.provider, self.snapshot.model, self.snapshot.reasoning
@@ -715,6 +857,28 @@ impl FleetSetupView {
     }
 }
 
+/// Render wrapped, line-scrolled plain text (the ratify-ready draft TOML
+/// preview) into `area`, clamping `scroll` to the real wrapped-row bound the
+/// same way [`FleetSetupView::render_review`]'s summary does — an
+/// over-estimate of wrapped height is harmless (scroll clamps at the end).
+fn render_scrollable_text(area: Rect, buf: &mut Buffer, text: &str, scroll: usize) {
+    let lines: Vec<Line> = text
+        .lines()
+        .map(|line| Line::from(line.to_string()))
+        .collect();
+    let wrap_width = usize::from(area.width).max(1);
+    let visual_rows: usize = lines
+        .iter()
+        .map(|line| line.width().div_ceil(wrap_width).max(1))
+        .sum();
+    let max_scroll = visual_rows.saturating_sub(usize::from(area.height).max(1));
+    let scroll = scroll.min(max_scroll);
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .scroll((scroll as u16, 0))
+        .render(area, buf);
+}
+
 /// Render a wizard choice step: a list of selectable identifiers on the left and
 /// a wrapped detail pane (summary + description + context) on the right. Stacks
 /// vertically when the body is too narrow for two columns so nothing truncates.
@@ -772,12 +936,12 @@ fn render_choice_step(
     let choice = &choices[selected.min(choices.len().saturating_sub(1))];
     let mut detail_lines: Vec<Line> = vec![
         Line::from(Span::styled(
-            choice.summary,
+            choice.summary.clone(),
             Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
         )),
         Line::from(""),
         Line::from(Span::styled(
-            choice.description,
+            choice.description.clone(),
             Style::default().fg(palette::TEXT_PRIMARY),
         )),
     ];
@@ -869,7 +1033,10 @@ mod tests {
                 .iter()
                 .map(|member| (member.id.to_lowercase(), member.origin.to_string()))
                 .collect(),
-            available_models: vec!["deepseek-v4-pro", "deepseek-v4-flash"],
+            available_models: vec![
+                ("deepseek".to_string(), "deepseek-v4-pro".to_string()),
+                ("deepseek".to_string(), "deepseek-v4-flash".to_string()),
+            ],
         }
     }
 
@@ -903,6 +1070,7 @@ mod tests {
         let ViewAction::Emit(ViewEvent::FleetProfileModelDraftRequested {
             role,
             model,
+            provider,
             locale,
         }) = action
         else {
@@ -910,7 +1078,82 @@ mod tests {
         };
         assert!(!role.is_empty());
         assert!(!model.is_empty());
+        // Default selection is `inherit` (model_idx 0), which carries no
+        // concrete provider route.
+        assert_eq!(provider, None);
         assert_eq!(locale, crate::localization::Locale::En);
+    }
+
+    #[test]
+    fn m_redraft_preserves_a_cross_provider_pick_regression_4093() {
+        // #4093 BLOCKER 2 regression: a cross-provider route pick followed by an
+        // `m` model-assisted redraft must STILL persist the picked provider. A
+        // model draft comes from `from_untrusted_json`, which hard-sets
+        // `provider: None` (and can echo any model). Without re-injection the
+        // ratified profile would carry `model` with no `provider` — the exact
+        // ambiguous, provider-scoped profile #4093 removes.
+        //
+        // The active/session provider is DeepSeek; the picked route is a
+        // GLM model on Zai — a genuinely different provider than the parent.
+        let mut snap = snapshot();
+        snap.provider = "DeepSeek".to_string();
+        snap.model = "deepseek-v4-pro".to_string();
+        snap.available_models = vec![("zai".to_string(), "glm-5.2".to_string())];
+        let mut view = FleetSetupView::from_snapshot(snap);
+
+        // Role step: keep the first role. Model step: inherit(0), then the one
+        // cross-provider row (1) -> pick it. Then advance to Review.
+        view.handle_key(key(KeyCode::Enter)); // Role -> Model
+        view.handle_key(key(KeyCode::Down)); // -> the zai/glm-5.2 row
+        assert_eq!(
+            view.selected_route(),
+            Some(("zai".to_string(), "glm-5.2".to_string()))
+        );
+        view.handle_key(key(KeyCode::Enter)); // Model -> Review
+
+        // `m` requests a draft and carries the picked cross-provider route.
+        let action = view.handle_key(key(KeyCode::Char('m')));
+        let ViewAction::Emit(ViewEvent::FleetProfileModelDraftRequested {
+            model, provider, ..
+        }) = action
+        else {
+            panic!("expected model draft request");
+        };
+        assert_eq!(model, "glm-5.2");
+        assert_eq!(provider.as_deref(), Some("zai"));
+
+        // The host reconstructs the picked route from the event exactly as
+        // `handle_fleet_profile_model_draft` does, and carries it to
+        // `install_model_draft` (immune to the selection changing mid-draft).
+        let picked_route = provider.map(|provider| (provider, model.clone()));
+
+        // The model returns a draft that (as always) has provider: None — the
+        // untrusted gate strips any provider a model tries to smuggle.
+        let drafted = sample_draft();
+        assert_eq!(drafted.provider, None);
+
+        // Installing it re-injects the picked route, so the ratified draft keeps
+        // BOTH the provider and the model the user actually chose.
+        let (_title, content) =
+            view.install_model_draft(drafted, "GLM-5.2".to_string(), picked_route);
+        let ratified = view.model_draft.as_deref().expect("draft installed");
+        assert_eq!(ratified.provider.as_deref(), Some("zai"));
+        assert_eq!(ratified.model.as_deref(), Some("glm-5.2"));
+
+        // The rendered TOML the ratify keypress would persist names the provider
+        // explicitly — never a provider-scoped ambiguity.
+        assert!(content.contains("provider = \"zai\""), "{content}");
+        assert!(content.contains("model = \"glm-5.2\""), "{content}");
+
+        // And ratifying commits exactly that route.
+        let action = view.handle_key(key(KeyCode::Char('g')));
+        let ViewAction::EmitAndClose(ViewEvent::FleetProfileDraftCommitRequested { draft }) =
+            action
+        else {
+            panic!("expected ratify commit event");
+        };
+        assert_eq!(draft.provider.as_deref(), Some("zai"));
+        assert_eq!(draft.model.as_deref(), Some("glm-5.2"));
     }
 
     #[test]
@@ -924,7 +1167,8 @@ mod tests {
             ViewAction::None
         ));
 
-        let (title, content) = view.install_model_draft(sample_draft(), "GLM-5.2".to_string());
+        let (title, content) =
+            view.install_model_draft(sample_draft(), "GLM-5.2".to_string(), None);
         assert!(title.contains("GLM-5.2"));
         assert!(content.contains("id = \"reviewer\""), "{content}");
         assert!(content.contains("Nothing is saved until"), "{content}");
@@ -942,7 +1186,7 @@ mod tests {
     fn changing_answers_discards_a_stale_draft() {
         let mut view = FleetSetupView::from_snapshot(snapshot());
         to_review(&mut view);
-        let _ = view.install_model_draft(sample_draft(), "GLM-5.2".to_string());
+        let _ = view.install_model_draft(sample_draft(), "GLM-5.2".to_string(), None);
         assert!(view.model_draft.is_some());
 
         // Back to the role step and change the selection: the draft no
@@ -993,7 +1237,7 @@ mod tests {
     }
 
     #[test]
-    fn start_on_review_previews_and_ratifies_starter_profile_for_selection() {
+    fn start_on_review_previews_inline_and_ratifies_starter_profile_for_selection() {
         let mut view = FleetSetupView::from_snapshot(snapshot());
         // Role: manager(0) scout(1) builder(2) -> builder.
         view.handle_key(key(KeyCode::Down));
@@ -1003,27 +1247,35 @@ mod tests {
         view.handle_key(key(KeyCode::Down));
         view.handle_key(key(KeyCode::Enter)); // -> Review
 
+        // Start previews inline (#4093: no separate pager to steal the next
+        // ratify keypress) — the action stays `None` and the draft/preview
+        // land directly on this same view.
         let action = view.handle_key(key(KeyCode::Enter)); // Start
-        match action {
-            ViewAction::Emit(ViewEvent::OpenTextPager { title, content }) => {
-                assert!(title.contains("starter draft"));
-                assert!(content.contains("# .codewhale/agents/builder.toml"));
-                assert!(content.contains("id = \"builder\""));
-                assert!(content.contains("role_hint = \"builder\""));
-                assert!(content.contains("model = \"deepseek-v4-pro\""));
-                assert!(content.contains("Nothing is saved until"));
-                for forbidden in ["provider", "base_url", "api_key"] {
-                    assert!(
-                        !content.contains(forbidden),
-                        "starter profile must not carry {forbidden}: {content}"
-                    );
-                }
-            }
-            other => panic!("expected starter profile preview, got {other:?}"),
-        }
+        assert!(matches!(action, ViewAction::None));
         assert!(view.model_draft.is_some());
+        let content = view
+            .model_draft_preview
+            .as_deref()
+            .expect("preview installed inline");
+        assert!(content.contains("# .codewhale/agents/builder.toml"));
+        assert!(content.contains("id = \"builder\""));
+        assert!(content.contains("role_hint = \"builder\""));
+        assert!(content.contains("model = \"deepseek-v4-pro\""));
+        // A concrete cross-provider route pin names its own provider
+        // explicitly (#4093) — the saved profile must not be ambiguously
+        // scoped to whatever provider happens to be active at launch time.
+        assert!(content.contains("provider = \"deepseek\""), "{content}");
+        assert!(content.contains("Nothing is saved until"));
+        for forbidden in ["base_url", "api_key"] {
+            assert!(
+                !content.contains(forbidden),
+                "starter profile must not carry {forbidden}: {content}"
+            );
+        }
 
-        let action = view.handle_key(key(KeyCode::Enter)); // ratify previewed draft
+        // `g` ratifies directly from this same view — no Esc-then-g round
+        // trip through a separate pager required.
+        let action = view.handle_key(key(KeyCode::Char('g')));
         let ViewAction::EmitAndClose(ViewEvent::FleetProfileDraftCommitRequested { draft }) =
             action
         else {
@@ -1032,6 +1284,21 @@ mod tests {
         assert_eq!(draft.id, "builder");
         assert_eq!(draft.role_hint, "builder");
         assert_eq!(draft.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(draft.provider.as_deref(), Some("deepseek"));
+    }
+
+    #[test]
+    fn inherit_selection_starter_draft_carries_no_provider() {
+        // `inherit` (no concrete route pin) must never carry a provider —
+        // there's no explicit route to name (#4093).
+        let mut view = FleetSetupView::from_snapshot(snapshot());
+        to_review(&mut view);
+        view.handle_key(key(KeyCode::Enter)); // Start -> preview inherit draft
+        let draft = view.model_draft.as_deref().expect("draft installed");
+        assert_eq!(draft.model, None);
+        assert_eq!(draft.provider, None);
+        let content = view.model_draft_preview.as_deref().unwrap();
+        assert!(!content.contains("provider"), "{content}");
     }
 
     #[test]

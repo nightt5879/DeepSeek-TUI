@@ -2104,10 +2104,10 @@ async fn run_event_loop(
             .try_lock()
             .ok()
             .and_then(|mut guard| guard.take());
-        if let Some((draft_gen, model_label, outcome)) = fleet_draft_delivery
+        if let Some((draft_gen, model_label, picked_route, outcome)) = fleet_draft_delivery
             && draft_gen == app.current_draft_gen()
         {
-            deliver_fleet_draft_result(app, model_label, outcome, app.ui_locale);
+            deliver_fleet_draft_result(app, model_label, picked_route, outcome, app.ui_locale);
         }
 
         // Poll the constitution model-draft cell (same background pattern).
@@ -5711,8 +5711,16 @@ async fn handle_fleet_profile_model_draft(
     config: &Config,
     role: String,
     model: String,
+    provider: Option<String>,
     locale: crate::localization::Locale,
 ) {
+    // The route the operator actually picked at `m`-press time (#4093). A
+    // model draft always comes back `provider: None` (the untrusted gate
+    // strips any provider), so this captured `(provider, model)` is what the
+    // ratified profile is pinned to — immune to the model omitting/altering
+    // the route AND to the selection changing while the draft is in flight.
+    // `None` for an `inherit` pick (no concrete route to keep).
+    let picked_route = provider.map(|provider| (provider, model.clone()));
     // Do NOT await the network call on the event loop — that parks the whole
     // TUI for up to the timeout (#3757 review). Spawn it into the shared
     // fleet_draft_cell and let the loop poll + deliver the result, keeping
@@ -5725,6 +5733,7 @@ async fn handle_fleet_profile_model_draft(
             deliver_fleet_draft_result(
                 app,
                 model_label.clone(),
+                picked_route.clone(),
                 Err(format!("provider not ready: {err:#}")),
                 locale,
             );
@@ -5776,18 +5785,24 @@ async fn handle_fleet_profile_model_draft(
             Ok(result) => result,
         };
         if let Ok(mut guard) = cell.lock() {
-            *guard = Some((request_gen, spawn_label, outcome));
+            *guard = Some((request_gen, spawn_label, picked_route, outcome));
         }
     });
 }
 
 /// Install a completed fleet-profile draft into the wizard (if it is still on
-/// top) and open its preview, or surface a failure. Called from the event
-/// loop when the background draft lands, and directly on the pre-spawn
+/// top), or surface a failure. Called from the event loop when the
+/// background draft lands, and directly on the pre-spawn
 /// provider-construction failure.
+///
+/// The preview renders inline on the wizard's own Review step — deliberately
+/// NOT in a separate pager (#4093): a standalone pager view owns its own
+/// `g`/`G` scroll bindings and would swallow the ratify keypress, forcing an
+/// Esc-then-g round trip before the user could actually save.
 fn deliver_fleet_draft_result(
     app: &mut App,
     model_label: String,
+    picked_route: Option<(String, String)>,
     outcome: Result<Box<crate::fleet::profile::FleetProfileDraft>, String>,
     locale: crate::localization::Locale,
 ) {
@@ -5796,19 +5811,21 @@ fn deliver_fleet_draft_result(
             if app.view_stack.top_kind() == Some(ModalKind::FleetSetup)
                 && let Some(mut boxed) = app.view_stack.pop()
             {
-                let preview = boxed
+                let installed = boxed
                     .as_any_mut()
                     .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>()
-                    .map(|wizard| wizard.install_model_draft(draft, model_label.clone()));
+                    .map(|wizard| {
+                        wizard.install_model_draft(draft, model_label.clone(), picked_route.clone())
+                    })
+                    .is_some();
                 app.view_stack.push_boxed(boxed);
-                if let Some((title, content)) = preview {
-                    open_text_pager(app, title, content);
+                if installed {
                     app.status_message = Some(match locale {
                         crate::localization::Locale::ZhHans => {
-                            format!("{model_label} 已起草配置。请查看 TOML，然后按 g 批准。")
+                            format!("{model_label} 已起草配置。请查看下方 TOML，然后按 g 批准。")
                         }
                         _ => format!(
-                            "{model_label} drafted the profile. Review the TOML, then press g to ratify."
+                            "{model_label} drafted the profile. Review the TOML below, then press g to ratify."
                         ),
                     });
                 }
@@ -10353,9 +10370,10 @@ async fn handle_view_events(
             ViewEvent::FleetProfileModelDraftRequested {
                 role,
                 model,
+                provider,
                 locale,
             } => {
-                handle_fleet_profile_model_draft(app, config, role, model, locale).await;
+                handle_fleet_profile_model_draft(app, config, role, model, provider, locale).await;
             }
             ViewEvent::FleetRosterOpenSetupRequested => {
                 // The roster view hands off to the authoring wizard (same
@@ -10417,6 +10435,36 @@ async fn handle_view_events(
                             "Profile id `{}` is already used by {}; redraft with a different role or remove the old file first.",
                             draft.id,
                             existing.source.display()
+                        )
+                    });
+                    app.needs_redraw = true;
+                    continue;
+                }
+                // #4093 AC #5: a profile may only pin a provider the operator
+                // has actually configured/credentialed. The picker already
+                // offers models only from configured providers, but a
+                // model-drafted or hand-edited route (or credentials removed
+                // after the pick) could still name an unconfigured one — which
+                // would fail loudly at launch. Catch it at save time with a
+                // clear message, reusing the SAME predicate the picker uses.
+                if let Some(provider_id) = draft.provider.as_deref()
+                    && let Some(provider) = crate::config::ApiProvider::parse(provider_id)
+                    && !crate::config::provider_is_configured_for_active(
+                        config,
+                        provider,
+                        app.api_provider,
+                    )
+                {
+                    let zh = app.ui_locale == crate::localization::Locale::ZhHans;
+                    app.status_message = Some(if zh {
+                        format!(
+                            "配置指定的 provider `{provider_id}` 尚未配置凭据（{}）；请先在 /provider 中设置，再保存。",
+                            provider.env_vars_label()
+                        )
+                    } else {
+                        format!(
+                            "Profile pins provider `{provider_id}`, which has no configured credentials ({}); set it up in /provider before saving.",
+                            provider.env_vars_label()
                         )
                     });
                     app.needs_redraw = true;

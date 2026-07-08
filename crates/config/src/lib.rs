@@ -1146,6 +1146,20 @@ pub struct FleetProfile {
     /// validates the executable provider/model/wire-model decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Optional explicit provider id for this profile's model (#4093).
+    ///
+    /// Present only when the profile was created against a specific,
+    /// credential-checked provider (e.g. via the Fleet setup model picker),
+    /// so a worker can be pinned to a route independent of the parent/current
+    /// session provider. `None` means "no route pin" (inherit), matching
+    /// `model: None`; a profile must never carry `provider` without `model`.
+    ///
+    /// EPIC #2608 explicit-config-only mandate: this field is the ONLY
+    /// authority for the profile's provider. It is never inferred by sniffing
+    /// a substring/prefix out of `model` — callers that need the provider for
+    /// this profile must read this field, not guess from the model id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// Permission defaults requested by the profile.
     #[serde(default)]
     pub permissions: FleetProfilePermissions,
