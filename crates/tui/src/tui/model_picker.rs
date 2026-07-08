@@ -397,7 +397,14 @@ impl ModelPickerView {
         let visible_height = usize::from(area.height.saturating_sub(2));
         let (start, end) = visible_row_window(selected, rows.len(), visible_height);
         let title = if rows.len() > visible_height && visible_height > 0 {
-            format!(" {title} {}-{}/{} ", start + 1, end, rows.len())
+            if start + 1 == end {
+                // A scrollable pane whose visible window spans exactly one row
+                // renders a single position (`Model 2/3`), not a degenerate
+                // `2-2/3` range (#3995).
+                format!(" {title} {}/{} ", end, rows.len())
+            } else {
+                format!(" {title} {}-{}/{} ", start + 1, end, rows.len())
+            }
         } else {
             format!(" {title} ")
         };
@@ -2256,5 +2263,53 @@ mod tests {
                 .map(|effort| effort.short_label())
                 .collect();
         assert_eq!(labels, vec!["auto", "off", "high", "max"]);
+    }
+
+    #[test]
+    fn single_visible_row_pane_title_shows_single_position_not_degenerate_range() {
+        let (app, config, _lock) = create_test_app();
+        let view = ModelPickerView::new(&app, &config);
+
+        // Three rows in a pane only tall enough to show one inner row (height 3
+        // leaves 1 row after the top/bottom border). The scrollable-title branch
+        // must render a single position (`Model 2/3`), not a degenerate `2-2/3`
+        // range (#3995).
+        let rows: Vec<(String, String)> = (1..=3)
+            .map(|n| (format!("model-{n}"), String::new()))
+            .collect();
+        let area = Rect::new(0, 0, 40, 3);
+        let mut buf = Buffer::empty(area);
+        view.render_pane(area, &mut buf, "Model", rows, 1, false);
+
+        let title = buffer_row_text(&buf, area, area.y);
+        assert!(
+            title.contains("Model 2/3"),
+            "single visible row should show a single position: {title:?}"
+        );
+        assert!(
+            !title.contains("2-2/3"),
+            "single visible row must not render a degenerate range: {title:?}"
+        );
+    }
+
+    #[test]
+    fn multi_visible_row_pane_title_keeps_real_range() {
+        let (app, config, _lock) = create_test_app();
+        let view = ModelPickerView::new(&app, &config);
+
+        // Four rows in a pane tall enough for two inner rows (height 4). The
+        // visible window spans two rows, so the title keeps a real range.
+        let rows: Vec<(String, String)> = (1..=4)
+            .map(|n| (format!("model-{n}"), String::new()))
+            .collect();
+        let area = Rect::new(0, 0, 40, 4);
+        let mut buf = Buffer::empty(area);
+        view.render_pane(area, &mut buf, "Thinking", rows, 2, false);
+
+        let title = buffer_row_text(&buf, area, area.y);
+        assert!(
+            title.contains("Thinking 2-3/4"),
+            "multi visible row should render a real range: {title:?}"
+        );
     }
 }
