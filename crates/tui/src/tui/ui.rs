@@ -3635,6 +3635,13 @@ async fn run_event_loop(
             app.accrue_subagent_cost_estimate(pending_bg_cost);
             app.needs_redraw = true;
         }
+        // Drain completed file-tree walks (initial build / expands) so the
+        // spliced children repaint without waiting for an input event (#3900).
+        if let Some(tree) = app.file_tree.as_mut()
+            && tree.poll_background()
+        {
+            app.needs_redraw = true;
+        }
         // Expire the "Press Ctrl+C again to quit" prompt silently after its
         // window. Triggers a redraw if the prompt was visible.
         app.tick_quit_armed();
