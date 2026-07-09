@@ -4233,6 +4233,47 @@ async fn implementer_delegation_allows_suggest_write_without_parent_auto_approve
 }
 
 #[tokio::test]
+async fn workflow_accept_edits_allows_general_file_write_without_parent_auto_approve() {
+    // Workflow-spawned children accept Suggest-level file edits for write-capable
+    // postures (including general) while shell tools still require parent auto-approve.
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().to_path_buf();
+    let mut runtime = stub_runtime();
+    runtime.context = ToolContext::new(workspace.clone());
+    runtime.context.auto_approve = false;
+    runtime.accept_edits = true;
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::General,
+        None,
+        Arc::new(Mutex::new(TodoList::new())),
+        Arc::new(Mutex::new(PlanState::default())),
+    );
+
+    let result = registry
+        .execute(
+            "agent_test",
+            "write_file",
+            json!({"path": "workflow_edit.txt", "content": "from workflow"}),
+        )
+        .await
+        .expect("workflow accept_edits should allow general write");
+    let written =
+        std::fs::read_to_string(workspace.join("workflow_edit.txt")).expect("file should exist");
+    assert_eq!(written, "from workflow");
+    assert!(!result.contains("requires approval"), "{result}");
+
+    let err = registry
+        .execute("agent_test", "exec_shell", json!({"command": "echo hi"}))
+        .await
+        .expect_err("shell must still require parent auto-approve");
+    assert!(
+        err.to_string().contains("requires approval"),
+        "unexpected: {err}"
+    );
+}
+
+#[tokio::test]
 async fn general_delegation_still_blocks_suggest_write_without_parent_auto_approve() {
     let tmp = tempdir().expect("tempdir");
     let workspace = tmp.path().to_path_buf();
@@ -4693,6 +4734,7 @@ fn stub_runtime() -> SubAgentRuntime {
         fleet_roster: std::sync::Arc::new(crate::fleet::roster::FleetRoster::built_ins_only()),
         context,
         allow_shell: true,
+        accept_edits: false,
         agent_tool_surface_options: AgentToolSurfaceOptions::new(ShellPolicy::Full),
         worker_profile: WorkerRuntimeProfile::for_role(SubAgentType::General),
         event_tx: None,

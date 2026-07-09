@@ -1132,9 +1132,11 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 # # Require an approval card before write/shell/network/high-budget launches.
 # require_approval_for_writes = true
 # # Soft cap on children admitted by automatic launch (larger plans ask first).
-# auto_start_child_limit = 8
-# # Hard ceiling on children in one Workflow run.
-# max_children = 64
+# auto_start_child_limit = 16
+# # Hard ceiling on agents in one Workflow run (matches VM lifetime cap).
+# max_children = 1000
+# # Maximum concurrently live agents inside one run (others wait for a slot).
+# max_concurrent = 16
 # # Maximum nested Workflow / child-orchestration depth.
 # max_depth = 2
 # # Default shared token budget for a Workflow run and its children.

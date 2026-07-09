@@ -8,6 +8,26 @@ files, shell, network, providers, cancellation, or TUI state.
 For a guided walkthrough from Fleet task specs to Workflow authoring and
 monitoring, see [Fleet + Workflow Tutorial](FLEET_WORKFLOW_TUTORIAL.md).
 
+
+## Access model
+
+The Workflow script is a **coordinator only**. It has no filesystem or shell of
+its own. Real work happens in sub-agents the script launches.
+
+| Layer | What it can access |
+|-------|--------------------|
+| Workflow script (JS VM) | Script variables, branching/loops, `task()` / `parallel()` / `pipeline()`, `phase` / `log`, `budget` / `args`. **No** direct FS, shell, network, env, imports, clock, or randomness. |
+| Workflow-spawned sub-agents | Normal tool surface (read/search/edit/write, shell, web, MCP) subject to role posture, allowlists, and parent policy. File edits for write-capable roles auto-accept under Workflow; shell / web / MCP still require parent auto-approve or fail closed. |
+| Parent session | Working directory, configured tools/MCP, permission mode, sandbox/network rules. |
+
+### Scale
+
+- Up to **16 concurrent** live agents in one run (additional spawns wait for a slot).
+- Up to **1_000 agents per run** (VM lifetime spawn cap).
+- Soft auto-launch still uses a lower child soft-cap (`auto_start_child_limit`).
+
+See the Workflow JS sandbox tests for the fail-closed host surface inventory.
+
 ## Language Choice
 
 | Surface | Strength | Tradeoff | v0.8.60 stance |

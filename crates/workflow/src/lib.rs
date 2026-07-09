@@ -21,7 +21,9 @@ pub use js_authoring::{
 pub use model_policy::*;
 pub use replay::*;
 
-pub const DEFAULT_FLEET_WORKFLOW_MAX_AGENTS: usize = 100;
+/// Default hard ceiling on total agents a Fleet-shaped Workflow plan may launch.
+/// Matches the imperative VM lifetime cap (1_000 agents per run).
+pub const DEFAULT_FLEET_WORKFLOW_MAX_AGENTS: usize = 1000;
 pub const DEFAULT_FLEET_WORKFLOW_MAX_DEPTH: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

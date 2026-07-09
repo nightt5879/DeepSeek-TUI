@@ -300,12 +300,12 @@ async fn pipeline_surfaces_response_schema_errors_instead_of_null() {
 }
 
 #[tokio::test]
-async fn parallel_enforces_the_4096_item_cap_without_spawning() {
+async fn parallel_enforces_the_1000_item_cap_without_spawning() {
     let driver = Arc::new(FakeDriver::new());
     let value = run(
         &driver,
         r#"
-        const thunks = new Array(4097).fill(() => task({ description: "x" }));
+        const thunks = new Array(1001).fill(() => task({ description: "x" }));
         try {
             await parallel(thunks);
             return "no-throw";
@@ -318,17 +318,17 @@ async fn parallel_enforces_the_4096_item_cap_without_spawning() {
     .await
     .unwrap();
     let text = value.as_str().unwrap();
-    assert!(text.contains("max 4096"), "{text}");
+    assert!(text.contains("max 1000"), "{text}");
     assert_eq!(driver.spawn_count(), 0, "cap must reject before any spawn");
 }
 
 #[tokio::test]
-async fn parallel_accepts_exactly_4096_items() {
+async fn parallel_accepts_exactly_1000_items() {
     let driver = Arc::new(FakeDriver::new());
     let value = run(
         &driver,
         r#"
-        const thunks = new Array(4096).fill(() => Promise.resolve(1));
+        const thunks = new Array(1000).fill(() => Promise.resolve(1));
         const results = await parallel(thunks);
         return results.length;
         "#,
@@ -336,7 +336,7 @@ async fn parallel_accepts_exactly_4096_items() {
     )
     .await
     .unwrap();
-    assert_eq!(value, json!(4096));
+    assert_eq!(value, json!(1000));
 }
 
 #[tokio::test]

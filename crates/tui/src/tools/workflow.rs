@@ -19,11 +19,11 @@ use codewhale_workflow::{
 };
 use codewhale_workflow_js::{
     BudgetSnapshot, DriverError, ProgressEvent, SpawnedTask, TaskCompletion, TaskRequest,
-    WorkflowDriver, WorkflowRunCancel, WorkflowVm,
+    WORKFLOW_MAX_CONCURRENT, WorkflowDriver, WorkflowRunCancel, WorkflowVm,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::core::events::Event;
@@ -1591,6 +1591,10 @@ struct SubAgentWorkflowDriver {
     task_records: Arc<Mutex<HashMap<String, RuntimeTaskRecord>>>,
     total_budget: Option<u64>,
     last_budget_event: Arc<Mutex<Option<BudgetSnapshot>>>,
+    /// Caps concurrently live `task()` children for this run (product: 16).
+    concurrent_gate: Arc<Semaphore>,
+    /// Held permits for in-flight children; released on completion/cancel.
+    spawn_permits: Mutex<HashMap<String, OwnedSemaphorePermit>>,
 }
 
 impl SubAgentWorkflowDriver {
@@ -1615,6 +1619,8 @@ impl SubAgentWorkflowDriver {
             task_records: Arc::new(Mutex::new(HashMap::new())),
             total_budget,
             last_budget_event: Arc::new(Mutex::new(None)),
+            concurrent_gate: Arc::new(Semaphore::new(WORKFLOW_MAX_CONCURRENT.max(1))),
+            spawn_permits: Mutex::new(HashMap::new()),
         });
         spawn_completion_pump(driver.clone(), completion_rx);
         driver
@@ -1626,6 +1632,9 @@ impl SubAgentWorkflowDriver {
             .lock()
             .map(|ids| ids.clone())
             .unwrap_or_default();
+        if let Ok(mut permits) = self.spawn_permits.lock() {
+            permits.clear();
+        }
         cancel_child_agents(self.manager.clone(), ids);
         if let Ok(mut state) = self.completion_state.lock() {
             for (_, waiter) in state.waiters.drain() {
@@ -1823,6 +1832,9 @@ impl SubAgentWorkflowDriver {
 
     fn deliver_completion(&self, agent_id: String, completion: TaskCompletion) {
         self.record_task_completion(&agent_id, &completion);
+        if let Ok(mut permits) = self.spawn_permits.lock() {
+            permits.remove(&agent_id);
+        }
         let mut state = self
             .completion_state
             .lock()
@@ -1844,6 +1856,13 @@ struct CompletionState {
 #[async_trait]
 impl WorkflowDriver for SubAgentWorkflowDriver {
     async fn spawn_task(&self, request: TaskRequest) -> Result<SpawnedTask, DriverError> {
+        // Wait for a concurrent slot (max 16 live children per run).
+        let permit = self
+            .concurrent_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| DriverError::Rejected("workflow concurrent admission closed".into()))?;
         let runtime = self
             .runtime
             .clone()
@@ -1874,10 +1893,18 @@ impl WorkflowDriver for SubAgentWorkflowDriver {
             workflow_task_label,
             workflow_child_index,
         };
-        let result = spawn_workflow_task(request, self.manager.clone(), runtime, identity)
-            .await
-            .map_err(|err| DriverError::Rejected(err.to_string()))?;
+        let result =
+            match spawn_workflow_task(request, self.manager.clone(), runtime, identity).await {
+                Ok(result) => result,
+                Err(err) => {
+                    drop(permit);
+                    return Err(DriverError::Rejected(err.to_string()));
+                }
+            };
         let task_id = result.result.agent_id.clone();
+        if let Ok(mut permits) = self.spawn_permits.lock() {
+            permits.insert(task_id.clone(), permit);
+        }
         self.record_child(&task_id);
         self.record_task_started(&task_id, &request_record, &result.metadata, &result.result);
         self.record_task_request(&task_id, &request_record);

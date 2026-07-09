@@ -55,7 +55,18 @@ pub use vm::{VmLimits, WorkflowRunCancel, WorkflowVm};
 /// Maximum `task()` spawn attempts per run (design §4.3). Counted in the VM
 /// before the driver is consulted, so a runaway `loop-until-dry` terminates
 /// even if the driver would keep admitting work.
+///
+/// Product scale: up to 1_000 agents per Workflow run.
 pub const WORKFLOW_LIFETIME_CAP: u64 = 1000;
 
+/// Maximum concurrently executing agents within one Workflow run.
+///
+/// Fan-out may *declare* more work via `parallel()` / `pipeline()`, but the
+/// host admits at most this many live `task()` children at once; additional
+/// spawns wait for a slot.
+pub const WORKFLOW_MAX_CONCURRENT: usize = 16;
+
 /// Maximum items per `parallel()` or `pipeline()` call (design §4.2).
-pub const PARALLEL_MAX_ITEMS: usize = 4096;
+/// Kept at the per-run agent ceiling so a single fan-out cannot declare more
+/// work than the lifetime cap can ever complete.
+pub const PARALLEL_MAX_ITEMS: usize = 1000;

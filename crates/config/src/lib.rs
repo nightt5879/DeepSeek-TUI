@@ -1508,9 +1508,12 @@ pub struct WorkflowConfigToml {
     /// should ask the operator or use explicit `/workflow`.
     #[serde(default = "default_workflow_auto_start_child_limit")]
     pub auto_start_child_limit: u32,
-    /// Hard ceiling on total children in one Workflow run.
+    /// Hard ceiling on total children in one Workflow run (product: 1000).
     #[serde(default = "default_workflow_max_children")]
     pub max_children: u32,
+    /// Maximum concurrently live agents inside one Workflow run (product: 16).
+    #[serde(default = "default_workflow_max_concurrent")]
+    pub max_concurrent: u32,
     /// Maximum nested Workflow / child-orchestration depth.
     #[serde(default = "default_workflow_max_depth")]
     pub max_depth: u32,
@@ -1544,11 +1547,16 @@ fn default_workflow_require_approval_for_writes() -> bool {
 }
 
 fn default_workflow_auto_start_child_limit() -> u32 {
-    8
+    // Soft auto stays small; explicit launches may use the full concurrent cap.
+    16
 }
 
 fn default_workflow_max_children() -> u32 {
-    64
+    1000
+}
+
+fn default_workflow_max_concurrent() -> u32 {
+    16
 }
 
 fn default_workflow_max_depth() -> u32 {
@@ -1579,6 +1587,7 @@ impl Default for WorkflowConfigToml {
             require_approval_for_writes: default_workflow_require_approval_for_writes(),
             auto_start_child_limit: default_workflow_auto_start_child_limit(),
             max_children: default_workflow_max_children(),
+            max_concurrent: default_workflow_max_concurrent(),
             max_depth: default_workflow_max_depth(),
             default_token_budget: default_workflow_default_token_budget(),
             max_parallel_writes_without_worktree:

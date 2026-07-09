@@ -1404,6 +1404,10 @@ pub struct SubAgentRuntime {
     pub fleet_roster: std::sync::Arc<crate::fleet::roster::FleetRoster>,
     pub context: ToolContext,
     pub allow_shell: bool,
+    /// When true, Suggest-level file writes auto-accept for write-capable roles
+    /// without full parent auto-approve. Shell/network/MCP still gated.
+    /// Set for Workflow-spawned children.
+    pub accept_edits: bool,
     /// Native Agent-mode tool surface inherited from the parent turn. Carries
     /// feature/config-dependent families such as web search, patch, memory,
     /// vision, notify, and FIM so child catalogs stay in parity with the parent.
@@ -1496,6 +1500,7 @@ impl SubAgentRuntime {
             fleet_roster: std::sync::Arc::new(crate::fleet::roster::FleetRoster::built_ins_only()),
             context,
             allow_shell,
+            accept_edits: false,
             agent_tool_surface_options: AgentToolSurfaceOptions::new(
                 ShellPolicy::from_legacy_allow_shell(allow_shell),
             ),
@@ -1757,6 +1762,7 @@ impl SubAgentRuntime {
             fleet_roster: self.fleet_roster.clone(),
             context: child_context,
             allow_shell: self.allow_shell,
+            accept_edits: self.accept_edits,
             agent_tool_surface_options: self.agent_tool_surface_options.clone(),
             worker_profile: self.worker_profile.clone(),
             event_tx: self.event_tx.clone(),
@@ -4470,7 +4476,7 @@ fn apply_session_spawn_policy(
 pub(crate) async fn spawn_workflow_task(
     request: codewhale_workflow_js::TaskRequest,
     manager: SharedSubAgentManager,
-    runtime: SubAgentRuntime,
+    mut runtime: SubAgentRuntime,
     identity: WorkflowTaskSpawnIdentity,
 ) -> Result<WorkflowTaskSpawnResult, ToolError> {
     // Capture identity fallbacks before consuming `request` fields into the
@@ -4515,6 +4521,10 @@ pub(crate) async fn spawn_workflow_task(
     if let Some(value) = request.token_budget {
         input["token_budget"] = json!(value);
     }
+    // Workflow children inherit the parent tool surface and auto-accept
+    // Suggest-level file edits for write-capable roles. Shell / network / MCP
+    // still require parent auto-approve (or fail closed).
+    runtime.accept_edits = true;
     let (result, _, mut metadata) = spawn_subagent_from_input(input, manager, runtime).await?;
     // Prefer the identity values the driver stamped; fall back to task options.
     let workflow_task_label = identity
@@ -7592,6 +7602,8 @@ struct SubAgentToolRegistry {
     /// `command_denies_tool` (exact + `prefix*`, case-insensitive).
     disallowed_tools: Vec<String>,
     auto_approve: bool,
+    /// Workflow-spawned children auto-accept Suggest-level file edits.
+    accept_edits: bool,
     /// The role/type of the sub-agent that this registry belongs to. Used to
     /// decide whether `Suggest`-level tools (write/edit/patch) may run inside
     /// the child without the parent runtime being auto-approved (#1828, #1833).
@@ -7663,6 +7675,7 @@ impl SubAgentToolRegistry {
             allowed_tools: explicit_allowed_tools,
             disallowed_tools: runtime.worker_profile.denied_tools.clone(),
             auto_approve: runtime.context.auto_approve,
+            accept_edits: runtime.accept_edits,
             agent_type,
             runtime_profile: runtime.worker_profile,
             can_spawn_child,
@@ -7803,16 +7816,12 @@ impl SubAgentToolRegistry {
                 ApprovalRequirement::Suggest => {
                     // Write/edit/patch tools land here. Explicit
                     // write-capable roles (`implementer`, `custom`) may run them
-                    // without parent auto-approve so that delegated work
-                    // can actually land file changes; the previous
-                    // behavior blocked every write under `suggest` mode
-                    // even for the role explicitly chartered to write
-                    // (#1828, #1833). Read-only roles still bounce so
-                    // exploration/review/planning/verifier children
-                    // can't mutate the workspace behind the parent's back.
-                    if !self.runtime_profile.permissions.write
-                        || !Self::role_can_delegate_writes(&self.agent_type)
-                    {
+                    // without parent auto-approve (#1828, #1833). Workflow-spawned
+                    // children also accept Suggest edits for any write-capable
+                    // posture (including general). Read-only roles still bounce.
+                    let may_write = self.runtime_profile.permissions.write
+                        && (self.accept_edits || Self::role_can_delegate_writes(&self.agent_type));
+                    if !may_write {
                         return Err(anyhow!(
                             "Tool {name} requires approval and is not delegated to {role} sub-agents; rerun the parent with auto approval or pick a write-capable role",
                             role = self.agent_type.as_str()

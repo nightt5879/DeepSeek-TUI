@@ -5453,8 +5453,9 @@ fn workflow_config_defaults_match_product_surface() {
     assert!(defaults.automatic);
     assert!(defaults.auto_start_read_only);
     assert!(defaults.require_approval_for_writes);
-    assert_eq!(defaults.auto_start_child_limit, 8);
-    assert_eq!(defaults.max_children, 64);
+    assert_eq!(defaults.auto_start_child_limit, 16);
+    assert_eq!(defaults.max_children, 1000);
+    assert_eq!(defaults.max_concurrent, 16);
     assert_eq!(defaults.max_depth, 2);
     assert_eq!(defaults.default_token_budget, 120_000);
     assert_eq!(defaults.max_parallel_writes_without_worktree, 0);
@@ -5498,7 +5499,8 @@ default_token_budget = 50000
     // Unset keys keep product defaults.
     assert!(workflow.auto_start_read_only);
     assert!(workflow.require_approval_for_writes);
-    assert_eq!(workflow.auto_start_child_limit, 8);
+    assert_eq!(workflow.auto_start_child_limit, 16);
+    assert_eq!(workflow.max_concurrent, 16);
     assert_eq!(workflow.max_depth, 2);
     assert_eq!(workflow.max_parallel_writes_without_worktree, 0);
     assert!(workflow.persist_completed_activity);
