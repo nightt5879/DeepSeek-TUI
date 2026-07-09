@@ -519,6 +519,17 @@ pub enum AgentWorkerStatus {
     Interrupted,
 }
 
+impl AgentWorkerStatus {
+    /// Terminal worker statuses may be age-evicted from the run ledger (#4217).
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Interrupted
+        )
+    }
+}
+
 /// Tool capability profile requested for a headless worker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -3041,6 +3052,7 @@ impl SubAgentManager {
     /// during this pass.
     pub fn cleanup(&mut self, max_age: Duration) -> usize {
         let before = self.agents.len();
+        let before_workers = self.worker_records.len();
         let mut auto_cancelled = 0;
         let timeout = self.running_heartbeat_timeout;
         let mut worker_cancellations = Vec::new();
@@ -3089,7 +3101,23 @@ impl SubAgentManager {
                 agent.started_at.elapsed() < max_age
             }
         });
-        if self.agents.len() != before || auto_cancelled > 0 {
+        // #4217: age-evict terminal worker ledger entries. Agents already drop
+        // after `max_age`, but worker_records previously only had an LRU cap of
+        // 256 — long-lived sessions rewrote multi-MB subagents.v1.json forever.
+        // Running / starting / waiting records are always preserved.
+        let now_ms = epoch_millis_now();
+        let max_age_ms = max_age.as_millis() as u64;
+        self.worker_records.retain(|_, record| {
+            if !record.status.is_terminal() {
+                return true;
+            }
+            let anchor_ms = record.completed_at_ms.unwrap_or(record.updated_at_ms);
+            now_ms.saturating_sub(anchor_ms) < max_age_ms
+        });
+        if self.agents.len() != before
+            || auto_cancelled > 0
+            || self.worker_records.len() != before_workers
+        {
             self.persist_state_best_effort();
         }
         self.last_cleanup_at = Some(Instant::now());

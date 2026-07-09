@@ -494,6 +494,11 @@ don't go through the standard write-approval flow.
 - Persisted state: `<workspace>/.codewhale/state/subagents.v1.json`. Schema
   version `1` (forward-compatible — new optional fields use
   `#[serde(default)]`).
+- Worker records are pruned by time: completed / failed / cancelled /
+  interrupted records are evicted after the same retention window used for
+  finished agents (default 1h, `COMPLETED_AGENT_RETENTION`). Running /
+  starting / waiting records are preserved. The hard cap of 256 records
+  remains as a safety bound (#4217).
 - `SubAgentRuntime::background_runtime()` starts from `child_runtime()` but
   replaces the turn-scoped child token with a fresh cancellation token, so
   parent turn cancellation does not stop detached background sessions.

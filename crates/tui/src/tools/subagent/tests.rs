@@ -6501,6 +6501,88 @@ async fn worker_is_not_stranded_by_transient_global_rate_limit_window() {
     );
 }
 
+/// #4217: terminal worker records must age out of the persisted ledger so
+/// long-lived sessions do not rewrite multi-MB `subagents.v1.json` forever.
+#[test]
+fn cleanup_evicts_stale_terminal_worker_records_and_keeps_live_ones() {
+    let tmp = tempdir().expect("tempdir");
+    let state_path = tmp.path().join("subagents.v1.json");
+    let mut manager =
+        SubAgentManager::new(tmp.path().to_path_buf(), 4).with_state_path(state_path.clone());
+
+    manager.register_worker(make_worker_spec("agent_old_done", tmp.path().to_path_buf()));
+    manager.register_worker(make_worker_spec(
+        "agent_recent_done",
+        tmp.path().to_path_buf(),
+    ));
+    manager.register_worker(make_worker_spec(
+        "agent_still_running",
+        tmp.path().to_path_buf(),
+    ));
+
+    let mut old_done = make_snapshot(SubAgentStatus::Completed);
+    old_done.agent_id = "agent_old_done".to_string();
+    old_done.name = "agent_old_done".to_string();
+    manager.complete_worker_from_result("agent_old_done", &old_done);
+
+    let mut recent_done = make_snapshot(SubAgentStatus::Failed("boom".to_string()));
+    recent_done.agent_id = "agent_recent_done".to_string();
+    recent_done.name = "agent_recent_done".to_string();
+    manager.complete_worker_from_result("agent_recent_done", &recent_done);
+
+    manager.record_worker_event(
+        "agent_still_running",
+        AgentWorkerStatus::Running,
+        Some("working".to_string()),
+        Some(1),
+        None,
+    );
+
+    let now_ms = epoch_millis_now();
+    let two_hours_ago = now_ms.saturating_sub(2 * 60 * 60 * 1000);
+    {
+        let old = manager
+            .worker_records
+            .get_mut("agent_old_done")
+            .expect("old terminal worker");
+        old.completed_at_ms = Some(two_hours_ago);
+        old.updated_at_ms = two_hours_ago;
+    }
+
+    // One-hour retention matches COMPLETED_AGENT_RETENTION used by cleanup callers.
+    let auto_cancelled = manager.cleanup(Duration::from_secs(60 * 60));
+    assert_eq!(auto_cancelled, 0);
+
+    assert!(
+        manager.get_worker_record("agent_old_done").is_none(),
+        "terminal worker older than retention must be evicted"
+    );
+    assert!(
+        manager.get_worker_record("agent_recent_done").is_some(),
+        "recent terminal worker must be retained"
+    );
+    let running = manager
+        .get_worker_record("agent_still_running")
+        .expect("running worker");
+    assert_eq!(running.status, AgentWorkerStatus::Running);
+
+    // Persist the pruned ledger and confirm eviction survives reload.
+    manager
+        .persist_state()
+        .expect("persist after cleanup")
+        .join()
+        .expect("persist thread");
+    let mut reloaded =
+        SubAgentManager::new(tmp.path().to_path_buf(), 4).with_state_path(state_path);
+    reloaded.load_state().expect("load pruned state");
+    assert!(
+        reloaded.get_worker_record("agent_old_done").is_none(),
+        "eviction must survive reload of subagents.v1.json"
+    );
+    assert!(reloaded.get_worker_record("agent_recent_done").is_some());
+    assert!(reloaded.get_worker_record("agent_still_running").is_some());
+}
+
 #[test]
 fn cleanup_due_gates_write_locked_cleanup_to_a_bounded_cadence() {
     // #3803: a fresh manager is always due (never cleaned); right after a
