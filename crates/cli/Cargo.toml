@@ -22,6 +22,7 @@ clap_complete.workspace = true
 codewhale-agent = { path = "../agent", version = "0.8.67" }
 codewhale-app-server = { path = "../app-server", version = "0.8.67" }
 codewhale-config = { path = "../config", version = "0.8.67" }
+codewhale-lane = { path = "../lane", version = "0.8.67" }
 codewhale-execpolicy = { path = "../execpolicy", version = "0.8.67" }
 codewhale-mcp = { path = "../mcp", version = "0.8.67" }
 codewhale-release = { path = "../release", version = "0.8.67" }
