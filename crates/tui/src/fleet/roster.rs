@@ -138,8 +138,8 @@ impl FleetRoster {
             (
                 "scout",
                 FleetSlot::Scout,
-                FleetLoadout::Fast,
-                "Fast read-only reconnaissance: find files, map code, gather evidence.",
+                FleetLoadout::Inherit,
+                "Read-only reconnaissance: find files, map code, gather evidence.",
                 None,
             ),
             (
@@ -168,7 +168,7 @@ impl FleetRoster {
             (
                 "synthesizer",
                 FleetSlot::Summarizer,
-                FleetLoadout::Fast,
+                FleetLoadout::Inherit,
                 "Read-only synthesis: merge findings into one coherent report.",
                 None,
             ),
@@ -338,9 +338,9 @@ mod tests {
         }
         assert_eq!(members[0].profile.slot, FleetSlot::Manager);
         assert_eq!(members[1].profile.slot, FleetSlot::Operator);
-        assert_eq!(members[2].profile.loadout, FleetLoadout::Fast);
+        assert_eq!(members[2].profile.loadout, FleetLoadout::Inherit);
         assert_eq!(members[6].profile.slot, FleetSlot::Summarizer);
-        assert_eq!(members[6].profile.loadout, FleetLoadout::Fast);
+        assert_eq!(members[6].profile.loadout, FleetLoadout::Inherit);
     }
 
     #[test]

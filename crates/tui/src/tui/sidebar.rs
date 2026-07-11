@@ -20,6 +20,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Paragraph, Wrap},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::deepseek_theme::Theme;
 use crate::palette;
@@ -107,6 +108,221 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App, config: &Config)
     if let Some(hotbar_area) = hotbar_area {
         render_hotbar_panel(f, hotbar_area, app, config);
     }
+}
+
+/// Height of the transcript-top Tasks / To-do strip from the underwater TUI
+/// action spec. It collapses completely when neither durable background work
+/// nor current work state exists, preserving the full launch water field.
+pub(crate) fn top_work_strip_height(app: &mut App, width: u16) -> u16 {
+    let has_tasks = app
+        .task_panel
+        .iter()
+        .any(|task| task.kind == TaskPanelEntryKind::Background);
+    let has_todo = sidebar_work_summary(app).has_useful_content();
+    if !has_tasks && !has_todo {
+        0
+    } else if width >= 88 {
+        4
+    } else {
+        7
+    }
+}
+
+/// Render durable Tasks and the current To-do above the transcript. This is a
+/// compact proof strip; dense telemetry remains in the inspectors.
+pub(crate) fn render_top_work_strip(f: &mut Frame, area: Rect, app: &mut App) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    Block::default()
+        .style(Style::default().bg(app.ui_theme.surface_bg))
+        .render(area, f.buffer_mut());
+
+    let summary = sidebar_work_summary(app);
+    let has_tasks = app
+        .task_panel
+        .iter()
+        .any(|task| task.kind == TaskPanelEntryKind::Background);
+    let has_todo = summary.has_useful_content();
+    if has_tasks && !has_todo {
+        render_top_tasks(
+            f,
+            Rect {
+                height: area.height.saturating_sub(1),
+                ..area
+            },
+            app,
+        );
+        render_top_strip_rule(f, area, app);
+        return;
+    }
+    if has_todo && !has_tasks {
+        render_top_todo(
+            f,
+            Rect {
+                height: area.height.saturating_sub(1),
+                ..area
+            },
+            &summary,
+            app,
+        );
+        render_top_strip_rule(f, area, app);
+        return;
+    }
+    let wide = area.width >= 88;
+    let sections = Layout::default()
+        .direction(if wide {
+            Direction::Horizontal
+        } else {
+            Direction::Vertical
+        })
+        .constraints(if wide {
+            vec![Constraint::Percentage(50), Constraint::Percentage(50)]
+        } else {
+            vec![Constraint::Length(3), Constraint::Length(3)]
+        })
+        .split(Rect {
+            height: area.height.saturating_sub(1),
+            ..area
+        });
+
+    render_top_tasks(f, sections[0], app);
+    render_top_todo(f, sections[1], &summary, app);
+
+    render_top_strip_rule(f, area, app);
+}
+
+fn render_top_strip_rule(f: &mut Frame, area: Rect, app: &App) {
+    let rule_y = area.bottom().saturating_sub(1);
+    for x in area.left()..area.right() {
+        f.buffer_mut()[(x, rule_y)]
+            .set_symbol("─")
+            .set_fg(app.ui_theme.border)
+            .set_bg(app.ui_theme.surface_bg);
+    }
+}
+
+fn render_top_tasks(f: &mut Frame, area: Rect, app: &App) {
+    let tasks = app
+        .task_panel
+        .iter()
+        .filter(|task| task.kind == TaskPanelEntryKind::Background)
+        .collect::<Vec<_>>();
+    let waiting_for_user = tasks
+        .iter()
+        .any(|task| matches!(task.status.as_str(), "waiting" | "needs_user"));
+    let width = usize::from(area.width.saturating_sub(2)).max(1);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "▾ Tasks",
+            Style::default().fg(app.ui_theme.accent_primary).bold(),
+        ),
+        Span::styled(
+            format!(" {}", tasks.len()),
+            Style::default().fg(app.ui_theme.text_muted),
+        ),
+    ])];
+    for task in tasks.into_iter().take(2) {
+        let (mark, mark_color, label_color) = match task.status.as_str() {
+            "waiting" | "needs_user" => ("◆", app.ui_theme.error_fg, app.ui_theme.error_fg),
+            "running" => (
+                background_task_spinner_prefix(task, app.low_motion || waiting_for_user)
+                    .unwrap_or("›"),
+                if waiting_for_user {
+                    app.ui_theme.text_dim
+                } else {
+                    app.ui_theme.status_working
+                },
+                if waiting_for_user {
+                    app.ui_theme.text_dim
+                } else {
+                    app.ui_theme.text_body
+                },
+            ),
+            "queued" => ("☐", app.ui_theme.text_muted, app.ui_theme.text_muted),
+            "completed" | "success" => ("✓", app.ui_theme.success, app.ui_theme.text_muted),
+            "failed" => ("✕", app.ui_theme.error_fg, app.ui_theme.text_body),
+            "canceled" => ("✕", app.ui_theme.text_dim, app.ui_theme.text_dim),
+            _ => ("·", app.ui_theme.text_muted, app.ui_theme.text_muted),
+        };
+        let duration = task.duration_ms.map(format_duration_ms).unwrap_or_default();
+        let duration_width = UnicodeWidthStr::width(duration.as_str());
+        let summary_width = width
+            .saturating_sub(3 + UnicodeWidthStr::width(mark) + duration_width + 2)
+            .max(1);
+        let summary = truncate_line_to_width(&task.prompt_summary, summary_width);
+        let used = 3 + UnicodeWidthStr::width(mark) + UnicodeWidthStr::width(summary.as_str());
+        let gap = if duration.is_empty() {
+            0
+        } else {
+            width.saturating_sub(used + duration_width).max(2)
+        };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(mark, Style::default().fg(mark_color)),
+            Span::raw(" "),
+            Span::styled(summary, Style::default().fg(label_color)),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(duration, Style::default().fg(app.ui_theme.text_hint)),
+        ]));
+    }
+    Paragraph::new(lines).render(area, f.buffer_mut());
+}
+
+fn render_top_todo(f: &mut Frame, area: Rect, summary: &SidebarWorkSummary, app: &App) {
+    let total = summary.checklist_items.len();
+    let completed = summary
+        .checklist_items
+        .iter()
+        .filter(|item| item.status == TodoStatus::Completed)
+        .count();
+    let width = usize::from(area.width.saturating_sub(2)).max(1);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "▾ To-do",
+            Style::default().fg(app.ui_theme.accent_primary).bold(),
+        ),
+        Span::styled(
+            if total == 0 {
+                String::new()
+            } else {
+                format!(" {completed}/{total}")
+            },
+            Style::default().fg(app.ui_theme.text_muted),
+        ),
+    ])];
+
+    let active = summary
+        .checklist_items
+        .iter()
+        .find(|item| item.status == TodoStatus::InProgress)
+        .or_else(|| {
+            summary
+                .checklist_items
+                .iter()
+                .find(|item| item.status == TodoStatus::Pending)
+        });
+    if let Some(item) = active {
+        let mark = if item.status == TodoStatus::InProgress {
+            "▸"
+        } else {
+            "☐"
+        };
+        let color = if item.status == TodoStatus::InProgress {
+            app.ui_theme.accent_primary
+        } else {
+            app.ui_theme.text_muted
+        };
+        let label = truncate_line_to_width(&format!("  {mark} {}", item.content), width);
+        lines.push(Line::from(Span::styled(label, Style::default().fg(color))));
+    } else if let Some(goal) = summary.goal_objective.as_deref() {
+        let label = truncate_line_to_width(&format!("  ◆ {goal}"), width);
+        lines.push(Line::from(Span::styled(
+            label,
+            Style::default().fg(app.ui_theme.text_body),
+        )));
+    }
+    Paragraph::new(lines).render(area, f.buffer_mut());
 }
 
 fn split_sidebar_hotbar_area(area: Rect, show_hotbar: bool) -> (Rect, Option<Rect>) {
@@ -1518,7 +1734,7 @@ fn task_panel_rows(
                 .map(format_duration_ms)
                 .unwrap_or_else(|| "-".to_string());
             let (label, detail) = background_task_labels(task, &duration);
-            let label = background_task_spinner_prefix(task)
+            let label = background_task_spinner_prefix(task, app.low_motion)
                 .map(|prefix| format!("{prefix} {label}"))
                 .unwrap_or(label);
             let (show_action, detail_action) = background_task_click_actions(task);
@@ -1658,7 +1874,7 @@ fn task_panel_hover_texts(app: &App, row_sets: &TaskPanelRowSets, max_rows: usiz
                 .map(format_duration_ms)
                 .unwrap_or_else(|| "-".to_string());
             let (label, detail) = background_task_labels(task, &duration);
-            let label = background_task_spinner_prefix(task)
+            let label = background_task_spinner_prefix(task, app.low_motion)
                 .map(|prefix| format!("{prefix} {label}"))
                 .unwrap_or(label);
             texts.push(label);
@@ -1848,13 +2064,13 @@ fn background_task_is_live(task: &TaskPanelEntry) -> bool {
         && matches!(task.status.as_str(), "queued" | "running")
 }
 
-fn background_task_spinner_prefix(task: &TaskPanelEntry) -> Option<&'static str> {
+fn background_task_spinner_prefix(task: &TaskPanelEntry, low_motion: bool) -> Option<&'static str> {
     if task.status != "running" {
         return None;
     }
     Some(braille_spinner_frame_for_duration_ms(
         task.duration_ms.unwrap_or_default(),
-        false,
+        low_motion,
     ))
 }
 
@@ -3610,11 +3826,11 @@ mod tests {
         agent_row_hover_text, auto_sidebar_panels, background_task_spinner_prefix,
         context_panel_cost_line, editorial_tool_rows, hotbar_panel_enabled,
         hotbar_panel_hover_texts, hotbar_panel_lines, hotbar_panel_slots, is_hotbar_disabled,
-        normalize_activity_text, render_sidebar, sidebar_agent_rows, sidebar_hover_rows,
-        sidebar_work_summary, sort_sidebar_agent_rows_as_tree, subagent_output_handle,
-        subagent_panel_hover_texts, subagent_panel_lines, subagent_panel_rows,
-        task_panel_hover_texts, task_panel_lines, task_panel_row_sets, task_panel_rows,
-        work_panel_empty_hint, work_panel_hover_texts, work_panel_lines,
+        normalize_activity_text, render_sidebar, render_top_work_strip, sidebar_agent_rows,
+        sidebar_hover_rows, sidebar_work_summary, sort_sidebar_agent_rows_as_tree,
+        subagent_output_handle, subagent_panel_hover_texts, subagent_panel_lines,
+        subagent_panel_rows, task_panel_hover_texts, task_panel_lines, task_panel_row_sets,
+        task_panel_rows, work_panel_empty_hint, work_panel_hover_texts, work_panel_lines,
     };
     use crate::config::Config;
     use crate::localization::Locale;
@@ -3630,7 +3846,10 @@ mod tests {
     use crate::tui::history::{
         ExecCell, ExecSource, GenericToolCell, HistoryCell, ToolCell, ToolStatus,
     };
-    use crate::tui::spinner::BRAILLE_SPINNER_FRAME_MS;
+    use crate::tui::spinner::{
+        BRAILLE_SPINNER_FRAME_MS, BRAILLE_SPINNER_STILL_FRAME, LIVE_MARKER_DELAY_MS,
+        LIVE_STATIC_MARKER,
+    };
     use ratatui::{Terminal, backend::TestBackend, text::Line};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
@@ -3662,6 +3881,88 @@ mod tests {
             initial_input: None,
         };
         App::new(options, &Config::default())
+    }
+
+    #[test]
+    fn top_work_strip_places_tasks_and_todo_above_transcript_contract() {
+        let mut app = create_test_app();
+        app.task_panel.push(TaskPanelEntry {
+            id: "task-1".to_string(),
+            status: "running".to_string(),
+            prompt_summary: "verify the underwater layout".to_string(),
+            duration_ms: Some(1_200),
+            kind: TaskPanelEntryKind::Background,
+            stale: false,
+            elapsed_since_output_ms: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
+        });
+        {
+            let mut todos = app.todos.try_lock().expect("todos lock");
+            todos.add(
+                "move work state to the top".to_string(),
+                TodoStatus::InProgress,
+            );
+        }
+
+        let backend = TestBackend::new(100, 4);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_top_work_strip(frame, frame.area(), &mut app))
+            .expect("draw top work strip");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Tasks"));
+        assert!(rendered.contains("verify the underwater layout"));
+        assert!(rendered.contains("1.2s"));
+        assert!(rendered.contains("To-do"));
+        assert!(rendered.contains("move work state to the top"));
+    }
+
+    #[test]
+    fn waiting_task_freezes_other_motion_and_owns_attention() {
+        let mut app = create_test_app();
+        for (id, status) in [("run", "running"), ("ask", "waiting")] {
+            app.task_panel.push(TaskPanelEntry {
+                id: id.to_string(),
+                status: status.to_string(),
+                prompt_summary: format!("{id} task"),
+                duration_ms: Some(2_000),
+                kind: TaskPanelEntryKind::Background,
+                stale: false,
+                elapsed_since_output_ms: None,
+                owner_agent_id: None,
+                owner_agent_name: None,
+            });
+        }
+
+        let backend = TestBackend::new(100, 4);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_top_work_strip(frame, frame.area(), &mut app))
+            .expect("draw top work strip");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(
+            rendered.contains("◆"),
+            "waiting row keeps a still coral mark"
+        );
+        assert!(
+            rendered.contains(BRAILLE_SPINNER_STILL_FRAME),
+            "other live rows freeze while the user owns the next move"
+        );
     }
 
     fn sidebar_tool_row(name: &str, status: ToolStatus) -> SidebarToolRow {
@@ -5090,6 +5391,7 @@ mod tests {
     #[test]
     fn tasks_panel_puts_background_shell_command_on_primary_row() {
         let mut app = create_test_app();
+        app.low_motion = false;
         app.task_panel.push(TaskPanelEntry {
             id: "shell_33a08c3c".to_string(),
             status: "running".to_string(),
@@ -5111,10 +5413,8 @@ mod tests {
             "background shell headline should show the command, not only the shell id: {text:?}"
         );
         assert!(
-            text.iter().any(|line| line.contains(&format!(
-                "{} Bash running",
-                crate::tui::spinner::BRAILLE_SPINNER_FRAMES[0]
-            ))),
+            text.iter()
+                .any(|line| line.contains(&format!("{} Bash running", LIVE_STATIC_MARKER))),
             "running background shell should show a braille spinner prefix: {text:?}"
         );
         assert!(
@@ -5165,19 +5465,25 @@ mod tests {
         };
 
         assert_eq!(
-            background_task_spinner_prefix(&task),
+            background_task_spinner_prefix(&task, false),
+            Some(LIVE_STATIC_MARKER)
+        );
+
+        task.duration_ms = Some(LIVE_MARKER_DELAY_MS - 1);
+        assert_eq!(
+            background_task_spinner_prefix(&task, false),
+            Some(LIVE_STATIC_MARKER)
+        );
+
+        task.duration_ms = Some(LIVE_MARKER_DELAY_MS);
+        assert_eq!(
+            background_task_spinner_prefix(&task, false),
             Some(crate::tui::spinner::BRAILLE_SPINNER_FRAMES[0])
         );
 
-        task.duration_ms = Some(BRAILLE_SPINNER_FRAME_MS - 1);
+        task.duration_ms = Some(LIVE_MARKER_DELAY_MS + BRAILLE_SPINNER_FRAME_MS);
         assert_eq!(
-            background_task_spinner_prefix(&task),
-            Some(crate::tui::spinner::BRAILLE_SPINNER_FRAMES[0])
-        );
-
-        task.duration_ms = Some(BRAILLE_SPINNER_FRAME_MS);
-        assert_eq!(
-            background_task_spinner_prefix(&task),
+            background_task_spinner_prefix(&task, false),
             Some(crate::tui::spinner::BRAILLE_SPINNER_FRAMES[1])
         );
     }
@@ -5218,6 +5524,7 @@ mod tests {
     #[test]
     fn tasks_panel_auto_mode_shows_only_live_background_jobs() {
         let mut app = create_test_app();
+        app.low_motion = false;
         app.sidebar_focus = SidebarFocus::Auto;
         app.runtime_turn_id = Some("turn_abcdef123456".to_string());
         app.runtime_turn_status = Some("in_progress".to_string());
@@ -5277,10 +5584,8 @@ mod tests {
             "auto Tasks should keep live background jobs visible: {text:?}"
         );
         assert!(
-            text.iter().any(|line| line.contains(&format!(
-                "{} Bash running",
-                crate::tui::spinner::BRAILLE_SPINNER_FRAMES[0]
-            ))),
+            text.iter()
+                .any(|line| line.contains(&format!("{} Bash running", LIVE_STATIC_MARKER))),
             "auto Tasks should animate running background jobs: {text:?}"
         );
         for hidden in [

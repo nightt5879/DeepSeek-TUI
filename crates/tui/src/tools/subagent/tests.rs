@@ -966,16 +966,16 @@ fn test_parse_spawn_request_accepts_model_strength() {
 }
 
 #[test]
-fn explore_subagent_defaults_to_faster_model_strength() {
-    // type: "explore" with no model_strength and no model defaults to Faster:
-    // bounded read-only lookup is exactly the cheap-sibling job.
+fn explore_subagent_inherits_active_model_by_default() {
+    // Role names never silently change the model. A Fleet without custom
+    // routing should behave exactly like the active session.
     let input = json!({
         "prompt": "find every caller of normalize_model_name",
         "type": "explore"
     });
     let parsed = parse_spawn_request(&input).expect("spawn request should parse");
     assert_eq!(parsed.agent_type, SubAgentType::Explore);
-    assert_eq!(parsed.model_strength, SubAgentModelStrength::Faster);
+    assert_eq!(parsed.model_strength, SubAgentModelStrength::Same);
 
     // Explicit model_strength: "same" wins for explore too.
     let input = json!({
@@ -988,7 +988,7 @@ fn explore_subagent_defaults_to_faster_model_strength() {
     assert_eq!(parsed.model_strength, SubAgentModelStrength::Same);
 
     // An explicit model pins the child (downstream Fixed route) and disables
-    // the explore→faster default, so model_strength falls back to Same.
+    // any strength hint, so model_strength remains Same.
     let input = json!({
         "prompt": "explore on a specific model",
         "type": "explore",
@@ -1234,7 +1234,7 @@ fn test_apply_spawn_profile_accepts_agreeing_explicit_type() {
 }
 
 #[test]
-fn test_apply_spawn_profile_scout_yields_explore_type_and_faster_route() {
+fn test_apply_spawn_profile_scout_yields_explore_type_and_inherits_route() {
     let roster = FleetRoster::built_ins_only();
     let mut request = parse_spawn_request(&json!({"prompt": "map the parser", "profile": "scout"}))
         .expect("parse");
@@ -1246,10 +1246,10 @@ fn test_apply_spawn_profile_scout_yields_explore_type_and_faster_route() {
         .expect("scout model selection");
     assert_eq!(
         selected.model_route,
-        ModelRoute::Faster,
-        "scout's fast loadout routes to the faster sibling"
+        ModelRoute::Inherit,
+        "without Fleet setup the scout inherits the active session model"
     );
-    assert_eq!(selected.source, SpawnRouteSource::AgentProfileLoadout);
+    assert_eq!(selected.source, SpawnRouteSource::RunModel);
 }
 
 #[test]
@@ -1811,8 +1811,9 @@ fn subagent_tool_schemas_advertise_real_type_and_role_vocabulary() {
     assert!(agent_schema["properties"].get("max_depth").is_some());
     let model_strength = schema_property_description(&agent_schema, "model_strength");
     assert!(
-        model_strength.contains("type=explore") && model_strength.contains("faster"),
-        "model_strength description should teach explore/faster routing: {model_strength}"
+        model_strength.contains("inherit the active model")
+            && model_strength.contains("Choose faster explicitly"),
+        "model_strength description should teach predictable default routing: {model_strength}"
     );
     let thinking = schema_property_description(&agent_schema, "thinking");
     assert!(

@@ -585,7 +585,7 @@ impl HotbarActionSource for BuiltinHotbarActionSource {
             "mode.operate",
             "operate",
             "Operate mode",
-            "Manage Fleet workers, subagents, and workflow lanes.",
+            "Coordinate a Fleet for multi-step work.",
             AppHotbarKind::Mode(AppMode::Operate),
         ));
         registry.register(AppHotbarAction::new(

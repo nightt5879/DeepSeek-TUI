@@ -24,7 +24,7 @@ use codewhale_config::pricing::OfferingPricing;
 use crate::codex_model_cache::{
     self, CodexModelCacheFreshness, CodexModelMetadata, CodexModelRoster,
 };
-use crate::config::{ApiProvider, Config};
+use crate::config::{ApiProvider, Config, DEEPSEEK_ALIAS_REPLACEMENT};
 use crate::model_profile::{
     CapabilityOverride, SupportState, resolved_capability_profile_with_overrides,
 };
@@ -58,9 +58,11 @@ const AUTO_MODEL_PICKER_EFFORTS: &[ReasoningEffort] = &[ReasoningEffort::Auto];
 
 /// `/model` catalog views (#4115).
 ///
-/// Configured stays the conservative default. Discoverability views (Recent /
-/// Coding / Cheap / Long context) never auto-select a surprising route — the
-/// active model remains the selection until the operator moves.
+/// Configured stays the calm default. Typing searches every provider and a
+/// cross-provider selection switches its route transactionally, so `/provider`
+/// is never a prerequisite. Discoverability views (Recent / Coding / Cheap /
+/// Long context) never auto-select a surprising route — the active model
+/// remains the selection until the operator moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelListView {
     Configured,
@@ -139,6 +141,10 @@ enum Pane {
 
 pub struct ModelPickerView {
     initial_model: String,
+    /// Exact runtime value before the picker opened. Keep this raw so choosing
+    /// the canonical replacement for a retired alias performs a real migration
+    /// instead of being misclassified as "unchanged".
+    previous_model: String,
     initial_provider: ApiProvider,
     initial_effort: ReasoningEffort,
     active_accepts_custom_model_ids: bool,
@@ -198,6 +204,11 @@ impl ModelPickerView {
         let initial_model = if app.auto_model {
             "auto".to_string()
         } else {
+            picker_visible_model_id(app.api_provider, &app.model).to_string()
+        };
+        let previous_model = if app.auto_model {
+            "auto".to_string()
+        } else {
             app.model.clone()
         };
         let model_rows = picker_model_rows_for_app(app, config);
@@ -236,6 +247,7 @@ impl ModelPickerView {
 
         let mut view = Self {
             initial_model,
+            previous_model,
             initial_provider: app.api_provider,
             initial_effort,
             active_accepts_custom_model_ids: app.accepts_custom_model_ids(),
@@ -514,7 +526,7 @@ impl ModelPickerView {
             model: self.resolved_model(),
             provider,
             effort: self.resolved_effort(),
-            previous_model: self.initial_model.clone(),
+            previous_model: self.previous_model.clone(),
             previous_effort: self.initial_effort,
         }
     }
@@ -683,7 +695,7 @@ fn fit_text(text: &str, width: usize) -> String {
 #[cfg(test)]
 fn picker_model_ids_for_provider(provider: ApiProvider) -> Vec<String> {
     let mut models = vec!["auto".to_string()];
-    for id in all_catalog_models_for_provider(provider) {
+    for id in provider_catalog_model_ids(provider) {
         if id != "auto" && !models.iter().any(|m| m.eq_ignore_ascii_case(&id)) {
             models.push(id);
         }
@@ -713,7 +725,10 @@ fn picker_model_rows_for_app(app: &App, config: &Config) -> Vec<ModelPickerRow> 
             .map(|model| model.trim())
             .filter(|model| !model.is_empty())
         {
-            push_model_id(&mut models, model);
+            push_model_id(
+                &mut models,
+                picker_visible_model_id(app.api_provider, model),
+            );
         }
         models
     } else {
@@ -743,7 +758,7 @@ fn picker_model_rows_for_app(app: &App, config: &Config) -> Vec<ModelPickerRow> 
             .map(|model| model.trim())
             .filter(|model| !model.is_empty())
         {
-            push_model_id(&mut model_ids, model);
+            push_model_id(&mut model_ids, picker_visible_model_id(provider, model));
         }
         push_provider_model_rows(
             &mut rows,
@@ -796,7 +811,11 @@ fn push_provider_model_rows(
 }
 
 fn provider_catalog_model_ids(provider: ApiProvider) -> Vec<String> {
-    all_catalog_models_for_provider(provider)
+    let mut models = Vec::new();
+    for id in all_catalog_models_for_provider(provider) {
+        push_model_id(&mut models, picker_visible_model_id(provider, &id));
+    }
+    models
 }
 
 fn provider_scoped_model_ids_for_app(app: &App, include_current_model: bool) -> Vec<String> {
@@ -804,7 +823,7 @@ fn provider_scoped_model_ids_for_app(app: &App, include_current_model: bool) -> 
     // separate custom/current-model row.
     let mut models = Vec::new();
     push_model_id(&mut models, "auto");
-    for id in all_catalog_models_for_provider(app.api_provider) {
+    for id in provider_catalog_model_ids(app.api_provider) {
         push_model_id(&mut models, &id);
     }
 
@@ -814,11 +833,17 @@ fn provider_scoped_model_ids_for_app(app: &App, include_current_model: bool) -> 
         .map(|model| model.trim())
         .filter(|model| !model.is_empty())
     {
-        push_model_id(&mut models, model);
+        push_model_id(
+            &mut models,
+            picker_visible_model_id(app.api_provider, model),
+        );
     }
 
     if include_current_model && !app.auto_model {
-        push_model_id(&mut models, app.model.trim());
+        push_model_id(
+            &mut models,
+            picker_visible_model_id(app.api_provider, app.model.trim()),
+        );
     }
 
     models
@@ -834,6 +859,20 @@ fn push_model_id(models: &mut Vec<String>, model: &str) {
         .any(|existing| existing.eq_ignore_ascii_case(model))
     {
         models.push(model.to_string());
+    }
+}
+
+/// Keep temporary DeepSeek compatibility aliases callable without presenting
+/// them as current model choices. This is deliberately provider-scoped:
+/// `deepseek-reasoner` is a native wire id for providers such as Wanjie Ark.
+fn picker_visible_model_id(provider: ApiProvider, model: &str) -> &str {
+    if provider == ApiProvider::Deepseek
+        && (model.eq_ignore_ascii_case("deepseek-chat")
+            || model.eq_ignore_ascii_case("deepseek-reasoner"))
+    {
+        DEEPSEEK_ALIAS_REPLACEMENT
+    } else {
+        model
     }
 }
 
@@ -899,17 +938,34 @@ fn model_row_matches_query(
     if query.is_empty() {
         return true;
     }
-    let provider_matches = row.provider.is_some_and(|provider| {
-        provider.as_str().to_ascii_lowercase().contains(&query)
-            || provider
-                .display_name()
-                .to_ascii_lowercase()
-                .contains(&query)
-    });
+    let normalized_query = normalize_picker_search_text(&query);
+    let matches = |candidate: &str| {
+        let candidate = candidate.to_ascii_lowercase();
+        candidate.contains(&query)
+            || normalize_picker_search_text(&candidate).contains(&normalized_query)
+    };
+    let provider_matches = row
+        .provider
+        .is_some_and(|provider| matches(provider.as_str()) || matches(provider.display_name()));
     provider_matches
-        || row.id.to_ascii_lowercase().contains(&query)
+        || matches(&row.id)
         || ((row.provider.is_none() || row.provider == Some(initial_provider))
-            && row.hint.to_ascii_lowercase().contains(&query))
+            && matches(&row.hint))
+}
+
+fn normalize_picker_search_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn model_row_label(row: &ModelPickerRow, initial_provider: ApiProvider) -> String {
@@ -1396,11 +1452,10 @@ impl ModelPickerView {
         let inner = outer.inner(popup_area);
         outer.render(popup_area, buf);
 
-        // Keep the long-standing "browse all" label on Configured so footer
-        // discoverability tests and muscle memory stay intact; other views
-        // preview the next named view (#4115).
+        // Say what the action does in model language. Provider changes are an
+        // implementation detail of applying a cross-provider model row.
         let view_action = match self.view {
-            ModelListView::Configured => "browse all",
+            ModelListView::Configured => "browse catalog",
             other => other.next().title_label(),
         };
         let content = render_modal_footer(
@@ -1409,7 +1464,7 @@ impl ModelPickerView {
             &[
                 ActionHint::new("↑↓", "move"),
                 ActionHint::new("Tab", "switch"),
-                ActionHint::new("Type", "filter"),
+                ActionHint::new("Type", "search any model"),
                 ActionHint::new("Enter", "apply"),
                 ActionHint::new("A", view_action),
                 ActionHint::new("Esc", "cancel"),
@@ -2053,6 +2108,78 @@ mod tests {
     }
 
     #[test]
+    fn muse_session_can_select_deepseek_flash_without_provider_first() {
+        let (mut app, config, _lock) = create_test_app();
+        app.api_provider = crate::config::ApiProvider::Meta;
+        app.model = "muse-spark-1.1".to_string();
+        app.auto_model = false;
+
+        let mut view = ModelPickerView::new(&app, &config);
+        assert_eq!(view.view, ModelListView::Configured);
+        type_model_query(&mut view, "deepseek v4 flash");
+        let flash = view
+            .visible_model_rows()
+            .iter()
+            .position(|row| {
+                row.id == "deepseek-v4-flash"
+                    && row.provider == Some(crate::config::ApiProvider::Deepseek)
+            })
+            .expect("typing a model name searches every provider");
+        view.selected_model_idx = flash;
+
+        assert_eq!(view.resolved_model(), "deepseek-v4-flash");
+        assert_eq!(
+            view.resolved_provider(),
+            Some(crate::config::ApiProvider::Deepseek)
+        );
+        assert!(matches!(
+            view.build_event(),
+            ViewEvent::ModelPickerApplied {
+                provider: Some(crate::config::ApiProvider::Deepseek),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn stale_deepseek_alias_is_migrated_out_of_picker_choices() {
+        let (mut app, config, _lock) = create_test_app();
+        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.model = "deepseek-reasoner".to_string();
+        app.auto_model = false;
+        app.provider_models
+            .insert("deepseek".to_string(), "deepseek-reasoner".to_string());
+
+        let view = ModelPickerView::new(&app, &config);
+        let ids = view.visible_model_ids();
+        assert!(ids.contains(&"deepseek-v4-flash"));
+        assert!(!ids.contains(&"deepseek-chat"));
+        assert!(!ids.contains(&"deepseek-reasoner"));
+        assert_eq!(view.resolved_model(), "deepseek-v4-flash");
+        assert!(matches!(
+            view.build_event(),
+            ViewEvent::ModelPickerApplied {
+                model,
+                previous_model,
+                ..
+            } if model == "deepseek-v4-flash" && previous_model == "deepseek-reasoner"
+        ));
+
+        let completions = provider_scoped_model_completion_ids(&app);
+        assert!(completions.iter().any(|id| id == "deepseek-v4-flash"));
+        assert!(!completions.iter().any(|id| id == "deepseek-chat"));
+        assert!(!completions.iter().any(|id| id == "deepseek-reasoner"));
+    }
+
+    #[test]
+    fn provider_native_reasoner_id_is_not_globally_rewritten() {
+        assert_eq!(
+            picker_visible_model_id(crate::config::ApiProvider::WanjieArk, "deepseek-reasoner"),
+            "deepseek-reasoner"
+        );
+    }
+
+    #[test]
     fn picker_initial_selection_matches_auto_state() {
         let (mut app, config, _lock) = create_test_app();
         app.model = "auto".to_string();
@@ -2450,6 +2577,21 @@ mod tests {
             &row,
             "z-ai/",
             ApiProvider::Deepseek
+        ));
+    }
+
+    #[test]
+    fn model_row_query_treats_hyphens_like_human_word_breaks() {
+        let row = ModelPickerRow {
+            id: "deepseek-v4-flash".to_string(),
+            provider: Some(ApiProvider::Deepseek),
+            hint: String::new(),
+            metadata: EffectivePickerMetadata::default(),
+        };
+        assert!(model_row_matches_query(
+            &row,
+            "deepseek v4 flash",
+            ApiProvider::Meta
         ));
     }
 
@@ -3149,7 +3291,14 @@ mod tests {
             let text = rows.join("\n");
 
             // Footer keeps every action (it wraps instead of clipping).
-            for label in ["move", "switch", "filter", "apply", "browse all", "cancel"] {
+            for label in [
+                "move",
+                "switch",
+                "search any model",
+                "apply",
+                "browse catalog",
+                "cancel",
+            ] {
                 assert!(text.contains(label), "{w}x{h}: missing '{label}' hint");
             }
             // The shared list/detail layout keeps both picker panes visible;

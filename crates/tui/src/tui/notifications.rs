@@ -269,13 +269,7 @@ pub fn clear_taskbar_progress() {
     set_taskbar_progress(0, None);
 }
 
-/// Animation frame characters for the terminal title.
-/// Uses the DeepSeek whale emoji (🐳 spouting, 🐋 resting) to match the
-/// existing header status indicator in the TUI.
-const TITLE_FRAMES: &[&str] = &["🐳", "🐋", "🐳", "🐋"];
-const TITLE_ANIMATION_INTERVAL: Duration = Duration::from_millis(800);
-
-/// Shared flag controlling the title animation loop. Set to `true` by
+/// Shared flag controlling the title activity marker. Set to `true` by
 /// `start_title_animation()`, cleared by `stop_title_animation()`.
 static TITLE_ANIMATION_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -287,58 +281,30 @@ fn set_terminal_title(title: &str) {
     let _ = stdout.flush();
 }
 
-/// Tracks whether the ✅ completion marker was set, so
+/// Tracks whether the completion marker was set, so
 /// `reset_title_on_interaction()` can skip redundant writes.
 static COMPLETION_MARKER_SHOWN: AtomicBool = AtomicBool::new(false);
 
-/// Start an animated terminal title spinner.
-///
-/// Cycles the terminal title between 🐳→🐋 every 800ms while processing,
-/// matching the whale status indicator in the TUI header, so alt-tabbed
-/// users can see activity.
-///
-/// The animation runs in a background tokio task that checks
-/// `TITLE_ANIMATION_RUNNING`. Each call restarts the animation with the
-/// given `original` base title — safe to call on every turn start.
+/// Mark the terminal title as active. Window chrome stays static so an
+/// alt-tabbed session communicates state without another competing spinner.
 pub fn start_title_animation(original: &str) {
-    // Signal any existing animation loop to exit, then start fresh.
     TITLE_ANIMATION_RUNNING.store(true, Ordering::SeqCst);
-    let base = original.to_string();
-    tokio::spawn(async move {
-        let mut frame = 0usize;
-        while TITLE_ANIMATION_RUNNING.load(Ordering::SeqCst) {
-            // Yield once per frame so a racing stop_title_animation()
-            // can observe the cleared flag and apply the completion
-            // marker before the next frame write. Without this yield
-            // the background task could overwrite the ✅ marker with
-            // the next whale frame.
-            tokio::task::yield_now().await;
-            if !TITLE_ANIMATION_RUNNING.load(Ordering::SeqCst) {
-                break;
-            }
-            let spinner = TITLE_FRAMES[frame % TITLE_FRAMES.len()];
-            set_terminal_title(&format!("{spinner} {base}"));
-            frame += 1;
-            tokio::time::sleep(TITLE_ANIMATION_INTERVAL).await;
-        }
-        // Don't restore title here — stop_title_animation() handles
-        // what to show on completion (e.g. ✅ marker).
-    });
+    set_terminal_title(&format!("› {original}"));
 }
 
 /// Stop the title animation and show a completion marker.
 ///
-/// Sets the title to `✅ <base>` so alt-tabbed users see at a glance
+/// Sets the title to `✓ <base>` so alt-tabbed users see at a glance
 /// that processing finished. The marker is overwritten on the next turn
 /// by [`start_title_animation`].
 pub fn stop_title_animation() {
     TITLE_ANIMATION_RUNNING.store(false, Ordering::SeqCst);
     COMPLETION_MARKER_SHOWN.store(false, Ordering::SeqCst);
-    // Show ✅ marker only for beep mode. Bell mode already has its own
+    // Show a completion marker only for beep mode. Bell mode already has its own
     // terminal-level visual indicator (flash/icon).
     let mode = COMPLETION_SOUND_MODE.load(Ordering::SeqCst);
     if mode == 1 {
-        set_terminal_title("✅ CodeWhale");
+        set_terminal_title("✓ CodeWhale");
     }
     play_completion_sound();
 }
@@ -353,7 +319,7 @@ pub fn stop_title_animation_quietly() {
     set_terminal_title("CodeWhale");
 }
 
-/// Clear the ✅ completion marker from the title when the user interacts.
+/// Clear the completion marker from the title when the user interacts.
 ///
 /// Call this on every user input event (key press, mouse click) so the
 /// marker doesn't persist once the user is back at the terminal.

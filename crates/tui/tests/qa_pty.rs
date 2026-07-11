@@ -58,6 +58,10 @@ fn spawn_minimal(
         // Force a known base URL so the doctor / model probe never escapes
         // the box. 127.0.0.1:1 will refuse instantly.
         .env("DEEPSEEK_BASE_URL", "http://127.0.0.1:1")
+        // PTY scenarios assert state transitions, not animation cadence. Freeze
+        // ambient motion so wait_for_idle measures product state instead of a
+        // decorative ocean frame.
+        .env("NO_ANIMATIONS", "1")
         .env("RUST_LOG", "warn")
         .args([
             "--workspace",
@@ -91,13 +95,14 @@ fn assert_viewport_starts_at_top(frame: &qa_harness::Frame) {
         first_row, 0,
         "viewport content drifted below row 0:\n{dump}"
     );
+    let header = frame.row(0).to_ascii_lowercase();
     assert!(
-        frame.row(0).contains("Plan")
-            || frame.row(0).contains("Act")
-            || frame.row(0).contains("Agent")
-            || frame.row(0).contains("Operate")
-            || frame.row(0).contains("Yolo")
-            || frame.row(0).contains("DeepSeek"),
+        header.contains("plan")
+            || header.contains("act")
+            || header.contains("agent")
+            || header.contains("operate")
+            || header.contains("yolo")
+            || header.contains("deepseek"),
         "expected header content on row 0:\n{dump}"
     );
 }

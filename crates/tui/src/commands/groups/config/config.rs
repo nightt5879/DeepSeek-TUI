@@ -1684,6 +1684,10 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             app.fancy_animations = settings.fancy_animations;
             app.needs_redraw = true;
         }
+        "ocean_treatment" | "treatment" | "background_treatment" => {
+            app.ocean_treatment = settings.ocean_treatment.clone();
+            app.needs_redraw = true;
+        }
         "bracketed_paste" | "paste" => {
             app.use_bracketed_paste = settings.bracketed_paste;
             app.needs_redraw = true;
@@ -2713,7 +2717,7 @@ Parse error: permissions.toml at permissions.toml could not be parsed: expected 
     }
 
     #[test]
-    fn config_fancy_animations_obeys_ghostty_override() {
+    fn config_fancy_animations_keeps_ghostty_frame_cap_without_disabling_motion() {
         let temp_root = env::temp_dir().join(format!(
             "codewhale-tui-ghostty-fancy-config-test-{}",
             std::process::id()
@@ -2727,18 +2731,19 @@ Parse error: permissions.toml at permissions.toml could not be parsed: expected 
         }
 
         let mut app = create_test_app();
-        assert!(!app.fancy_animations);
+        assert!(app.fancy_animations);
+        assert!(app.constrained_frame_rate);
 
         let result = set_config_value(&mut app, "fancy_animations", "true", false);
 
         assert!(!result.is_error);
         assert!(
-            !app.fancy_animations,
-            "Ghostty compatibility override must keep the water strip disabled"
+            app.fancy_animations,
+            "Ghostty compatibility must cap redraws without disabling motion"
         );
         assert_eq!(
             result.message.as_deref(),
-            Some("fancy_animations = false (session only, add --save to persist)")
+            Some("fancy_animations = true (session only, add --save to persist)")
         );
 
         // Safety: cleanup under EnvGuard's lock.

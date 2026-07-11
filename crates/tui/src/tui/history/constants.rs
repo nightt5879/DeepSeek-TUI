@@ -7,7 +7,7 @@ pub(super) const TOOL_HEADER_SUMMARY_LIMIT: usize = 56;
 pub(super) const TOOL_OUTPUT_HEAD_LINES: usize = 2;
 pub(super) const TOOL_OUTPUT_TAIL_LINES: usize = 2;
 #[cfg(test)]
-pub(super) const TOOL_RUNNING_SYMBOLS: [&str; 12] = crate::tui::spinner::BRAILLE_SPINNER_FRAMES;
+pub(super) const TOOL_RUNNING_SYMBOLS: [&str; 8] = crate::tui::spinner::BRAILLE_SPINNER_FRAMES;
 #[cfg(test)]
 pub(super) const TOOL_STATUS_SYMBOL_MS: u64 = crate::tui::spinner::BRAILLE_SPINNER_FRAME_MS;
 /// Visual marker for the user role at the start of their message line. Solid
@@ -22,7 +22,7 @@ pub(super) const ASSISTANT_GLYPH: &str = "\u{25CF}"; // ●
 /// competing with content.
 pub(super) const TRANSCRIPT_RAIL: &str = "\u{258F} "; // ▏ + space
 pub(super) const TOOL_CARD_SUMMARY_LINES: usize = 4;
-pub(super) const TOOL_DONE_SYMBOL: &str = "•";
-pub(super) const TOOL_FAILED_SYMBOL: &str = "•";
+pub(super) const TOOL_DONE_SYMBOL: &str = "✓";
+pub(super) const TOOL_FAILED_SYMBOL: &str = "✕";
 /// Compact Ctrl+B affordance for foreground shell waits in the live transcript.
 pub(super) const FOREGROUND_SHELL_WAIT_HINT: &str = "Ctrl+B → /jobs";

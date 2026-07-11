@@ -11864,14 +11864,14 @@ fn build_pending_input_preview_includes_current_context_chips() {
 }
 
 #[test]
-fn render_footer_from_with_default_items_renders_model_without_mode() {
-    // Header owns mode; footer shows model/cost/status only.
+fn render_footer_from_with_default_items_leaves_header_owned_facts_out() {
+    // Header owns model and mode; footer shows cost/status only.
     let mut app = create_test_app();
     app.session.session_cost = 0.00005;
     let items = crate::config::StatusItem::default_footer();
     let props = render_footer_from(&app, &items, None);
     assert!(props.mode_label.is_empty(), "footer should not repeat mode");
-    assert!(!props.model.is_empty(), "footer should show a model name");
+    assert!(props.model.is_empty(), "footer should not repeat model");
     // Tiny but real costs should render instead of disappearing as "$0.00".
     assert!(!props.cost.is_empty());
     assert_eq!(spans_text(&props.cost), "<$0.0001");
@@ -11977,7 +11977,7 @@ fn render_footer_from_drops_only_unselected_clusters() {
         .collect();
     let props = render_footer_from(&app, &items, None);
     assert!(props.mode_label.is_empty());
-    assert!(!props.model.is_empty(), "footer should show a model name");
+    assert!(props.model.is_empty(), "footer should not repeat model");
     assert!(
         props.cost.is_empty(),
         "cost cluster should be empty when Cost is disabled"

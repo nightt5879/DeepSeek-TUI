@@ -1563,6 +1563,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         tools: config.tools.clone(),
         workspace_follow_symlinks: app.workspace_follow_symlinks,
         exec_policy_engine: config.exec_policy_engine.clone(),
+        terminal_chrome_enabled: true,
     }
 }
 
@@ -3609,13 +3610,32 @@ async fn run_event_loop(
         maybe_throttled_recovery_snapshot(app, Instant::now(), &mut last_recovery_snapshot_at);
         let history_has_live_motion = history_has_live_motion(&app.history);
         let active_cell_has_live_motion = active_cell_has_live_motion(app);
-        if should_tick_status_animation(
+        let underwater_idle_motion = !app.low_motion
+            && app.fancy_animations
+            && app.ocean_treatment == "ombre"
+            && crate::tui::ocean::OceanRamp::for_theme(&app.ui_theme).is_some()
+            && app.onboarding == OnboardingState::None
+            && !app.attention_hold_active()
+            && app.history.is_empty()
+            && app.input.trim().is_empty()
+            && app
+                .active_cell
+                .as_ref()
+                .is_none_or(crate::tui::active_cell::ActiveCell::is_empty)
+            && !app.is_loading;
+        let status_motion = should_tick_status_animation(
             app,
             has_running_agents,
             history_has_live_motion,
             active_cell_has_live_motion,
-        ) && last_status_frame.elapsed()
-            >= Duration::from_millis(status_animation_interval_ms(app))
+        );
+        let animation_interval_ms = if status_motion {
+            status_animation_interval_ms(app)
+        } else {
+            125
+        };
+        if (status_motion || underwater_idle_motion)
+            && last_status_frame.elapsed() >= Duration::from_millis(animation_interval_ms)
         {
             if streaming_thinking::animate_pending_translation(
                 app,
@@ -3694,7 +3714,7 @@ async fn run_event_loop(
         // Sync low-motion flag into the frame-rate limiter and streaming
         // chunking policy. Low-motion mode drops the frame cap to 30 FPS
         // and forces Smooth-only chunking so the display stays calm.
-        frame_rate_limiter.set_low_motion(app.low_motion);
+        frame_rate_limiter.set_low_motion(app.low_motion || app.constrained_frame_rate);
         app.streaming_state.set_low_motion(app.low_motion);
 
         let draw_wait = if app.needs_redraw {
@@ -8609,8 +8629,12 @@ async fn apply_command_result(
                     // Avoids re-reading settings.toml from disk on every
                     // `/theme` invocation.
                     let original = app.theme_id.name().to_string();
-                    app.view_stack
-                        .push(crate::tui::theme_picker::ThemePickerView::new(original));
+                    app.view_stack.push(
+                        crate::tui::theme_picker::ThemePickerView::new_with_treatment(
+                            original,
+                            app.ocean_treatment.clone(),
+                        ),
+                    );
                 }
             }
             AppAction::OpenFleetRoster => {
@@ -9656,6 +9680,7 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
         app.mention_menu_selected = mention_menu_entries.len().saturating_sub(1);
     }
     let context_usage = context_usage_snapshot(app);
+    let top_work_strip_height = super::sidebar::top_work_strip_height(app, size.width);
 
     // Defensive two-pass layout: pin the header to the absolute top row,
     // then split the remaining body area for chat / preview / composer /
@@ -9673,7 +9698,7 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
 
     let body_height = body_area.height;
     let composer_max_height = body_height
-        .saturating_sub(MIN_CHAT_HEIGHT + footer_height)
+        .saturating_sub(MIN_CHAT_HEIGHT + footer_height + top_work_strip_height)
         .max(MIN_COMPOSER_HEIGHT);
     let composer_height = {
         let composer_widget = ComposerWidget::new(
@@ -9704,6 +9729,7 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
         .direction(Direction::Vertical)
         .flex(ratatui::layout::Flex::Start)
         .constraints([
+            Constraint::Length(top_work_strip_height), // Tasks + To-do above transcript
             Constraint::Min(1),                        // Chat area
             Constraint::Length(workflow_panel_height), // Workflow panel (#4121)
             Constraint::Length(preview_height),        // Pending input preview (0 if empty)
@@ -9711,6 +9737,10 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
             Constraint::Length(footer_height),         // Footer
         ])
         .split(body_area);
+
+    if top_work_strip_height > 0 {
+        super::sidebar::render_top_work_strip(f, body_chunks[0], app);
+    }
 
     // Render header
     {
@@ -9807,19 +9837,19 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
         // resize) don't retain stale content from a previous frame.
         Block::default()
             .style(Style::default().bg(app.ui_theme.surface_bg))
-            .render(body_chunks[0], f.buffer_mut());
+            .render(body_chunks[1], f.buffer_mut());
 
         let mut sidebar_area = None;
 
         // When the file-tree pane is visible and the terminal is wide
         // enough, reserve the left ~25% for the file tree.
         let mut chat_area =
-            if app.file_tree.is_some() && body_chunks[0].width >= SIDEBAR_VISIBLE_MIN_WIDTH {
+            if app.file_tree.is_some() && body_chunks[1].width >= SIDEBAR_VISIBLE_MIN_WIDTH {
                 app.file_tree_visible = true;
                 let split = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
-                    .split(body_chunks[0]);
+                    .split(body_chunks[1]);
                 let tree_area = split[0];
                 let remaining = split[1];
 
@@ -9831,7 +9861,7 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
                 remaining
             } else {
                 app.file_tree_visible = false;
-                body_chunks[0]
+                body_chunks[1]
             };
 
         // Auto-reveal: in Auto focus mode, collapse the sidebar to a
@@ -9976,7 +10006,7 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
     // Workflow panel between chat and pending-input preview (#4121).
     if workflow_panel_height > 0 {
         if let Some(panel) = app.workflow_panel.as_ref() {
-            let area = body_chunks[1];
+            let area = body_chunks[2];
             app.viewport.last_workflow_panel_area = Some(area);
             let buf = f.buffer_mut();
             panel.render(area, buf);
@@ -9988,7 +10018,7 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
     // Render pending-input preview (queued/steered messages, if any).
     if preview_height > 0 {
         let buf = f.buffer_mut();
-        pending_preview.render(body_chunks[2], buf);
+        pending_preview.render(body_chunks[3], buf);
     }
 
     // Render composer
@@ -10000,16 +10030,25 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
             &mention_menu_entries,
         );
         let buf = f.buffer_mut();
-        composer_widget.render(body_chunks[3], buf);
-        composer_widget.cursor_pos(body_chunks[3])
+        composer_widget.render(body_chunks[4], buf);
+        composer_widget.cursor_pos(body_chunks[4])
     };
-    app.viewport.last_composer_area = Some(body_chunks[3]);
+    app.viewport.last_composer_area = Some(body_chunks[4]);
     {
-        let area = body_chunks[3];
-        let has_panel = app.composer_border && area.height >= 3 && area.width >= 12;
-        let inner = if has_panel {
+        let area = body_chunks[4];
+        let composer_widget = ComposerWidget::new(
+            app,
+            composer_max_height,
+            &slash_menu_entries,
+            &mention_menu_entries,
+        );
+        let inner = if composer_widget.has_panel(area) {
             ratatui::widgets::Block::default()
                 .borders(ratatui::widgets::Borders::ALL)
+                .inner(area)
+        } else if area.height >= 2 {
+            ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::TOP)
                 .inner(area)
         } else {
             area
@@ -10057,11 +10096,11 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
     }
 
     // Render footer
-    render_footer(f, body_chunks[4], app);
+    render_footer(f, body_chunks[5], app);
     // Toast stack overlay (#439): when multiple status toasts are queued,
     // surface the older ones as a 1-2 line strip above the footer so a
     // burst of events isn't collapsed to a single visible message.
-    render_toast_stack_overlay(f, size, body_chunks[3], body_chunks[4], app);
+    render_toast_stack_overlay(f, size, body_chunks[4], body_chunks[5], app);
 
     // Decision card overlay (v0.8.43 truth-surface). When a decision card is
     // active, render it centered on top of the transcript.

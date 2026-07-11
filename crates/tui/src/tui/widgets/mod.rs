@@ -65,6 +65,10 @@ pub struct ChatWidget {
     scrollbar: Option<TranscriptScrollbar>,
     jump_to_latest_button: Option<Rect>,
     background: Color,
+    ocean_ramp: Option<crate::tui::ocean::OceanRamp>,
+    ocean_elapsed_ms: u128,
+    ocean_animated: bool,
+    ambient_life: bool,
     scroll_track: Color,
     scroll_thumb: Color,
     jump_border: Color,
@@ -82,6 +86,13 @@ impl ChatWidget {
     pub fn new(app: &mut App, area: Rect) -> Self {
         let content_area = area;
         let background = app.ui_theme.surface_bg;
+        let ocean_ramp = (app.ocean_treatment == "ombre")
+            .then(|| crate::tui::ocean::OceanRamp::for_theme(&app.ui_theme))
+            .flatten();
+        let ocean_elapsed_ms = app.ocean_started_at.elapsed().as_millis();
+        let ocean_animated =
+            !app.low_motion && app.fancy_animations && !app.attention_hold_active();
+        let render_empty_state = should_render_empty_state(app);
         let scroll_track = app.ui_theme.border;
         let scroll_thumb = app.ui_theme.status_working;
         let jump_border = app.ui_theme.border;
@@ -89,7 +100,7 @@ impl ChatWidget {
         let visible_lines = content_area.height as usize;
         let render_options = app.transcript_render_options();
 
-        if should_render_empty_state(app) {
+        if render_empty_state {
             let lines = build_empty_state_lines(app, content_area);
             app.viewport.last_transcript_area = Some(content_area);
             app.viewport.last_transcript_top = 0;
@@ -103,6 +114,10 @@ impl ChatWidget {
                 scrollbar: None,
                 jump_to_latest_button: None,
                 background,
+                ocean_ramp,
+                ocean_elapsed_ms,
+                ocean_animated,
+                ambient_life: app.input.trim().is_empty() && !app.attention_hold_active(),
                 scroll_track,
                 scroll_thumb,
                 jump_border,
@@ -400,6 +415,10 @@ impl ChatWidget {
             scrollbar,
             jump_to_latest_button,
             background,
+            ocean_ramp,
+            ocean_elapsed_ms,
+            ocean_animated,
+            ambient_life: false,
             scroll_track,
             scroll_thumb,
             jump_border,
@@ -506,6 +525,16 @@ impl Renderable for ChatWidget {
             Paragraph::new(self.lines.clone()).style(Style::default().bg(self.background));
         paragraph.render(area, buf);
 
+        render_underwater_field(
+            area,
+            buf,
+            self.ocean_ramp,
+            &self.lines,
+            self.ambient_life,
+            self.ocean_elapsed_ms,
+            self.ocean_animated,
+        );
+
         // #3029: the transcript carries OSC 8 hyperlinks in-band inside span
         // content. Scan the rendered buffer for those payloads, blank the
         // payload cells (so no cell ever holds `\x1b`/`]8;;` — fixes the
@@ -544,6 +573,150 @@ impl Renderable for ChatWidget {
 
     fn desired_height(&self, _width: u16) -> u16 {
         1
+    }
+}
+
+fn render_underwater_field(
+    area: Rect,
+    buf: &mut Buffer,
+    ramp: Option<crate::tui::ocean::OceanRamp>,
+    lines: &[Line<'static>],
+    ambient_life: bool,
+    elapsed_ms: u128,
+    animated: bool,
+) {
+    let Some(ramp) = ramp else {
+        return;
+    };
+
+    for local_y in 0..area.height {
+        let protected = lines
+            .get(usize::from(local_y))
+            .and_then(occupied_text_bounds);
+        let row_bg = if animated {
+            ramp.color_at_phase(local_y, area.height, elapsed_ms)
+        } else {
+            ramp.color_at(local_y, area.height)
+        };
+        for local_x in 0..area.width {
+            let is_protected = protected.is_some_and(|(start, end)| {
+                usize::from(local_x) >= start && usize::from(local_x) < end
+            });
+            if !is_protected {
+                buf[(area.x + local_x, area.y + local_y)].set_bg(row_bg);
+            }
+        }
+    }
+
+    if ambient_life {
+        render_ambient_life(area, buf, ramp, lines, elapsed_ms, animated);
+    }
+}
+
+fn occupied_text_bounds(line: &Line<'_>) -> Option<(usize, usize)> {
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    if text.trim().is_empty() {
+        return None;
+    }
+
+    let leading = text
+        .chars()
+        .take_while(|ch| ch.is_whitespace())
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum::<usize>();
+    let total = UnicodeWidthStr::width(text.as_str());
+    let trailing = text
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_whitespace())
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum::<usize>();
+    Some((leading, total.saturating_sub(trailing)))
+}
+
+fn render_ambient_life(
+    area: Rect,
+    buf: &mut Buffer,
+    ramp: crate::tui::ocean::OceanRamp,
+    lines: &[Line<'static>],
+    elapsed_ms: u128,
+    animated: bool,
+) {
+    if area.width < 68 || area.height < 15 {
+        return;
+    }
+
+    let (drift_a, fish_a_forward) = if animated {
+        ambient_ping_pong(elapsed_ms, 620, 11, 0)
+    } else {
+        (0, true)
+    };
+    let (drift_b, fish_b_forward) = if animated {
+        ambient_ping_pong(elapsed_ms, 760, 8, 1_900)
+    } else {
+        (0, false)
+    };
+    let rise = if animated {
+        u16::try_from((elapsed_ms / 1_100) % 4).unwrap_or(0)
+    } else {
+        0
+    };
+    let marks = [
+        (
+            area.width / 9 + drift_a,
+            area.height * 7 / 10,
+            if fish_a_forward { "><>" } else { "<><" },
+        ),
+        (
+            (area.width * 4 / 5).saturating_sub(drift_b),
+            area.height * 2 / 5,
+            if fish_b_forward { "><>" } else { "<><" },
+        ),
+        (
+            area.width * 3 / 4,
+            (area.height / 4).saturating_sub(rise),
+            "°",
+        ),
+    ];
+    for (local_x, local_y, mark) in marks {
+        let protected = lines
+            .get(usize::from(local_y))
+            .and_then(occupied_text_bounds);
+        let mark_width = UnicodeWidthStr::width(mark);
+        let collides = protected.is_some_and(|(start, end)| {
+            usize::from(local_x) < end && usize::from(local_x) + mark_width > start
+        });
+        if collides || local_x.saturating_add(mark_width as u16) > area.width {
+            continue;
+        }
+        for (offset, ch) in mark.chars().enumerate() {
+            buf[(area.x + local_x + offset as u16, area.y + local_y)]
+                .set_symbol(&ch.to_string())
+                .set_fg(ramp.ambient);
+        }
+    }
+}
+
+/// Discrete cells cannot use CSS easing, so continuity matters more than raw
+/// speed. This triangular path reverses instead of wrapping/teleporting, and
+/// per-fish cadence/phase keeps the empty field from looking synchronized.
+fn ambient_ping_pong(elapsed_ms: u128, step_ms: u128, span: u16, phase_ms: u128) -> (u16, bool) {
+    if span == 0 || step_ms == 0 {
+        return (0, true);
+    }
+    let period = u128::from(span) * 2;
+    let phase = ((elapsed_ms + phase_ms) / step_ms) % period;
+    if phase <= u128::from(span) {
+        (u16::try_from(phase).unwrap_or(span), true)
+    } else {
+        (
+            u16::try_from(period.saturating_sub(phase)).unwrap_or(0),
+            false,
+        )
     }
 }
 
@@ -653,13 +826,22 @@ impl<'a> ComposerWidget<'a> {
         actual.max(usize::from(self.max_height_cap()))
     }
 
-    fn has_panel(&self, area: Rect) -> bool {
-        self.app.composer_border && area.height >= 3 && area.width >= 12
+    fn wants_enclosed_panel(&self) -> bool {
+        self.app.composer_border
+            && (self.app.is_history_search_active()
+                || self.app.composer_display_input().contains('\n')
+                || self.active_menu_row_count() > 0)
+    }
+
+    pub(crate) fn has_panel(&self, area: Rect) -> bool {
+        self.wants_enclosed_panel() && area.height >= 3 && area.width >= 12
     }
 
     fn inner_area(&self, area: Rect) -> Rect {
         if self.has_panel(area) {
             Block::default().borders(Borders::ALL).inner(area)
+        } else if area.height >= 2 {
+            Block::default().borders(Borders::TOP).inner(area)
         } else {
             area
         }
@@ -825,6 +1007,15 @@ impl Renderable for ComposerWidget<'_> {
             }
             if let Some(hint_line) = hint_line {
                 block = block.title_bottom(hint_line);
+            }
+            block.render(area, buf);
+        } else if area.height >= 2 {
+            let mut block = Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(self.app.ui_theme.border))
+                .style(background);
+            if let Some(chrome) = composer_top_right_chrome(self.app, area.width) {
+                block = block.title_top(chrome.right_aligned());
             }
             block.render(area, buf);
         } else {
@@ -1163,6 +1354,19 @@ impl Renderable for ComposerWidget<'_> {
             .style(background)
             .wrap(Wrap { trim: false });
         paragraph.render(inner_area, buf);
+
+        // The quiet composer needs one unmistakable focus anchor. Keep the
+        // reference's gold prompt only on a genuinely empty input row; once
+        // text exists, the text itself owns attention.
+        if input_text.is_empty()
+            && !self.app.is_history_search_active()
+            && inner_area.width >= 3
+            && let Some((cursor_x, cursor_y)) = self.cursor_pos(area)
+        {
+            buf[(cursor_x.saturating_sub(2), cursor_y)]
+                .set_symbol("❯")
+                .set_style(Style::default().fg(self.app.ui_theme.accent_primary));
+        }
     }
 
     fn desired_height(&self, width: u16) -> u16 {
@@ -1172,7 +1376,7 @@ impl Renderable for ComposerWidget<'_> {
             self.max_height.min(self.max_height_cap()),
             self.active_menu_reserved_rows(),
             self.app.composer_density,
-            self.app.composer_border,
+            self.wants_enclosed_panel(),
         )
     }
 
@@ -1203,9 +1407,13 @@ impl Renderable for ComposerWidget<'_> {
         };
         let top_padding = composer_top_padding(visual_rows, input_rows_budget);
 
+        let idle_prompt_inset = u16::from(
+            input_text.is_empty() && !self.app.is_history_search_active() && inner_area.width >= 3,
+        ) * 2;
         let cursor_x = area
             .x
             .saturating_add(inner_area.x.saturating_sub(area.x))
+            .saturating_add(idle_prompt_inset)
             .saturating_add(u16::try_from(cursor_col).unwrap_or(u16::MAX));
         let cursor_y = area
             .y
@@ -1244,7 +1452,12 @@ impl<'a> ApprovalWidget<'a> {
         let risk = self.request.risk;
         let stakes = self.request.stakes();
         let locale = self.view.locale();
-        let palette_colors = approval_palette(stakes);
+        let repo_law = self.request.is_repo_law_prompt();
+        let palette_colors = if repo_law {
+            repo_law_approval_palette()
+        } else {
+            approval_palette(stakes)
+        };
         let critical = matches!(stakes, crate::tui::approval::ApprovalStakes::Critical);
 
         let mut body: Vec<Line<'static>> = Vec::with_capacity(16);
@@ -1252,7 +1465,14 @@ impl<'a> ApprovalWidget<'a> {
         body.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                format!(" {} ", stakes_badge_text(stakes, locale)),
+                format!(
+                    " {} ",
+                    if repo_law {
+                        Cow::Borrowed("REPO LAW")
+                    } else {
+                        stakes_badge_text(stakes, locale)
+                    }
+                ),
                 Style::default()
                     .fg(palette::WHALE_BG)
                     .bg(palette_colors.accent)
@@ -1260,12 +1480,42 @@ impl<'a> ApprovalWidget<'a> {
             ),
             Span::raw("  "),
             Span::styled(
-                self.request.tool_name.clone(),
+                if repo_law {
+                    format!("Repository constitution · {}", self.request.tool_name)
+                } else {
+                    self.request.tool_name.clone()
+                },
                 Style::default()
                     .fg(palette::WHALE_INFO)
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
+
+        if repo_law {
+            body.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "◆ ",
+                    Style::default()
+                        .fg(palette::STATUS_WARNING)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "Repository law requires confirmation — even in Full Access.",
+                    Style::default()
+                        .fg(palette::WHALE_ERROR)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            body.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("Rule  ", Style::default().fg(palette::TEXT_HINT)),
+                Span::styled(
+                    self.request.description.clone(),
+                    Style::default().fg(palette::TEXT_SECONDARY),
+                ),
+            ]));
+        }
 
         // Command / change preview FIRST — for an approval the thing being run
         // is the load-bearing content, so on a short terminal it is the
@@ -1448,11 +1698,24 @@ impl Renderable for ApprovalWidget<'_> {
             Clear.render(bar_area, buf);
 
             let stakes = self.request.stakes();
-            let palette_colors = approval_palette(stakes);
+            let repo_law = self.request.is_repo_law_prompt();
+            let palette_colors = if repo_law {
+                repo_law_approval_palette()
+            } else {
+                approval_palette(stakes)
+            };
             let summary = format!(
                 " {} — {}  [Tab to expand] ",
-                self.request.tool_name,
-                stakes_badge_text(stakes, self.view.locale()),
+                if repo_law {
+                    "Repository constitution"
+                } else {
+                    self.request.tool_name.as_str()
+                },
+                if repo_law {
+                    Cow::Borrowed("REPO LAW")
+                } else {
+                    stakes_badge_text(stakes, self.view.locale())
+                },
             );
             let line = Line::from(Span::styled(
                 summary,
@@ -1469,7 +1732,12 @@ impl Renderable for ApprovalWidget<'_> {
         // analysis on shell commands); reuse it for the palette and the
         // left-rail gate instead of re-deriving per band.
         let stakes = self.request.stakes();
-        let palette_colors = approval_palette(stakes);
+        let repo_law = self.request.is_repo_law_prompt();
+        let palette_colors = if repo_law {
+            repo_law_approval_palette()
+        } else {
+            approval_palette(stakes)
+        };
         let (body, controls) = self.build_inline_content(area);
         let region = inline_region_for(area, &body, &controls);
         if region.width == 0 || region.height == 0 {
@@ -1548,7 +1816,7 @@ impl Renderable for ApprovalWidget<'_> {
             .wrap(Wrap { trim: false })
             .render(control_rect, buf);
 
-        if matches!(stakes, crate::tui::approval::ApprovalStakes::Critical) {
+        if repo_law || matches!(stakes, crate::tui::approval::ApprovalStakes::Critical) {
             paint_left_rail(region, buf, palette_colors.accent);
         }
     }
@@ -1729,6 +1997,14 @@ fn approval_palette(stakes: crate::tui::approval::ApprovalStakes) -> ApprovalCol
             accent: palette::WHALE_ERROR,
             shortcut: palette::STATUS_WARNING,
         },
+    }
+}
+
+fn repo_law_approval_palette() -> ApprovalColors {
+    ApprovalColors {
+        border: palette::STATUS_WARNING,
+        accent: palette::WHALE_ERROR,
+        shortcut: palette::STATUS_WARNING,
     }
 }
 
@@ -2556,6 +2832,40 @@ fn should_render_empty_state(app: &App) -> bool {
         && !app.is_loading
         && !app.is_compacting
         && !app.is_purging
+        && !app.attention_hold_active()
+        && !app
+            .task_panel
+            .iter()
+            .any(|task| task.kind == crate::tui::app::TaskPanelEntryKind::Background)
+        && crate::tui::sidebar::compact_work_indicator(app).is_none()
+}
+
+const CW_WHALE_MARK_WIDTH: usize = 22;
+const CW_WHALE_MARK_MIN_HEIGHT: usize = 14;
+
+fn centered_line(text: String, width: u16, style: Style) -> Line<'static> {
+    let text = truncate_display_width(&text, usize::from(width));
+    let inset =
+        " ".repeat(usize::from(width).saturating_sub(UnicodeWidthStr::width(text.as_str())) / 2);
+    Line::from(Span::styled(format!("{inset}{text}"), style))
+}
+
+fn cw_whale_mark_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let gold = Style::default().fg(app.ui_theme.accent_primary);
+    let seafoam = Style::default().fg(app.ui_theme.accent_secondary);
+    let ivory = Style::default().fg(app.ui_theme.text_body);
+    let inset = " ".repeat(usize::from(width).saturating_sub(CW_WHALE_MARK_WIDTH) / 2);
+
+    vec![
+        Line::from(Span::styled(format!("{inset}   ˚"), seafoam)),
+        Line::from(Span::styled(format!("{inset} ▗▄▄▄▄▄▄▄▄▄▄▄▄▄▖    ▚▞"), gold)),
+        Line::from(vec![
+            Span::styled(format!("{inset}▐██"), gold),
+            Span::styled("·", ivory),
+            Span::styled("████████████▙▄▄▄▞", gold),
+        ]),
+        Line::from(Span::styled(format!("{inset} ▝▀▀▀▀▀▀▀▀▀▀▀▀▀▘"), gold)),
+    ]
 }
 
 fn build_empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
@@ -2564,40 +2874,41 @@ fn build_empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     }
 
     let workspace = crate::utils::display_path(&app.workspace);
-    let title = format!(">_ codewhale (v{})", env!("CARGO_PKG_VERSION"));
-    let model = format!("model: {}  /model to switch", app.model);
-    let directory = format!("directory: {workspace}");
-    let block_width = [&title, &model, &directory]
-        .into_iter()
-        .map(|line| UnicodeWidthStr::width(line.as_str()))
-        .max()
-        .unwrap_or(0);
-    let left_padding = usize::from(area.width).saturating_sub(block_width) / 2;
-    let inset = " ".repeat(left_padding);
+    let workspace_identity = crate::tui::workspace_context::identity_from_context(
+        &app.workspace,
+        app.workspace_context.as_deref(),
+    );
+    let repo_state = workspace_identity.branch.as_deref().unwrap_or("no git");
+    let context = format!(
+        "codewhale · {workspace} · {repo_state} · mcp {}",
+        app.mcp_configured_count
+    );
+    let fleet = "Fleet  /fleet setup".to_string();
+    let routes = "Model  /model    Rules  /constitution    Setup  /setup".to_string();
+    let mark_fits = usize::from(area.width) >= CW_WHALE_MARK_WIDTH + 2
+        && usize::from(area.height) >= CW_WHALE_MARK_MIN_HEIGHT;
 
-    let body = vec![
-        Line::from(Span::styled(
-            format!("{inset}{title}"),
-            Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("{inset}{model}"),
-            Style::default().fg(palette::TEXT_MUTED),
-        )),
-        Line::from(Span::styled(
-            format!("{inset}{directory}"),
-            Style::default().fg(palette::TEXT_MUTED),
-        )),
-    ];
-
-    // Keep the welcome block near the top of the chat pane (header is separate).
-    let top_padding = 2usize;
-    let mut lines = Vec::new();
-    for _ in 0..top_padding {
+    let mut lines = vec![Line::from("")];
+    if mark_fits {
+        lines.extend(cw_whale_mark_lines(app, area.width));
         lines.push(Line::from(""));
     }
-    lines.extend(body);
+    lines.push(centered_line(
+        context,
+        area.width,
+        Style::default().fg(app.ui_theme.text_muted),
+    ));
+    lines.push(Line::from(""));
+    lines.push(centered_line(
+        fleet,
+        area.width,
+        Style::default().fg(app.ui_theme.accent_secondary).bold(),
+    ));
+    lines.push(centered_line(
+        routes,
+        area.width,
+        Style::default().fg(app.ui_theme.text_hint),
+    ));
     lines
 }
 
@@ -2672,6 +2983,8 @@ fn composer_height(
     let has_panel = show_panel && available_height >= 3 && width >= 12;
     let chrome_height = if has_panel {
         usize::from(COMPOSER_PANEL_HEIGHT)
+    } else if available_height >= 2 {
+        1
     } else {
         0
     };
@@ -2686,6 +2999,11 @@ fn composer_height(
     }
     if has_panel {
         line_count = line_count.max(composer_min_input_rows(density));
+    } else if input.is_empty() && available_height >= 3 {
+        // Quiet launch composer: rule + focused prompt + one explanatory hint.
+        // Keeping the hint visible makes the surface self-explanatory and is
+        // also the terminal-level readiness contract used by PTY QA.
+        line_count = line_count.max(2);
     }
     line_count = line_count
         .saturating_add(extra_lines)
@@ -3467,19 +3785,22 @@ fn line_spans_with_selection<'a>(
 mod tests {
     use super::{
         ACTIVE_REVISION_DOMAIN, ApprovalWidget, COMPOSER_PANEL_HEIGHT, COMPOSER_PLACEHOLDER,
-        ChatWidget, ComposerWidget, Renderable, SlashMenuEntry, active_entry_revision,
-        apply_detail_target_highlight, apply_selection_to_line, apply_send_flash,
-        build_empty_state_lines, composer_height, composer_max_height, composer_min_input_rows,
-        composer_top_padding, cursor_row_col, empty_composer_visual_rows, history_entry_revision,
-        layout_input, pad_lines_to_bottom, placeholder_visual_lines, push_command_entry,
-        revision_in_domain, should_render_empty_state, slash_completion_hints,
-        tool_run_summary_revision, wrap_input_lines, wrap_input_lines_for_mouse, wrap_text,
+        CW_WHALE_MARK_MIN_HEIGHT, ChatWidget, ComposerWidget, Renderable, SlashMenuEntry,
+        active_entry_revision, ambient_ping_pong, apply_detail_target_highlight,
+        apply_selection_to_line, apply_send_flash, build_empty_state_lines, composer_height,
+        composer_max_height, composer_min_input_rows, composer_top_padding, cursor_row_col,
+        empty_composer_visual_rows, history_entry_revision, layout_input, pad_lines_to_bottom,
+        placeholder_visual_lines, push_command_entry, revision_in_domain,
+        should_render_empty_state, slash_completion_hints, tool_run_summary_revision,
+        wrap_input_lines, wrap_input_lines_for_mouse, wrap_text,
     };
     use crate::config::{ApiProvider, Config};
     use crate::localization::Locale;
     use crate::palette;
     use crate::tui::active_cell::ActiveCell;
-    use crate::tui::app::{App, ComposerDensity, ToolCollapseMode, TuiOptions};
+    use crate::tui::app::{
+        App, ComposerDensity, TaskPanelEntry, TaskPanelEntryKind, ToolCollapseMode, TuiOptions,
+    };
     use crate::tui::history::{
         ExecCell, ExecSource, GenericToolCell, HistoryCell, ToolCell, ToolRun, ToolStatus,
     };
@@ -3490,7 +3811,10 @@ mod tests {
         style::{Color, Style},
         text::{Line, Span},
     };
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
     use unicode_width::UnicodeWidthStr;
 
     fn create_test_app() -> App {
@@ -4584,12 +4908,12 @@ mod tests {
     }
 
     #[test]
-    fn composer_height_skips_panel_chrome_when_border_disabled() {
+    fn composer_height_uses_quiet_rule_when_panel_is_not_needed() {
         let with_border = composer_height("", 40, 8, 0, ComposerDensity::Comfortable, true);
         let without_border = composer_height("", 40, 8, 0, ComposerDensity::Comfortable, false);
 
         assert_eq!(with_border, 5);
-        assert_eq!(without_border, 1);
+        assert_eq!(without_border, 3);
         assert!(without_border < with_border);
     }
 
@@ -4620,17 +4944,17 @@ mod tests {
             height: 5,
         };
 
-        // inner_area: {x:1, y:1, w:38, h:3}  (borders shrink by 1 each side)
-        // input_rows_budget = 3
+        // Normal one-line composition uses only the top rule, preserving the
+        // reference's continuous water field instead of drawing a full box.
+        // inner_area: {x:0, y:1, w:40, h:4}
+        // input_rows_budget = 4
         // empty_composer_visual_rows = cursor row + one hint row = 2
-        // top_padding = 3 - clamp(2, 1, 3) = 1
-        // cursor_x = 0 + (1-0) + 0 = 1
-        // cursor_y = 0 + (1-0) + (1+0) = 2
+        // top_padding = 4 - clamp(2, 1, 4) = 2
         assert_eq!(
-            empty_composer_visual_rows(Some(COMPOSER_PLACEHOLDER), 38, 3),
+            empty_composer_visual_rows(Some(COMPOSER_PLACEHOLDER), 40, 4),
             2
         );
-        assert_eq!(widget.cursor_pos(area), Some((1, 2)));
+        assert_eq!(widget.cursor_pos(area), Some((2, 3)));
     }
 
     #[test]
@@ -4649,19 +4973,17 @@ mod tests {
             height: 5,
         };
 
-        // inner_area: {x:1, y:1, w:12, h:3}
-        // input_rows_budget = 3
-        // placeholder_visual_lines(12) = 2  ("Write a task" / " or use /.")
+        // inner_area: {x:0, y:1, w:14, h:4}
+        // input_rows_budget = 4
+        // placeholder_visual_lines(14) = 2
         // empty_composer_visual_rows = cursor row + two hint rows = 3
-        // top_padding = 3 - clamp(3, 1, 3) = 0
-        // cursor_x = 0 + (1-0) + 0 = 1
-        // cursor_y = 0 + (1-0) + (0+0) = 1
-        assert_eq!(placeholder_visual_lines(12), 2);
+        // top_padding = 4 - clamp(3, 1, 4) = 1
+        assert_eq!(placeholder_visual_lines(14), 2);
         assert_eq!(
-            empty_composer_visual_rows(Some(COMPOSER_PLACEHOLDER), 12, 3),
+            empty_composer_visual_rows(Some(COMPOSER_PLACEHOLDER), 14, 4),
             3
         );
-        assert_eq!(widget.cursor_pos(area), Some((1, 1)));
+        assert_eq!(widget.cursor_pos(area), Some((2, 2)));
     }
 
     #[test]
@@ -4842,7 +5164,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_composer_cursor_uses_full_area_when_border_disabled() {
+    fn empty_composer_cursor_follows_idle_prompt_when_border_disabled() {
         let mut app = create_test_app();
         app.composer_density = ComposerDensity::Comfortable;
         app.composer_border = false;
@@ -4857,7 +5179,7 @@ mod tests {
             height: 3,
         };
 
-        assert_eq!(widget.cursor_pos(area), Some((0, 1)));
+        assert_eq!(widget.cursor_pos(area), Some((2, 1)));
     }
 
     #[test]
@@ -4910,10 +5232,42 @@ mod tests {
     }
 
     #[test]
+    fn durable_tasks_suppress_the_launch_tableau() {
+        let mut app = create_test_app();
+        app.task_panel.push(TaskPanelEntry {
+            id: "shell_1".to_string(),
+            status: "running".to_string(),
+            prompt_summary: "cargo test".to_string(),
+            duration_ms: Some(100),
+            kind: TaskPanelEntryKind::Background,
+            stale: false,
+            elapsed_since_output_ms: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
+        });
+
+        assert!(!should_render_empty_state(&app));
+    }
+
+    #[test]
+    fn attention_hold_freezes_the_whole_ocean_field() {
+        let mut app = create_test_app();
+        app.low_motion = false;
+        app.fancy_animations = true;
+        app.plan_prompt_pending = true;
+
+        let widget = ChatWidget::new(&mut app, Rect::new(0, 0, 100, 20));
+
+        assert!(!widget.ocean_animated);
+        assert!(!widget.ambient_life);
+        assert!(!should_render_empty_state(&app));
+    }
+
+    #[test]
     fn empty_state_shows_startup_context() {
         let mut app = create_test_app();
         app.workspace = PathBuf::from("/tmp/codewhale-test-workspace");
-        app.model = "deepseek-v4-pro".to_string();
+        app.mcp_configured_count = 2;
 
         let lines = build_empty_state_lines(&app, Rect::new(0, 0, 100, 20));
         let rendered = lines
@@ -4927,16 +5281,16 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains(&format!(">_ codewhale (v{})", env!("CARGO_PKG_VERSION"))));
-        assert!(rendered.contains("model: deepseek-v4-pro  /model to switch"));
-        assert!(rendered.contains("directory: /tmp/codewhale-test-workspace"));
+        assert!(rendered.contains("codewhale · /tmp/codewhale-test-workspace · no git · mcp 2"));
+        assert!(rendered.contains("Fleet  /fleet setup"));
+        assert!(rendered.contains("Model  /model"));
+        assert!(rendered.contains("Rules  /constitution"));
     }
 
     #[test]
     fn empty_state_centers_startup_block_by_actual_text_width() {
         let mut app = create_test_app();
         app.workspace = PathBuf::from("/tmp/codewhale-test-workspace");
-        app.model = "deepseek-v4-pro".to_string();
 
         let lines = build_empty_state_lines(&app, Rect::new(0, 0, 100, 20));
         let text_lines = lines
@@ -4948,21 +5302,119 @@ mod tests {
                     .collect::<String>()
             })
             .collect::<Vec<_>>();
-        let title = format!(">_ codewhale (v{})", env!("CARGO_PKG_VERSION"));
-        let model = "model: deepseek-v4-pro  /model to switch";
-        let directory = "directory: /tmp/codewhale-test-workspace";
-        let block_width = [title.as_str(), model, directory]
-            .into_iter()
-            .map(UnicodeWidthStr::width)
-            .max()
-            .expect("startup block has lines");
-        let expected_padding = (100usize - block_width) / 2;
-        let actual_padding = text_lines[2].chars().take_while(|ch| *ch == ' ').count();
+        let context = "codewhale · /tmp/codewhale-test-workspace · no git · mcp 0";
+        let context_line = text_lines
+            .iter()
+            .find(|line| line.trim_start() == context)
+            .expect("context line");
+        let expected_padding = (100usize - UnicodeWidthStr::width(context)) / 2;
+        let actual_padding = context_line.chars().take_while(|ch| *ch == ' ').count();
 
         assert_eq!(actual_padding, expected_padding);
-        assert_eq!(text_lines[2].trim_start(), title);
-        assert_eq!(text_lines[4].trim_start(), model);
-        assert_eq!(text_lines[5].trim_start(), directory);
+    }
+
+    #[test]
+    fn underwater_launch_is_visibly_deep_and_preserves_text_cells() {
+        let mut app = create_test_app();
+        app.workspace = PathBuf::from("/tmp/codewhale-test-workspace");
+        app.model = "deepseek-v4-pro".to_string();
+
+        let area = Rect::new(0, 0, 100, 20);
+        let base = app.ui_theme.surface_bg;
+        let mut buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut buf);
+
+        assert_ne!(buf[(0, 0)].bg, buf[(0, 19)].bg);
+        assert_eq!(buf[(11, 14)].symbol(), ">");
+
+        let context = "codewhale · /tmp/codewhale-test-workspace · no git · mcp 0";
+        let context_x = ((100usize - UnicodeWidthStr::width(context)) / 2) as u16;
+        assert_eq!(buf[(context_x, 6)].symbol(), "c");
+        assert_eq!(buf[(context_x, 6)].bg, base);
+    }
+
+    #[test]
+    fn compact_launch_keeps_fleet_setup_without_ambient_clutter() {
+        let app = create_test_app();
+        let rendered = build_empty_state_lines(&app, Rect::new(0, 0, 40, 12))
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.contains("/fleet setup"));
+        assert!(!rendered.contains("▗▄▄"));
+    }
+
+    #[test]
+    fn launch_hierarchy_survives_responsive_gate_sizes() {
+        for (width, height) in [(40, 12), (60, 16), (80, 24), (100, 32), (140, 40)] {
+            let mut app = create_test_app();
+            let area = Rect::new(0, 0, width, height);
+            let mut buf = Buffer::empty(area);
+
+            ChatWidget::new(&mut app, area).render(area, &mut buf);
+            let rendered = buffer_text(&buf, area);
+
+            assert!(
+                rendered.contains("Fleet") && rendered.contains("/fleet setup"),
+                "Fleet must remain the launch priority at {width}x{height}:\n{rendered}"
+            );
+            if height < CW_WHALE_MARK_MIN_HEIGHT as u16 {
+                assert!(
+                    !rendered.contains("▗▄▄"),
+                    "the decorative whale must yield before the Fleet action at {width}x{height}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flat_treatment_keeps_theme_surface_and_state_content() {
+        let mut app = create_test_app();
+        app.ocean_treatment = "flat".to_string();
+        let area = Rect::new(0, 0, 100, 20);
+        let base = app.ui_theme.surface_bg;
+        let mut buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut buf);
+
+        assert_eq!(buf[(0, 0)].bg, base);
+        assert_eq!(buf[(0, 19)].bg, base);
+        assert_eq!(buf[(11, 14)].symbol(), " ", "flat has no ambient fish");
+        assert!(
+            (0..area.height).any(|y| (0..area.width).any(|x| buf[(x, y)].symbol() == "F")),
+            "Fleet setup remains available in flat mode"
+        );
+    }
+
+    #[test]
+    fn reduced_motion_freezes_the_ocean_without_removing_depth() {
+        let mut app = create_test_app();
+        app.low_motion = true;
+        app.fancy_animations = true;
+        let area = Rect::new(0, 0, 100, 20);
+        app.ocean_started_at = Instant::now() - Duration::from_secs(2);
+        let mut first = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut first);
+
+        app.ocean_started_at = Instant::now() - Duration::from_secs(11);
+        let mut second = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut second);
+
+        assert_ne!(first[(0, 0)].bg, first[(0, 19)].bg);
+        assert_eq!(first[(0, 0)].bg, second[(0, 0)].bg);
+        assert_eq!(first[(11, 14)].symbol(), second[(11, 14)].symbol());
+    }
+
+    #[test]
+    fn ambient_path_reverses_without_teleporting() {
+        let step = 620;
+        let span = 11;
+        assert_eq!(ambient_ping_pong(0, step, span, 0), (0, true));
+        assert_eq!(ambient_ping_pong(step * 11, step, span, 0), (11, true));
+        assert_eq!(ambient_ping_pong(step * 12, step, span, 0), (10, false));
+        assert_eq!(ambient_ping_pong(step * 21, step, span, 0), (1, false));
+        assert_eq!(ambient_ping_pong(step * 22, step, span, 0), (0, true));
     }
 
     /// Probe: confirm `cell.lines_with_motion` returns no Line whose total
@@ -5075,6 +5527,7 @@ mod tests {
         let mut app = create_test_app();
         let custom = ratatui::style::Color::Rgb(26, 27, 38);
         app.ui_theme = app.ui_theme.with_background_color(custom);
+        app.ocean_treatment = "flat".to_string();
         app.add_message(HistoryCell::Assistant {
             content: "ready".to_string(),
             streaming: false,
@@ -5350,6 +5803,33 @@ mod tests {
             let mut buf = Buffer::empty(area);
             widget.render(area, &mut buf);
         }
+    }
+
+    #[test]
+    fn repo_law_approval_has_distinct_authority_grammar() {
+        let request = crate::tui::approval::ApprovalRequest::new(
+            "approval-law",
+            "edit_file",
+            "Repo law holds this write: \"manifest review\" protects Cargo.toml (matched Cargo.toml, .codewhale/constitution.json)",
+            &serde_json::json!({ "path": "Cargo.toml", "old": "a", "new": "b" }),
+            "edit_file:Cargo.toml",
+        );
+        assert!(request.is_repo_law_prompt());
+        let view = crate::tui::approval::ApprovalView::new(request.clone());
+        let widget = ApprovalWidget::new(&request, &view);
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+
+        widget.render(area, &mut buf);
+        let rendered = buffer_text(&buf, area);
+        assert!(rendered.contains("REPO LAW"), "{rendered}");
+        assert!(rendered.contains("Repository constitution"), "{rendered}");
+        assert!(rendered.contains("even in Full Access"), "{rendered}");
+        assert!(rendered.contains("Cargo.toml"), "{rendered}");
+        assert!((0..area.height).any(|y| {
+            let cell = &buf[(1, y)];
+            cell.symbol() == "┃" && cell.fg == palette::WHALE_ERROR
+        }));
     }
 
     #[test]

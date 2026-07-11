@@ -53,11 +53,18 @@ pub fn header_status_indicator_frame(
     turn_started_at: Option<Instant>,
     mode: &str,
 ) -> Option<&'static str> {
+    if matches!(
+        mode.trim().to_ascii_lowercase().as_str(),
+        "cw" | "mark" | "text"
+    ) {
+        return Some("cw");
+    }
     let frames: &[&str] = match mode.trim().to_ascii_lowercase().as_str() {
         "off" | "none" | "hidden" | "false" => return None,
         "dots" | "dot" => STATUS_INDICATOR_DOT_FRAMES,
-        // "whale" + aliases + unknown → whale (intentional default).
-        _ => STATUS_INDICATOR_WHALE_FRAMES,
+        "whale" | "🐳" | "🐋" => STATUS_INDICATOR_WHALE_FRAMES,
+        // Unknown values keep the owned typographic mark visible.
+        _ => return Some("cw"),
     };
     let elapsed_ms = turn_started_at
         .map(|t| t.elapsed().as_millis())
@@ -71,7 +78,6 @@ pub struct HeaderData<'a> {
     pub model: &'a str,
     pub workspace_name: &'a str,
     pub mode: AppMode,
-    pub is_streaming: bool,
     pub background: ratatui::style::Color,
     /// Total tokens used in this session (cumulative, for display).
     pub total_tokens: u32,
@@ -105,14 +111,13 @@ impl<'a> HeaderData<'a> {
         mode: AppMode,
         model: &'a str,
         workspace_name: &'a str,
-        is_streaming: bool,
+        _is_streaming: bool,
         background: ratatui::style::Color,
     ) -> Self {
         Self {
             model,
             workspace_name,
             mode,
-            is_streaming,
             background,
             total_tokens: 0,
             context_window: None,
@@ -120,7 +125,7 @@ impl<'a> HeaderData<'a> {
             last_prompt_tokens: None,
             reasoning_effort_label: None,
             provider_label: None,
-            status_indicator_frame: None,
+            status_indicator_frame: Some("cw"),
         }
     }
 
@@ -285,14 +290,18 @@ impl<'a> HeaderWidget<'a> {
         let Some(frame) = self.data.status_indicator_frame else {
             return Vec::new();
         };
-        // Color matches the rest of the live-status cluster (sky), keeping
-        // the chip visually grouped with `● Live` and the effort label.
+        let color = if frame == "cw" {
+            palette::WHALE_ACCENT_PRIMARY
+        } else {
+            palette::WHALE_INFO
+        };
         vec![Span::styled(
             frame.to_string(),
-            Style::default().fg(palette::WHALE_INFO),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
         )]
     }
 
+    #[allow(dead_code)]
     fn provider_chip_spans(&self) -> Vec<Span<'static>> {
         let Some(label) = self.data.provider_label else {
             return Vec::new();
@@ -309,6 +318,7 @@ impl<'a> HeaderWidget<'a> {
         )]
     }
 
+    #[allow(dead_code)]
     fn effort_chip_spans(&self, include_prefix: bool) -> Vec<Span<'static>> {
         let Some(label) = self.data.reasoning_effort_label else {
             return Vec::new();
@@ -338,59 +348,10 @@ impl<'a> HeaderWidget<'a> {
 
     fn status_variant(
         &self,
-        show_stream_label: bool,
+        _show_stream_label: bool,
         show_percent: bool,
         show_signal: bool,
     ) -> Vec<Span<'static>> {
-        let mut spans = Vec::new();
-
-        let provider_spans = self.provider_chip_spans();
-        let has_provider = !provider_spans.is_empty();
-        if has_provider {
-            spans.extend(provider_spans);
-        }
-
-        // Status indicator chip (whale 🐳/🐋 or dots ◌/◉ depending on
-        // `status_indicator` setting). Sits immediately before the effort
-        // chip so the layout reads e.g. `🐳..  ◆ max` — the chip cluster
-        // users associate with "where the whale used to be."
-        let indicator_spans = self.status_indicator_spans();
-        let has_indicator = !indicator_spans.is_empty();
-        if has_indicator {
-            if has_provider {
-                spans.push(Span::raw("  "));
-            }
-            spans.extend(indicator_spans);
-        }
-
-        let effort_spans = self.effort_chip_spans(true);
-        let has_effort = !effort_spans.is_empty();
-        if has_effort {
-            if has_provider || has_indicator {
-                spans.push(Span::raw("  "));
-            }
-            spans.extend(effort_spans);
-        }
-
-        if self.data.is_streaming {
-            if has_effort || has_provider {
-                spans.push(Span::raw("  "));
-            }
-            spans.push(Span::styled(
-                "●",
-                Style::default()
-                    .fg(palette::WHALE_INFO)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            if show_stream_label {
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(
-                    "Live",
-                    Style::default().fg(palette::TEXT_SOFT),
-                ));
-            }
-        }
-
         let context_spans = if show_signal {
             self.context_signal_spans(show_percent)
         } else if show_percent {
@@ -399,13 +360,9 @@ impl<'a> HeaderWidget<'a> {
             Vec::new()
         };
         if !context_spans.is_empty() {
-            if !spans.is_empty() {
-                spans.push(Span::raw("  "));
-            }
-            spans.extend(context_spans);
+            return context_spans;
         }
-
-        spans
+        Vec::new()
     }
 
     /// Compile-time version tag (`v0.8.29`, …). Rendered in the header's
@@ -457,6 +414,7 @@ impl<'a> HeaderWidget<'a> {
             .unwrap_or_default()
     }
 
+    #[allow(dead_code)]
     fn metadata_spans(&self, max_width: usize) -> Vec<Span<'static>> {
         let workspace = self.data.workspace_name.trim();
         let model = self.data.model.trim();
@@ -529,38 +487,47 @@ impl<'a> HeaderWidget<'a> {
             return Vec::new();
         }
 
-        let mode_label = Self::mode_name(self.data.mode);
+        let mode_label = Self::mode_name(self.data.mode).to_ascii_lowercase();
         let mode_style = Style::default()
             .fg(Self::mode_color(self.data.mode))
             .add_modifier(Modifier::BOLD);
+        let mut spans = self.status_indicator_spans();
+        let used = Self::span_width(&spans);
 
-        if max_width < mode_label.width() {
-            let fallback = self
-                .data
-                .mode
-                .label()
-                .chars()
-                .next()
-                .unwrap_or('?')
-                .to_string();
-            return vec![Span::styled(fallback, mode_style)];
-        }
-
-        let mut spans = vec![Span::styled(mode_label.to_string(), mode_style)];
-        let metadata_width = max_width
-            .saturating_sub(mode_label.width())
-            .saturating_sub(2);
-        let metadata = if metadata_width >= 4 {
-            self.metadata_spans(metadata_width)
+        let provider = self.data.provider_label.unwrap_or("").trim();
+        let model = self.data.model.trim();
+        let route = if provider.is_empty() {
+            model.to_string()
         } else {
-            Vec::new()
+            format!("{provider}:{model}")
+        };
+        let effort = self.data.reasoning_effort_label.unwrap_or("").trim();
+        let fixed_width =
+            3 + mode_label.width() + usize::from(!effort.is_empty()) * (3 + effort.width());
+        let route_budget = max_width.saturating_sub(used + fixed_width + 1);
+        let route = if route_budget >= 4 {
+            Self::truncate_to_width(&route, route_budget)
+        } else {
+            String::new()
         };
 
-        if !metadata.is_empty() {
-            spans.push(Span::raw("  "));
-            spans.extend(metadata);
+        if !spans.is_empty() && !route.is_empty() {
+            spans.push(Span::raw(" "));
         }
-
+        if !route.is_empty() {
+            spans.push(Span::styled(route, Style::default().fg(palette::TEXT_HINT)));
+        }
+        if Self::span_width(&spans) + 3 + mode_label.width() <= max_width {
+            spans.push(Span::styled(" · ", Style::default().fg(palette::TEXT_DIM)));
+            spans.push(Span::styled(mode_label, mode_style));
+        }
+        if !effort.is_empty() && Self::span_width(&spans) + 3 + effort.width() <= max_width {
+            spans.push(Span::styled(" · ", Style::default().fg(palette::TEXT_DIM)));
+            spans.push(Span::styled(
+                effort.to_string(),
+                Style::default().fg(palette::WHALE_INFO),
+            ));
+        }
         spans
     }
 }
@@ -627,8 +594,8 @@ mod tests {
         );
 
         // Wave 7: the Agent mode chip reads "Act".
-        assert!(rendered.contains("Act"));
-        assert!(rendered.contains("codewhale-tui"));
+        assert!(rendered.contains("cw"));
+        assert!(rendered.contains("act"));
         assert!(rendered.contains("deepseek-v4-pro"));
         assert!(!rendered.contains("Plan"));
         assert!(!rendered.contains("Yolo"));
@@ -678,7 +645,7 @@ mod tests {
             "version chip should drop under width pressure: {rendered:?}",
         );
         assert!(
-            rendered.contains("Act") || rendered.contains('A'),
+            rendered.contains("act") || rendered.contains('a'),
             "mode label must survive: {rendered:?}",
         );
     }
@@ -697,7 +664,7 @@ mod tests {
             72,
         );
 
-        assert!(rendered.contains("Live"));
+        assert!(!rendered.contains("Live"));
         assert!(rendered.contains("38%"));
         assert!(rendered.contains("▰"));
     }
@@ -733,7 +700,8 @@ mod tests {
 
         // YOLO renders as Act; under extreme width pressure only the first
         // glyph of the mode chip remains.
-        assert!(rendered.trim_start().starts_with('A'));
+        assert!(rendered.trim_start().starts_with("cw"));
+        assert!(rendered.contains("act"));
         assert!(!rendered.contains("Plan"));
         assert!(!rendered.contains("Operate"));
     }
@@ -817,6 +785,15 @@ mod tests {
     }
 
     #[test]
+    fn cw_indicator_is_static_and_typographic() {
+        assert_eq!(super::header_status_indicator_frame(None, "cw"), Some("cw"));
+        assert_eq!(
+            super::header_status_indicator_frame(Some(std::time::Instant::now()), "cw"),
+            Some("cw")
+        );
+    }
+
+    #[test]
     fn whale_indicator_advances_through_frames_then_breaches() {
         use std::thread::sleep;
         use std::time::Duration;
@@ -850,11 +827,9 @@ mod tests {
     }
 
     #[test]
-    fn unknown_indicator_mode_defaults_to_whale() {
-        // We'd rather restore the whale on a typo than silently hide the
-        // chip — matches `StatusIndicatorValue::from(&str)`.
+    fn unknown_indicator_mode_defaults_to_cw_mark() {
         let frame = super::header_status_indicator_frame(None, "wahel-typo");
-        assert_eq!(frame, Some("🐳"));
+        assert_eq!(frame, Some("cw"));
     }
 
     #[test]

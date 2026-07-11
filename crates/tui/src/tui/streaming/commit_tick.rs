@@ -5,7 +5,7 @@
 //! [`run_commit_tick`] on every commit beat to obtain text to flush to the
 //! transcript on this beat. Normal motion drains all text received since the
 //! prior tick so the display follows the upstream delta cadence. Low-motion
-//! mode keeps the old one-grapheme drip to reduce visual churn.
+//! mode may coalesce redraws, but never fabricates a one-grapheme typewriter.
 //!
 //! The chunker is the unit of streaming — one per active block (assistant /
 //! thinking). Tool output is unbuffered and bypasses this path.
@@ -215,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn low_motion_keeps_smooth_micro_chunk_pacing() {
+    fn low_motion_preserves_upstream_delta_pacing() {
         let mut chunker = StreamChunker::new();
         let mut policy = AdaptiveChunkingPolicy::new();
         policy.set_low_motion(true);
@@ -223,11 +223,11 @@ mod tests {
 
         chunker.push_delta("hello world");
         let out = run_commit_tick(&mut policy, &mut chunker, now);
-        assert_eq!(out.committed_text, "h");
-        assert!(!chunker.is_idle(), "low motion should keep dripping");
+        assert_eq!(out.committed_text, "hello world");
+        assert!(chunker.is_idle());
 
         let out = run_commit_tick(&mut policy, &mut chunker, now + Duration::from_millis(20));
-        assert_eq!(out.committed_text, "e");
+        assert_eq!(out.committed_text, "");
     }
 
     #[test]
@@ -255,9 +255,9 @@ mod tests {
 
         chunker.push_delta("e\u{301}x");
         let out1 = run_commit_tick(&mut policy, &mut chunker, t0);
-        assert_eq!(out1.committed_text, "e\u{301}");
+        assert_eq!(out1.committed_text, "e\u{301}x");
         let out2 = run_commit_tick(&mut policy, &mut chunker, t0 + Duration::from_millis(20));
-        assert_eq!(out2.committed_text, "x");
+        assert_eq!(out2.committed_text, "");
     }
 
     #[test]

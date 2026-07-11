@@ -425,13 +425,9 @@ impl FooterWidget {
 
     /// Build the left status line with priority-ordered hint dropping.
     ///
-    /// Priority order (highest to lowest — last to drop):
-    /// 1. Model name (always visible; then truncated mid-word once all hints are gone)
-    /// 2. Balance chip — drops third (account balance is more actionable than session cost)
-    /// 3. Cost chip — drops fourth
-    /// 4. Status label (e.g. "working", "draft") — drops first when space is tight
-    ///
-    /// Mode lives in the header only; the footer never repeats it.
+    /// Production leaves mode/model blank because the header owns them. The
+    /// generic widget still supports callers that supply them, while the
+    /// header-owned path prioritizes state, then cost and balance.
     fn status_line_spans(&self, max_width: usize) -> Vec<Span<'static>> {
         if max_width == 0 {
             return Vec::new();
@@ -446,6 +442,36 @@ impl FooterWidget {
         let show_cost = !cost_text.is_empty();
         let balance_text = spans_text(&self.props.balance);
         let show_balance = !balance_text.is_empty();
+
+        if mode_label.is_empty() && model.is_empty() {
+            let mut spans = Vec::new();
+            if show_status {
+                spans.push(Span::styled(
+                    truncate_to_width(status_label, max_width),
+                    Style::default().fg(self.props.state_color),
+                ));
+            }
+            for (text, color) in [
+                (cost_text.as_str(), self.props.text_muted_color),
+                (balance_text.as_str(), self.props.text_muted_color),
+            ] {
+                if text.is_empty() {
+                    continue;
+                }
+                let mut candidate = spans.clone();
+                if !candidate.is_empty() {
+                    candidate.push(Span::styled(
+                        sep.to_string(),
+                        Style::default().fg(self.props.text_dim_color),
+                    ));
+                }
+                candidate.push(Span::styled(text.to_string(), Style::default().fg(color)));
+                if span_width(&candidate) <= max_width {
+                    spans = candidate;
+                }
+            }
+            return spans;
+        }
 
         let mode_w = mode_label.width();
         let sep_w = sep.width();

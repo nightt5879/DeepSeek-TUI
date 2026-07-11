@@ -3768,7 +3768,7 @@ impl ToolSpec for AgentTool {
                 "model_strength": {
                     "type": "string",
                     "enum": ["same", "faster"],
-                    "description": "Optional child model strength. Use same when the child should be as capable as the current model. Use faster for type=explore, read-only lookup/search, status, or other low-risk tasks that can run on a smaller/faster same-family sibling; CodeWhale maps known families such as DeepSeek V4 Pro to Flash and GLM-5.2 to GLM-5-Turbo. type=explore defaults to faster unless you pass model_strength or model explicitly. No hidden auto-downgrade happens."
+                    "description": "Optional child model strength. Children inherit the active model by default, including type=explore. Choose faster explicitly for read-only lookup/search, status, or other low-risk tasks that can run on a smaller/faster same-family sibling; CodeWhale maps known families such as DeepSeek V4 Pro to Flash and GLM-5.2 to GLM-5-Turbo. No hidden auto-downgrade happens."
                 },
                 "model": {
                     "type": "string",
@@ -6411,20 +6411,10 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         .map(SubAgentModelStrength::parse)
         .transpose()?;
     let model_strength_explicit = explicit_model_strength.is_some();
-    let model_strength = explicit_model_strength.unwrap_or_else(|| {
-        // Default model strength. `type: "explore"` defaults to Faster for
-        // bounded read-only lookup/search/status work — the cheap, fast
-        // same-family sibling is exactly the lossy-breadth job a child
-        // should run. Every other role (and any call that supplies an
-        // explicit `model`) stays conservative at Same. Explicit
-        // model_strength above already wins via .parse(); explicit `model`
-        // wins downstream in assignment_model_route regardless of strength.
-        if agent_type == SubAgentType::Explore && model.is_none() {
-            SubAgentModelStrength::Faster
-        } else {
-            SubAgentModelStrength::Same
-        }
-    });
+    // Fleet is predictable before setup: every role inherits the active model.
+    // A cheaper sibling is an explicit routing choice through model_strength,
+    // a saved Fleet profile, or a concrete model override.
+    let model_strength = explicit_model_strength.unwrap_or(SubAgentModelStrength::Same);
     let thinking = optional_input_str(input, &["thinking", "reasoning_effort", "reasoningEffort"])
         .map(SubAgentThinking::parse)
         .transpose()?

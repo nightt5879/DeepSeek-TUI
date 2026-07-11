@@ -1821,8 +1821,16 @@ fn render_cycle_boundary(content: &str, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-fn status_symbol(started_at: Option<Instant>, status: ToolStatus, low_motion: bool) -> String {
+fn status_symbol(
+    started_at: Option<Instant>,
+    status: ToolStatus,
+    low_motion: bool,
+    family: crate::tui::widgets::tool_card::ToolFamily,
+) -> String {
     match status {
+        ToolStatus::Running if family == crate::tui::widgets::tool_card::ToolFamily::Verify => {
+            crate::tui::spinner::verification_tick_frame(started_at, low_motion).to_string()
+        }
         ToolStatus::Running => {
             crate::tui::spinner::braille_spinner_frame(started_at, low_motion).to_string()
         }
@@ -1951,7 +1959,7 @@ fn render_tool_header_with_family_and_summary(
 
     let mut spans = vec![
         Span::styled(
-            format!("{} ", status_symbol(started_at, status, low_motion)),
+            format!("{} ", status_symbol(started_at, status, low_motion, family)),
             Style::default().fg(tool_state_color(status)),
         ),
         Span::styled(

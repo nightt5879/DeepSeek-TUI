@@ -253,6 +253,18 @@ mod tests {
     }
 
     #[test]
+    fn operate_copy_explains_the_user_benefit_at_eighty_columns() {
+        let (buf, area) = render_at(80, 24);
+        let text = rows(&buf, area).join("\n");
+        assert!(
+            text.contains("Coordinate a Fleet for multi-step work."),
+            "{text}"
+        );
+        assert!(!text.contains("spawn, wait, verify"), "{text}");
+        assert!(!text.contains("subagents/workflows"), "{text}");
+    }
+
+    #[test]
     fn number_keys_select_modes() {
         // Visible roster: 1 Act, 2 Plan, 3 Operate. No Multitask / YOLO / gap.
         let mut view = ModePickerView::new(AppMode::Agent, Locale::En);

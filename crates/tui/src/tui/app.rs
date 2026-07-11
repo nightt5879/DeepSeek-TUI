@@ -1096,9 +1096,7 @@ impl AppMode {
             }
             AppMode::Yolo => "Act mode with Full Access (legacy YOLO permission shorthand)",
             AppMode::Plan => "Plan mode - research and design before implementing",
-            AppMode::Operate => {
-                "Operate mode - manage Fleet, subagents, and workflow lanes (spawn, wait, verify, hand off)"
-            }
+            AppMode::Operate => "Operate mode - coordinate a Fleet for multi-step work",
         }
     }
 
@@ -1779,10 +1777,14 @@ pub struct App {
     pub auto_compact_threshold_percent: f64,
     pub calm_mode: bool,
     pub low_motion: bool,
+    pub constrained_frame_rate: bool,
+    pub ocean_started_at: Instant,
     /// Pending #61 (animated working strip). Set from config but not read
     /// until the footer widget consumes it.
     #[allow(dead_code)]
     pub fancy_animations: bool,
+    /// `ombre` or `flat`; appearance is independent from motion settings.
+    pub ocean_treatment: String,
     /// Whether the renderer should wrap each frame in DEC mode 2026
     /// synchronized output. Resolved from `Settings::synchronized_output`
     /// at construction; `auto`/`on` → `true`, `off` → `false`. The Ptyxis
@@ -1791,10 +1793,10 @@ pub struct App {
     /// the draw loop the decision is already made. See the
     /// `Settings::synchronized_output` doc for the user-facing knob.
     pub synchronized_output_enabled: bool,
-    /// Header status-indicator chip mode. One of `"whale"` (default, cycles
-    /// 🐳→🐋 frames keyed off `turn_started_at`), `"dots"` (geometric ◌
-    /// frames), or `"off"` (chip hidden entirely). Loaded from settings;
-    /// changed via `/config status_indicator <whale|dots|off>`.
+    /// Header status-indicator chip mode. `"cw"` is the static default;
+    /// `"whale"` and `"dots"` preserve the animated legacy choices, while
+    /// `"off"` hides the chip. Loaded from settings and changed via
+    /// `/config status_indicator <cw|whale|dots|off>`.
     pub status_indicator: String,
     pub show_thinking: bool,
     pub verbose_transcript: bool,
@@ -2536,7 +2538,9 @@ impl App {
         let auto_compact_threshold_percent = settings.auto_compact_threshold_percent;
         let calm_mode = settings.calm_mode;
         let low_motion = settings.low_motion;
+        let constrained_frame_rate = settings.constrained_frame_rate;
         let fancy_animations = settings.fancy_animations;
+        let ocean_treatment = settings.ocean_treatment.clone();
         let synchronized_output_enabled = settings.synchronized_output_enabled();
         let status_indicator = settings.status_indicator.clone();
         let show_thinking = settings.show_thinking;
@@ -2837,7 +2841,10 @@ impl App {
             auto_compact_threshold_percent,
             calm_mode,
             low_motion,
+            constrained_frame_rate,
+            ocean_started_at: Instant::now(),
             fancy_animations,
+            ocean_treatment,
             synchronized_output_enabled,
             status_indicator,
             show_thinking,
@@ -3096,13 +3103,10 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// Show the one-time first-run follow-up nudge. Idempotent and
-    /// gated by a persisted `Settings::feature_intro_shown` flag, so it appears
-    /// exactly once per install: after first-run setup handoff when no
-    /// constitution checkpoint is due, and on the next launch for returning
-    /// users who haven't seen it (called from `run_tui` after `App::new`).
-    /// Plain copy, no marketing language. Stays silent while onboarding is
-    /// still in progress.
+    /// Mark the first-run follow-up as seen without inserting a transcript
+    /// message. The empty underwater launch surface owns setup guidance; a
+    /// synthetic history cell would hide that surface before the user sends
+    /// anything.
     pub fn maybe_show_feature_intro(&mut self) {
         if self.onboarding != OnboardingState::None {
             return;
@@ -3122,21 +3126,10 @@ impl App {
             self.status_message = Some(format!("Failed to save feature-intro flag: {err}"));
             // Still show the nudge; the flag write may simply retry next launch.
         }
-        self.add_message(HistoryCell::System {
-            content: Self::feature_intro_content(),
-        });
+        self.status_message = Some(
+            "Fleet is ready · /fleet opens roles · /fleet setup customizes routes".to_string(),
+        );
         self.needs_redraw = true;
-    }
-
-    /// The one-time first-run follow-up copy. Plain language, no
-    /// marketing. Pure so it can be unit-tested without touching disk or env.
-    pub(crate) fn feature_intro_content() -> String {
-        "Your CodeWhale setup is ready.\n\n\
-         • Constitution — review or personalize standing guidance with `/constitution`; run `/setup` for the full checkpoint any time.\n\
-         • Provider and model — adjust the active route later with `/provider` or `/model`.\n\
-         • Optional later — use `/hotbar` for Hotbar shortcuts (`/hotbar off` hides it) and `/fleet setup` for Fleet loadouts.\n\n\
-         This tip won't show again."
-            .to_string()
     }
 
     /// Apply a locale tag selected from the onboarding language picker (#566).
@@ -3405,6 +3398,20 @@ impl App {
                 .task_panel
                 .iter()
                 .any(|task| matches!(task.status.as_str(), "queued" | "running"))
+    }
+
+    /// Whether the interface is asking the user to make a decision. Ambient
+    /// motion yields across the whole frame while this is true; freezing one
+    /// task marker still leaves distracting movement in peripheral vision.
+    #[must_use]
+    pub fn attention_hold_active(&self) -> bool {
+        !self.view_stack.is_empty()
+            || self.pending_user_input_prompt.is_some()
+            || self.plan_prompt_pending
+            || self
+                .task_panel
+                .iter()
+                .any(|task| matches!(task.status.as_str(), "waiting" | "needs_user"))
     }
 
     pub fn mark_approval_policy_locked(&mut self) {

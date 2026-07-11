@@ -653,13 +653,14 @@ mod tests {
         );
         assert_eq!(member_routing(&reviewer), "inherit session route");
 
-        // Built-in scout: fast route preset is the routing truth.
+        // Built-in scout: no setup means the session route, just like every
+        // other built-in role.
         let scout = FleetRoster::built_ins_only().get("scout").unwrap().clone();
         assert_eq!(
             member_posture(&scout),
             "explore worker · read-only · shell read-only"
         );
-        assert_eq!(member_routing(&scout), "route preset fast");
+        assert_eq!(member_routing(&scout), "inherit session route");
 
         // Builder writes with full shell.
         let builder = FleetRoster::built_ins_only()

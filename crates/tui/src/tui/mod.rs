@@ -46,6 +46,7 @@ mod mcp_routing;
 pub mod model_picker;
 pub mod mouse_ui;
 pub mod notifications;
+pub mod ocean;
 pub mod onboarding;
 pub mod osc8;
 pub mod output_rows_cache;

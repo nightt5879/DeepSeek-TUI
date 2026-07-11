@@ -1029,7 +1029,12 @@ fn tool_lines_with_options_respects_low_motion_in_default_path() {
     // platforms with coarse timer resolution (Windows ≈ 15.6 ms) and
     // gives several frame intervals of headroom before the index could
     // wrap back to 0.
-    let started_at = Some(Instant::now() - Duration::from_millis(TOOL_STATUS_SYMBOL_MS * 2));
+    let started_at = Some(
+        Instant::now()
+            - Duration::from_millis(
+                crate::tui::spinner::LIVE_MARKER_DELAY_MS + TOOL_STATUS_SYMBOL_MS * 2,
+            ),
+    );
     let cell = HistoryCell::Tool(ToolCell::Exec(ExecCell {
         command: "echo hi".to_string(),
         status: ToolStatus::Running,
@@ -1058,8 +1063,9 @@ fn tool_lines_with_options_respects_low_motion_in_default_path() {
     let animated_symbol = animated[0].spans[1].content.trim();
     let low_motion_symbol = low_motion[0].spans[1].content.trim();
 
-    // low_motion always pins to the first (static) frame.
-    assert_eq!(low_motion_symbol, TOOL_RUNNING_SYMBOLS[0]);
+    // Reduced motion freezes at a filled, legible bubble rather than an
+    // invisible blank braille cell.
+    assert_eq!(low_motion_symbol, "⣤");
     // The animated path should be on a different frame (index 2).
     assert_ne!(animated_symbol, TOOL_RUNNING_SYMBOLS[0]);
 }

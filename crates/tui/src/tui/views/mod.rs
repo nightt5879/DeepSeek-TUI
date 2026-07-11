@@ -1161,6 +1161,13 @@ impl ConfigView {
             },
             ConfigRow {
                 section: ConfigSection::Display,
+                key: "ocean_treatment".to_string(),
+                value: settings.ocean_treatment.clone(),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
+                section: ConfigSection::Display,
                 key: "calm_mode".to_string(),
                 value: settings.calm_mode.to_string(),
                 editable: true,
@@ -1841,6 +1848,7 @@ fn config_label_for_key(key: &str) -> String {
         "theme" => "Theme",
         "locale" => "Language",
         "background_color" => "Background",
+        "ocean_treatment" => "Ocean treatment",
         "calm_mode" => "Calm mode",
         "low_motion" => "Low motion",
         "fancy_animations" => "Animations",
@@ -1916,6 +1924,7 @@ fn config_hint_for_key(key: &str) -> &'static str {
         "theme" => "system | dark | light | grayscale",
         "locale" => "auto | en | ja | zh-Hans | pt-BR",
         "background_color" => "#RRGGBB | default",
+        "ocean_treatment" => "ombre | flat",
         "base_url" => "global DeepSeek/root fallback; e.g. https://api.deepseek.com/beta",
         "provider_url" => {
             "current provider endpoint; Xiaomi: token-plan | pay-as-you-go | custom URL"

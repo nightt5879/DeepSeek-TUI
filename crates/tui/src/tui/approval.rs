@@ -181,6 +181,15 @@ impl AskRuleSavePreview {
 const ASK_RULE_SAVE_PREVIEW_MAX_ENTRIES: usize = 4;
 
 impl ApprovalRequest {
+    /// Mechanical repo-law asks are a distinct authority boundary, not an
+    /// ordinary risk prompt. The engine stamps this stable prefix when a
+    /// `.codewhale/constitution.json` ask rule forces review.
+    #[must_use]
+    pub fn is_repo_law_prompt(&self) -> bool {
+        self.description.starts_with("Repo law holds this write:")
+            && self.description.contains(".codewhale/constitution.json")
+    }
+
     /// Presentation stakes for this request (see [`ApprovalStakes`]).
     #[must_use]
     pub fn stakes(&self) -> ApprovalStakes {

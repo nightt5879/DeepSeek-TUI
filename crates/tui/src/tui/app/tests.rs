@@ -44,19 +44,6 @@ fn create_dir_symlink(target: &std::path::Path, link: &std::path::Path) -> std::
 }
 
 #[test]
-fn feature_intro_content_centers_constitution_follow_up() {
-    let content = App::feature_intro_content();
-    assert!(content.contains("Your CodeWhale setup is ready."));
-    assert!(content.contains("Constitution"));
-    assert!(content.contains("/constitution"));
-    assert!(content.contains("/setup"));
-    assert!(content.contains("/provider") && content.contains("/model"));
-    assert!(content.contains("Optional later"));
-    assert!(content.contains("/hotbar") && content.contains("/hotbar off"));
-    assert!(content.contains("Fleet") && content.contains("/fleet setup"));
-}
-
-#[test]
 fn feature_intro_is_silent_while_onboarding_is_in_progress() {
     let mut app = App::new(test_options(false), &Config::default());
     app.onboarding = OnboardingState::Welcome;
@@ -104,22 +91,11 @@ fn feature_intro_shows_once_persists_then_is_idempotent() {
     let before = app.history.len();
 
     app.maybe_show_feature_intro();
-    assert_eq!(
-        app.history.len(),
-        before + 1,
-        "intro should be added on the first call"
-    );
-    let content = match app.history.last() {
-        Some(HistoryCell::System { content }) => content.clone(),
-        other => panic!("expected a System intro cell, got {other:?}"),
-    };
+    assert_eq!(app.history.len(), before, "intro must not hide empty state");
     assert!(
-        content.contains("Hotbar") && content.contains("/hotbar off"),
-        "intro should explain Hotbar + the disable path: {content:?}"
-    );
-    assert!(
-        content.contains("Fleet") && content.contains("/fleet setup"),
-        "intro should explain Fleet setup: {content:?}"
+        app.status_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Fleet") && message.contains("/fleet setup"))
     );
 
     // Persisted flag now set → a second call is a no-op.
@@ -132,7 +108,7 @@ fn feature_intro_shows_once_persists_then_is_idempotent() {
     app.maybe_show_feature_intro();
     assert_eq!(
         app.history.len(),
-        before + 1,
+        before,
         "intro must not repeat once the flag is persisted"
     );
 
@@ -2171,7 +2147,13 @@ fn set_mode_captures_agent_edits_as_the_durable_baseline() {
 
 #[test]
 fn yolo_start_with_default_config_restores_interactive_agent_shell_baseline() {
-    let mut app = App::new(test_options(true), &Config::default());
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let mut options = test_options(true);
+    options.config_path = Some(config_path);
+    let mut app = App::new(options, &Config::default());
     // --yolo starts in Agent mode with the full-access compat shim (M6).
     assert_eq!(app.mode, AppMode::Agent);
     assert!(app.yolo);
@@ -2190,12 +2172,18 @@ fn yolo_start_with_default_config_restores_interactive_agent_shell_baseline() {
 
 #[test]
 fn leaving_yolo_after_startup_restores_baseline_policies() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
     let config = Config {
         allow_shell: Some(false),
         ..Default::default()
     };
 
-    let mut app = App::new(test_options(true), &config);
+    let mut options = test_options(true);
+    options.config_path = Some(config_path);
+    let mut app = App::new(options, &config);
     // --yolo starts in Agent mode with the full-access compat shim (M6).
     assert_eq!(app.mode, AppMode::Agent);
     assert!(app.yolo);

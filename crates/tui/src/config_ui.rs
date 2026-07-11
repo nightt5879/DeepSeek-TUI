@@ -52,6 +52,7 @@ pub struct SettingsSection {
     pub calm_mode: bool,
     pub low_motion: bool,
     pub fancy_animations: bool,
+    pub ocean_treatment: OceanTreatmentValue,
     pub paste_burst_detection: bool,
     pub show_thinking: bool,
     pub show_tool_details: bool,
@@ -198,6 +199,13 @@ pub enum UiThemeValue {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum OceanTreatmentValue {
+    Ombre,
+    Flat,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ComposerDensityValue {
     Compact,
     Comfortable,
@@ -266,6 +274,7 @@ pub enum ReasoningEffortValue {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StatusIndicatorValue {
+    Cw,
     Whale,
     Dots,
     Off,
@@ -334,6 +343,7 @@ pub fn build_document(app: &App, config: &Config) -> Result<ConfigUiDocument> {
             calm_mode: settings.calm_mode,
             low_motion: settings.low_motion,
             fancy_animations: settings.fancy_animations,
+            ocean_treatment: settings.ocean_treatment.as_str().into(),
             paste_burst_detection: settings.paste_burst_detection,
             show_thinking: settings.show_thinking,
             show_tool_details: settings.show_tool_details,
@@ -496,6 +506,7 @@ pub fn apply_document(
         ("calm_mode", bool_str(doc.settings.calm_mode)),
         ("low_motion", bool_str(doc.settings.low_motion)),
         ("fancy_animations", bool_str(doc.settings.fancy_animations)),
+        ("ocean_treatment", doc.settings.ocean_treatment.as_setting()),
         (
             "paste_burst_detection",
             bool_str(doc.settings.paste_burst_detection),
@@ -780,6 +791,25 @@ impl UiThemeValue {
     }
 }
 
+impl OceanTreatmentValue {
+    fn as_setting(self) -> &'static str {
+        match self {
+            Self::Ombre => "ombre",
+            Self::Flat => "flat",
+        }
+    }
+}
+
+impl From<&str> for OceanTreatmentValue {
+    fn from(value: &str) -> Self {
+        if value.trim().eq_ignore_ascii_case("flat") {
+            Self::Flat
+        } else {
+            Self::Ombre
+        }
+    }
+}
+
 impl ComposerDensityValue {
     fn as_setting(self) -> &'static str {
         match self {
@@ -962,6 +992,7 @@ impl From<&str> for DefaultModeValue {
 impl StatusIndicatorValue {
     fn as_setting(self) -> &'static str {
         match self {
+            Self::Cw => "cw",
             Self::Whale => "whale",
             Self::Dots => "dots",
             Self::Off => "off",
@@ -995,12 +1026,11 @@ impl From<&str> for StatusIndicatorValue {
         // so a TOML file with `status_indicator = "🐳"` or `"none"`
         // resolves to the canonical enum variant.
         match value.trim().to_ascii_lowercase().as_str() {
+            "cw" | "mark" | "text" => Self::Cw,
             "dots" | "dot" => Self::Dots,
             "off" | "none" | "hidden" | "false" => Self::Off,
-            // Default to whale for "whale", aliases, and anything unknown
-            // (we'd rather restore the historic indicator than silently
-            // hide it on a typo).
-            _ => Self::Whale,
+            "whale" | "🐳" | "🐋" => Self::Whale,
+            _ => Self::Cw,
         }
     }
 }

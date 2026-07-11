@@ -734,9 +734,8 @@ mod tests {
         state.start_text(0, None);
         state.set_low_motion(true);
         state.push_content(0, "abc");
-        assert_eq!(state.commit_text(0), "a");
-
-        assert_eq!(state.finalize_block_text(0), "bc");
+        assert_eq!(state.commit_text(0), "abc");
+        assert_eq!(state.finalize_block_text(0), "");
     }
 
     #[test]

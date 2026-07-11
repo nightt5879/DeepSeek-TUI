@@ -33,11 +33,20 @@ pub struct ThemePickerView {
     /// so the per-frame render doesn't re-invoke `UiTheme::detect()` (which
     /// reads `COLORFGBG`) on every keystroke.
     system_ui_theme: UiTheme,
+    /// Effective session treatment, reported separately from theme so the
+    /// picker never claims an ombre is active under Terminal or Flat.
+    ocean_treatment: String,
 }
 
 impl ThemePickerView {
+    #[cfg(test)]
     #[must_use]
     pub fn new(original_name: String) -> Self {
+        Self::new_with_treatment(original_name, "ombre".to_string())
+    }
+
+    #[must_use]
+    pub fn new_with_treatment(original_name: String, ocean_treatment: String) -> Self {
         // If the persisted name matches one of the entries, start there;
         // otherwise fall back to "System" so the cursor lands on a valid row.
         let selected = SELECTABLE_THEMES
@@ -48,6 +57,7 @@ impl ThemePickerView {
             selected,
             original_name,
             system_ui_theme: UiTheme::detect(),
+            ocean_treatment,
         }
     }
 
@@ -163,7 +173,7 @@ impl ModalView for ThemePickerView {
         // 1 title + 1 spacer + N rows + spacer + the in-body action footer.
         // centered_modal_area clamps strictly to `area`, so the modal always
         // fits even on tiny or split-pane terminals.
-        let needed_height = (SELECTABLE_THEMES.len() as u16).saturating_add(9);
+        let needed_height = (SELECTABLE_THEMES.len() as u16).saturating_add(10);
         let popup_area = centered_modal_area(area, 78, needed_height, 44, 8);
 
         // The live theme has already been swapped under us via ConfigUpdated,
@@ -205,6 +215,19 @@ impl ModalView for ThemePickerView {
         lines.push(Line::from(Span::styled(
             "Pick a theme — preview is live; Enter saves to settings.toml.",
             Style::default().fg(live.text_muted),
+        )));
+        lines.push(Line::from(""));
+
+        let treatment = if matches!(self.current(), ThemeId::Terminal) {
+            "Treatment  Ombre unavailable — Terminal owns the background"
+        } else if self.ocean_treatment.eq_ignore_ascii_case("flat") {
+            "Treatment  Flat — active"
+        } else {
+            "Treatment  Ombre — active"
+        };
+        lines.push(Line::from(Span::styled(
+            treatment,
+            Style::default().fg(live.text_hint),
         )));
         lines.push(Line::from(""));
 
@@ -406,6 +429,33 @@ mod tests {
         let area = ratatui::layout::Rect::new(0, 0, 20, 6);
         let mut buf = ratatui::buffer::Buffer::empty(area);
         v.render(area, &mut buf);
+    }
+
+    #[test]
+    fn treatment_report_names_effective_appearance() {
+        let area = ratatui::layout::Rect::new(0, 0, 100, 30);
+
+        let flat = ThemePickerView::new_with_treatment("dark".to_string(), "flat".to_string());
+        let mut flat_buf = ratatui::buffer::Buffer::empty(area);
+        flat.render(area, &mut flat_buf);
+        let flat_text = flat_buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(flat_text.contains("Treatment  Flat — active"));
+
+        let terminal =
+            ThemePickerView::new_with_treatment("terminal".to_string(), "ombre".to_string());
+        let mut terminal_buf = ratatui::buffer::Buffer::empty(area);
+        terminal.render(area, &mut terminal_buf);
+        let terminal_text = terminal_buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(terminal_text.contains("Ombre unavailable"));
+        assert!(terminal_text.contains("Terminal owns the background"));
     }
 
     #[test]

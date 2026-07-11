@@ -225,19 +225,19 @@ pub struct Settings {
     pub calm_mode: bool,
     /// Dense tool-run collapse mode: compact, expanded, or calm.
     pub tool_collapse_mode: String,
-    /// Streaming pacing mode. `true` pins the chunker to one-character-per-
-    /// commit-tick (typewriter); `false` drains the upstream cadence (each
-    /// commit flushes everything queued, which matches V4-pro's burst pattern
-    /// when the prefix cache is warm). Has no effect on the footer water-spout
-    /// animation — that is gated independently by [`Self::fancy_animations`].
+    /// Reduce decorative motion. This must never synthesize model text speed;
+    /// streaming follows upstream deltas in both modes.
     pub low_motion: bool,
-    /// Enable the footer water-spout animation strip during live turns. The
-    /// strip's wave cadence is synchronized with the character-commit rate, so
-    /// the visual flow matches whatever streaming pacing [`Self::low_motion`]
-    /// selects: typewriter mode drips, upstream mode surges, tool calls /
-    /// planning pauses freeze the surface. Set `false` to keep the gap as
-    /// plain whitespace.
+    /// Enable expressive live-state motion. This affects chrome and state
+    /// affordances only; model text always follows upstream stream deltas.
     pub fancy_animations: bool,
+    /// Background treatment: `ombre` paints the terminal-native water column;
+    /// `flat` preserves all state marks on the theme's plain surface.
+    pub ocean_treatment: String,
+    /// Runtime-only 30 FPS cap for terminals that flicker at high redraw
+    /// rates. Separate from accessibility motion and text delivery.
+    #[serde(skip)]
+    pub constrained_frame_rate: bool,
     /// Enable terminal bracketed-paste mode. Default true. Disable if your
     /// terminal mishandles the `\e[?2004h` escape (rare; some legacy
     /// terminals over SSH+screen multiplex without the cap).
@@ -312,7 +312,8 @@ pub struct Settings {
     pub provider_models: Option<std::collections::HashMap<String, String>>,
     /// Header status indicator next to the effort chip. Cycles through a
     /// per-turn animation keyed off `App::turn_started_at`:
-    /// - `"whale"` (default): historical `🐳 → 🐋` 12-frame sequence
+    /// - `"cw"` (default): static typographic CodeWhale mark.
+    /// - `"whale"`: historical `🐳 → 🐋` 12-frame sequence
     ///   originally shipped in v0.3.5, removed in v0.8.x's "smoother TUI
     ///   streaming" pass, restored in v0.8.30. Idle frame is a steady `🐳`.
     /// - `"dots"`: the 6-frame geometric sequence (`◍ ◉ ◌ ◌ ◉ ◍`) that
@@ -381,8 +382,10 @@ impl Default for Settings {
             // #4095: default presentation is compact/calm; verbose detail is opt-in.
             calm_mode: true,
             tool_collapse_mode: "compact".to_string(),
-            low_motion: true,
-            fancy_animations: false,
+            low_motion: false,
+            fancy_animations: true,
+            ocean_treatment: "ombre".to_string(),
+            constrained_frame_rate: false,
             bracketed_paste: true,
             paste_burst_detection: true,
             mention_menu_limit: 128,
@@ -399,8 +402,8 @@ impl Default for Settings {
             transcript_spacing: "compact".to_string(),
             default_mode: "agent".to_string(),
             sidebar_width_percent: 28,
-            sidebar_focus: "pinned".to_string(),
-            sidebar_auto_collapse_opt_in: false,
+            sidebar_focus: "auto".to_string(),
+            sidebar_auto_collapse_opt_in: true,
             context_panel: false,
             cost_currency: "usd".to_string(),
             max_input_history: 100,
@@ -409,7 +412,7 @@ impl Default for Settings {
             reasoning_effort: None,
             permission_posture: None,
             provider_models: None,
-            status_indicator: "whale".to_string(),
+            status_indicator: "cw".to_string(),
             synchronized_output: "auto".to_string(),
             prefer_external_pdftotext: false,
             workspace_follow_symlinks: false,
@@ -433,6 +436,14 @@ pub const CALM_PRESET_FIELDS: &[(&str, &str)] = &[
     ("fancy_animations", "false"),
     ("show_tool_details", "false"),
 ];
+
+fn normalize_ocean_treatment(value: &str) -> &'static str {
+    if value.trim().eq_ignore_ascii_case("flat") {
+        "flat"
+    } else {
+        "ombre"
+    }
+}
 
 /// The `(key, value)` fields a named preset applies, or `None` for an unknown
 /// name. Single source of truth shared by [`Settings::apply_preset`] and the
@@ -501,6 +512,7 @@ impl Settings {
                 s.sidebar_focus = "pinned".to_string();
             }
             s.status_indicator = normalize_status_indicator(&s.status_indicator).to_string();
+            s.ocean_treatment = normalize_ocean_treatment(&s.ocean_treatment).to_string();
             s.synchronized_output =
                 normalize_synchronized_output(&s.synchronized_output).to_string();
             s.locale = normalize_configured_locale(&s.locale)
@@ -555,8 +567,9 @@ impl Settings {
             self.fancy_animations = false;
         }
         // VS Code (TERM_PROGRAM=vscode, #1356), Ghostty (#1445), and a few
-        // VTE terminals (#1470) produce visible flicker at 120 FPS. Drop to
-        // the 30 FPS low-motion cap for them automatically. Ghostty may report
+        // VTE terminals (#1470) produce visible flicker at 120 FPS. Cap their
+        // redraw rate without changing motion semantics or model text pacing.
+        // Ghostty may report
         // either TERM_PROGRAM=Ghostty/ghostty or TERM=xterm-ghostty.
         // Like NO_ANIMATIONS above, this unconditionally overrides any
         // disk-loaded value — consistent precedence: env signals always win.
@@ -566,13 +579,13 @@ impl Settings {
         let term = std::env::var("TERM")
             .unwrap_or_default()
             .to_ascii_lowercase();
-        let term_forces_low_motion =
+        let term_constrains_frame_rate =
             matches!(term_program.as_str(), "vscode" | "ghostty") || term.contains("ghostty");
-        let vte_env_forces_low_motion = std::env::var_os("TILIX_ID").is_some_and(|v| !v.is_empty())
+        let vte_env_constrains_frame_rate = std::env::var_os("TILIX_ID")
+            .is_some_and(|v| !v.is_empty())
             || std::env::var_os("TERMINATOR_UUID").is_some_and(|v| !v.is_empty());
-        if term_forces_low_motion || vte_env_forces_low_motion {
-            self.low_motion = true;
-            self.fancy_animations = false;
+        if term_constrains_frame_rate || vte_env_constrains_frame_rate {
+            self.constrained_frame_rate = true;
         }
 
         // Termius (TERM_PROGRAM=Termius) and SSH sessions exhibit the
@@ -697,6 +710,15 @@ impl Settings {
             "fancy_animations" | "fancy" | "animations" => {
                 self.fancy_animations = parse_bool(value)?;
             }
+            "ocean_treatment" | "treatment" | "background_treatment" => {
+                let normalized = value.trim().to_ascii_lowercase();
+                if !matches!(normalized.as_str(), "ombre" | "flat") {
+                    anyhow::bail!(
+                        "Failed to update setting: invalid ocean treatment '{value}'. Expected: ombre or flat."
+                    );
+                }
+                self.ocean_treatment = normalized;
+            }
             "bracketed_paste" | "paste" => {
                 self.bracketed_paste = parse_bool(value)?;
             }
@@ -777,9 +799,9 @@ impl Settings {
             }
             "status_indicator" | "indicator" => {
                 let normalized = normalize_status_indicator(value);
-                if !["whale", "dots", "off"].contains(&normalized) {
+                if !["cw", "whale", "dots", "off"].contains(&normalized) {
                     anyhow::bail!(
-                        "Failed to update setting: invalid status indicator '{value}'. Expected: whale, dots, off."
+                        "Failed to update setting: invalid status indicator '{value}'. Expected: cw, whale, dots, off."
                     );
                 }
                 self.status_indicator = normalized.to_string();
@@ -940,6 +962,7 @@ impl Settings {
         lines.push(format!("  tool_collapse:      {}", self.tool_collapse_mode));
         lines.push(format!("  low_motion:         {}", self.low_motion));
         lines.push(format!("  fancy_animations:   {}", self.fancy_animations));
+        lines.push(format!("  ocean_treatment:    {}", self.ocean_treatment));
         lines.push(format!("  bracketed_paste:    {}", self.bracketed_paste));
         lines.push(format!(
             "  paste_burst_detect: {}",
@@ -1029,11 +1052,12 @@ impl Settings {
             ),
             (
                 "low_motion",
-                "Streaming pacing: on = typewriter (one char/tick), off = upstream cadence",
+                "Reduce decorative motion without changing model text delivery: on/off",
             ),
+            ("fancy_animations", "Expressive live-state motion: on/off"),
             (
-                "fancy_animations",
-                "Footer water-spout strip (wave synced to typing speed): on/off",
+                "ocean_treatment",
+                "Transcript background treatment: ombre/flat (independent of motion)",
             ),
             (
                 "bracketed_paste",
@@ -1088,7 +1112,7 @@ impl Settings {
             ),
             (
                 "status_indicator",
-                "Header status indicator next to effort chip: whale, dots, off",
+                "Header status indicator next to effort chip: cw, whale, dots, off",
             ),
             (
                 "synchronized_output",
@@ -1427,6 +1451,7 @@ fn normalize_tool_collapse_mode(value: &str) -> &str {
 /// in `update_setting` can surface a clear error.
 fn normalize_status_indicator(value: &str) -> &str {
     match value.trim().to_ascii_lowercase().as_str() {
+        "cw" | "mark" | "text" => "cw",
         "whale" | "🐳" | "🐋" => "whale",
         "dots" | "dot" => "dots",
         "off" | "none" | "hidden" | "false" => "off",
@@ -1557,6 +1582,20 @@ fn env_truthy(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn ocean_treatment_is_appearance_not_motion() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.ocean_treatment, "ombre");
+        assert!(!settings.low_motion);
+
+        settings.set("ocean_treatment", "flat").unwrap();
+        assert_eq!(settings.ocean_treatment, "flat");
+        assert!(!settings.low_motion, "appearance must not change motion");
+
+        let err = settings.set("ocean_treatment", "kelp").unwrap_err();
+        assert!(err.to_string().contains("ombre or flat"));
+    }
+
     /// Explicit animated baseline for env-force tests (#4095 flipped defaults to calm).
     fn animated_settings() -> Settings {
         Settings {
@@ -1572,7 +1611,7 @@ mod tests {
     #[test]
     fn apply_preset_calm_sets_bundle_and_preserves_evidence() {
         let mut settings = Settings::default();
-        // Defaults are already the calm/compact posture (#4095).
+        // Density is calm by default; motion is an independent axis.
         assert!(settings.calm_mode);
         assert!(settings.show_thinking);
 
@@ -1604,8 +1643,8 @@ mod tests {
         let settings = Settings::default();
         assert!(settings.calm_mode);
         assert!(!settings.show_tool_details);
-        assert!(settings.low_motion);
-        assert!(!settings.fancy_animations);
+        assert!(!settings.low_motion);
+        assert!(settings.fancy_animations);
         assert_eq!(settings.transcript_spacing, "compact");
         assert_eq!(settings.tool_collapse_mode, "compact");
         // Thinking stays visible — compact is not "hide evidence".
@@ -1656,22 +1695,23 @@ mod tests {
     fn default_settings_show_footer_water_strip() {
         let settings = Settings::default();
         assert!(
-            !settings.fancy_animations,
-            "default presentation is calm (#4095)"
+            settings.fancy_animations,
+            "underwater presentation is the default"
         );
+        assert!(!settings.low_motion);
     }
 
     #[test]
-    fn default_settings_keep_sidebar_pinned() {
+    fn default_settings_keep_the_water_field_open_until_inspection_is_needed() {
         let settings = Settings::default();
-        assert_eq!(settings.sidebar_focus, "pinned");
-        assert!(!settings.sidebar_auto_collapse_opt_in);
+        assert_eq!(settings.sidebar_focus, "auto");
+        assert!(settings.sidebar_auto_collapse_opt_in);
     }
 
     #[test]
     fn sidebar_auto_opt_in_marker_is_serialized_only_when_enabled() {
         let default_body = toml::to_string_pretty(&Settings::default()).expect("serialize");
-        assert!(!default_body.contains("sidebar_auto_collapse_opt_in"));
+        assert!(default_body.contains("sidebar_auto_collapse_opt_in = true"));
 
         let mut settings = Settings::default();
         settings
@@ -2121,7 +2161,7 @@ mod tests {
     }
 
     #[test]
-    fn vscode_term_program_forces_low_motion_on() {
+    fn vscode_caps_redraws_without_disabling_motion_or_text_cadence() {
         let _g = term_program_test_guard();
         let prev = std::env::var_os("TERM_PROGRAM");
         // SAFETY: serialised by the guard.
@@ -2131,13 +2171,11 @@ mod tests {
         let mut settings = animated_settings();
         assert!(!settings.low_motion, "default is animated");
         settings.apply_env_overrides();
+        assert!(!settings.low_motion);
+        assert!(settings.fancy_animations);
         assert!(
-            settings.low_motion,
-            "TERM_PROGRAM=vscode must enable low_motion to prevent flickering (#1356)"
-        );
-        assert!(
-            !settings.fancy_animations,
-            "TERM_PROGRAM=vscode must disable fancy_animations"
+            settings.constrained_frame_rate,
+            "TERM_PROGRAM=vscode should cap redraws without changing animation semantics"
         );
         // SAFETY: cleanup under the guard.
         unsafe {
@@ -2149,7 +2187,7 @@ mod tests {
     }
 
     #[test]
-    fn ghostty_term_program_forces_low_motion_on() {
+    fn ghostty_term_program_caps_redraws_without_disabling_motion() {
         let _g = term_program_test_guard();
         let prev = std::env::var_os("TERM_PROGRAM");
         // SAFETY: serialised by the guard.
@@ -2159,14 +2197,9 @@ mod tests {
         let mut settings = animated_settings();
         assert!(!settings.low_motion, "default is animated");
         settings.apply_env_overrides();
-        assert!(
-            settings.low_motion,
-            "TERM_PROGRAM=Ghostty must enable low_motion to prevent flickering (#1445)"
-        );
-        assert!(
-            !settings.fancy_animations,
-            "TERM_PROGRAM=Ghostty must disable fancy_animations"
-        );
+        assert!(!settings.low_motion);
+        assert!(settings.fancy_animations);
+        assert!(settings.constrained_frame_rate);
         // SAFETY: cleanup under the guard.
         unsafe {
             match prev {
@@ -2177,7 +2210,7 @@ mod tests {
     }
 
     #[test]
-    fn ghostty_term_fallback_forces_low_motion_on() {
+    fn ghostty_term_fallback_caps_redraws_without_disabling_motion() {
         let _g = term_program_test_guard();
         let prev_program = std::env::var_os("TERM_PROGRAM");
         let prev_term = std::env::var_os("TERM");
@@ -2188,14 +2221,9 @@ mod tests {
         }
         let mut settings = Settings::default();
         settings.apply_env_overrides();
-        assert!(
-            settings.low_motion,
-            "TERM=xterm-ghostty must enable low_motion when TERM_PROGRAM is absent"
-        );
-        assert!(
-            !settings.fancy_animations,
-            "TERM=xterm-ghostty must disable fancy_animations"
-        );
+        assert!(!settings.low_motion);
+        assert!(settings.fancy_animations);
+        assert!(settings.constrained_frame_rate);
         // SAFETY: cleanup under the guard.
         unsafe {
             match prev_program {
@@ -2277,7 +2305,7 @@ mod tests {
     }
 
     #[test]
-    fn tilix_and_terminator_env_force_low_motion_on() {
+    fn tilix_and_terminator_cap_redraws_without_disabling_motion() {
         let _g = term_program_test_guard();
         let prev_term_program = std::env::var_os("TERM_PROGRAM");
         let prev_tilix_id = std::env::var_os("TILIX_ID");
@@ -2298,12 +2326,16 @@ mod tests {
             assert!(!settings.low_motion, "default is animated");
             settings.apply_env_overrides();
             assert!(
-                settings.low_motion,
-                "{var} must enable low_motion to prevent VTE flicker (#1470)"
+                settings.constrained_frame_rate,
+                "{var} must cap redraws to prevent VTE flicker (#1470)"
             );
             assert!(
-                !settings.fancy_animations,
-                "{var} must disable fancy_animations"
+                !settings.low_motion,
+                "{var} must not change motion semantics"
+            );
+            assert!(
+                settings.fancy_animations,
+                "{var} must not disable the ocean treatment"
             );
         }
 

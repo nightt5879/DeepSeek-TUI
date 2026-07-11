@@ -10,9 +10,9 @@
 //! - [`ChunkingMode::Smooth`]: normal pressure.
 //! - [`ChunkingMode::CatchUp`]: elevated pressure.
 //!
-//! Normal-motion callers drain all currently available chunks so the display
-//! follows the upstream SSE delta cadence. Low-motion callers stay in Smooth
-//! and drain one chunk per tick to reduce visual churn.
+//! Every caller drains all currently available chunks so the display follows
+//! the upstream SSE delta cadence. Low motion affects decorative animation and
+//! redraw frequency, never the apparent speed of model text.
 //!
 //! # Hysteresis
 //!
@@ -130,15 +130,16 @@ impl AdaptiveChunkingPolicy {
 
     /// Computes a drain decision from the current queue snapshot.
     pub fn decide(&mut self, snapshot: QueueSnapshot, now: Instant) -> ChunkingDecision {
-        // In low-motion mode, always use Smooth pacing regardless of queue
-        // pressure — the user asked for a calm, steady display.
+        // Low motion stays in Smooth mode, but text still follows upstream
+        // cadence. Dripping one grapheme per redraw creates an artificial
+        // typewriter followed by a large final flush.
         if self.low_motion {
             self.mode = ChunkingMode::Smooth;
             self.below_exit_threshold_since = None;
             return ChunkingDecision {
                 mode: self.mode,
                 entered_catch_up: false,
-                drain_plan: DrainPlan::Single,
+                drain_plan: DrainPlan::Available,
             };
         }
 
@@ -410,7 +411,7 @@ mod tests {
         let d1 = policy.decide(snap(ENTER_QUEUE_DEPTH_LINES + 80, 10), t0);
         assert_eq!(d1.mode, ChunkingMode::Smooth);
         assert!(!d1.entered_catch_up);
-        assert_eq!(d1.drain_plan, DrainPlan::Single);
+        assert_eq!(d1.drain_plan, DrainPlan::Available);
 
         // Oldest age far above ENTER threshold.
         let d2 = policy.decide(
@@ -419,7 +420,7 @@ mod tests {
         );
         assert_eq!(d2.mode, ChunkingMode::Smooth);
         assert!(!d2.entered_catch_up);
-        assert_eq!(d2.drain_plan, DrainPlan::Single);
+        assert_eq!(d2.drain_plan, DrainPlan::Available);
 
         // Severe backlog — still Smooth.
         let d3 = policy.decide(
@@ -430,7 +431,7 @@ mod tests {
             t0 + Duration::from_millis(200),
         );
         assert_eq!(d3.mode, ChunkingMode::Smooth);
-        assert_eq!(d3.drain_plan, DrainPlan::Single);
+        assert_eq!(d3.drain_plan, DrainPlan::Available);
     }
 
     #[test]
