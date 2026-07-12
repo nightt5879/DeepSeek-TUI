@@ -21,7 +21,8 @@ use crate::session_manager::{
     strip_thinking_tags,
 };
 use crate::tui::views::{
-    ActionHint, render_modal_footer, render_panel_scroll_rail, render_underwater_surface,
+    ActionHint, action_footer_lines, render_modal_footer, render_panel_scroll_rail,
+    render_underwater_surface,
 };
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
 
@@ -572,19 +573,78 @@ impl ModalView for SessionPickerView {
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let surface = render_underwater_surface(area, buf, "sessions");
-        let content = render_modal_footer(
-            surface,
-            buf,
-            &[
-                ActionHint::new("Enter", "resume"),
-                ActionHint::new("/", "search"),
-                ActionHint::new("s", "sort"),
-                ActionHint::new("r", "rename"),
-                ActionHint::new("a", "all workspaces"),
-                ActionHint::new("d", "delete"),
-                ActionHint::new("Esc", "close"),
-            ],
-        );
+        let full_hints = [
+            ActionHint::new("Enter", "resume"),
+            ActionHint::new("/", "search"),
+            ActionHint::new("s", "sort"),
+            ActionHint::new("r", "rename"),
+            ActionHint::new("a", "all workspaces"),
+            ActionHint::new("d", "delete"),
+            ActionHint::new("Esc", "close"),
+        ];
+        // The two bordered panes spend five rows on chrome before either can
+        // show a content row. When the body cannot afford that, this room
+        // keeps only the object it exists for — a selectable session list
+        // with a usable resume action — and trims the action rail to match.
+        let full_footer_rows = action_footer_lines(&full_hints, surface.width).len();
+        let compact = usize::from(surface.height).saturating_sub(full_footer_rows) < 12;
+        if compact {
+            let content = render_modal_footer(
+                surface,
+                buf,
+                &[
+                    ActionHint::new("Enter", "resume"),
+                    ActionHint::new("/", "search"),
+                    ActionHint::new("Esc", "close"),
+                ],
+            );
+            let header_rows = 1 + usize::from(self.confirm_delete || self.status.is_some());
+            let footer_rows = usize::from(!self.filtered.is_empty());
+            let visible_rows = usize::from(content.height)
+                .saturating_sub(header_rows + footer_rows)
+                .max(1);
+            self.update_list_viewport(visible_rows);
+            let list_scroll = self.list_scroll.get();
+            let list_content = render_panel_scroll_rail(
+                content,
+                buf,
+                self.filtered.len().saturating_add(header_rows),
+                list_scroll,
+                visible_rows,
+                true,
+            );
+            let list_lines = build_list_lines(
+                &self.filtered,
+                self.selected,
+                list_content.width,
+                list_scroll,
+                visible_rows,
+                self.search_mode,
+                &self.search_input,
+                self.sort_label(),
+                self.confirm_delete,
+                self.rename_mode,
+                &self.rename_input,
+                self.status.as_deref(),
+            );
+            *self.last_row_hitboxes.borrow_mut() = (0..visible_rows)
+                .filter_map(|row| {
+                    let index = list_scroll.saturating_add(row);
+                    (index < self.filtered.len()).then_some((
+                        list_content
+                            .y
+                            .saturating_add(header_rows as u16)
+                            .saturating_add(row as u16),
+                        index,
+                    ))
+                })
+                .collect();
+            Paragraph::new(list_lines)
+                .wrap(Wrap { trim: false })
+                .render(list_content, buf);
+            return;
+        }
+        let content = render_modal_footer(surface, buf, &full_hints);
         let narrow = content.width < 95;
         let chunks = Layout::default()
             .direction(if narrow {
@@ -1282,6 +1342,55 @@ mod tests {
                 .any(|x| buf[(x, y)].bg == palette::WHALE_ACCENT_PRIMARY),
             "selected /sessions row should not use the bright accent background"
         );
+    }
+
+    /// 40x12/60x16 regression: when two bordered panes cannot both show a
+    /// content row, the picker keeps a single focused session list — with the
+    /// selected session, its resume action, and truthful mouse hitboxes —
+    /// instead of two empty headings over a wrapped footer.
+    #[test]
+    fn session_picker_compact_heights_keep_a_selectable_session() {
+        let sessions = (0..6)
+            .map(|idx| {
+                let mut session = test_session(idx, "compact fixture session");
+                session.id = format!("compact-fixture-{idx:02}");
+                session
+            })
+            .collect::<Vec<_>>();
+        let mut view = picker_with(sessions, None);
+        view.selected = 4;
+        view.ensure_selected_visible();
+
+        for (width, height, label) in [(40u16, 12u16, "40x12"), (60, 16, "60x16")] {
+            let area = Rect::new(0, 0, width, height);
+            let mut buf = Buffer::empty(area);
+
+            view.render(area, &mut buf);
+
+            let dump = buffer_text(&buf, area);
+            let selected_id = crate::session_manager::truncate_id(&view.filtered[view.selected].id);
+            assert!(
+                row_containing(&buf, area, &selected_id).is_some(),
+                "{label} should render the selected session row:\n{dump}"
+            );
+            assert!(
+                dump.contains("resume"),
+                "{label} should keep the resume action visible:\n{dump}"
+            );
+            let hitboxes = view.last_row_hitboxes.borrow();
+            assert!(
+                !hitboxes.is_empty(),
+                "{label} should register session hitboxes:\n{dump}"
+            );
+            for (y, idx) in hitboxes.iter() {
+                let row = buffer_row_text(&buf, area, *y);
+                let id = crate::session_manager::truncate_id(&view.filtered[*idx].id);
+                assert!(
+                    row.contains(&id),
+                    "{label} hitbox at y={y} should map to session {id}; got {row:?}"
+                );
+            }
+        }
     }
 
     #[test]

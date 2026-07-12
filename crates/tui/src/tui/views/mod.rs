@@ -1138,6 +1138,9 @@ pub struct ConfigView {
     effective_low_motion: bool,
     effective_fancy_animations: bool,
     last_visible_rows: Cell<usize>,
+    /// Selection-anchored scroll actually used by the last render; keeps the
+    /// panel scroll rail truthful when the stored scroll predates a resize.
+    last_render_scroll: Cell<usize>,
     last_row_hitboxes: RefCell<Vec<(u16, usize)>>,
     last_mouse_selected: Option<usize>,
 }
@@ -1478,6 +1481,7 @@ impl ConfigView {
             effective_low_motion: app.low_motion,
             effective_fancy_animations: app.fancy_animations,
             last_visible_rows: Cell::new(0),
+            last_render_scroll: Cell::new(0),
             last_row_hitboxes: RefCell::new(Vec::new()),
             last_mouse_selected: None,
         }
@@ -2266,6 +2270,13 @@ impl ModalView for ConfigView {
         let inner =
             render_underwater_surface(area, buf, self.tr(MessageId::ConfigModalTitle).to_string());
         let (lines, footer) = if let Some(edit) = self.editing.as_ref() {
+            let footer_text = self.tr(MessageId::ConfigEditFooter).to_string();
+            let reserved_footer_lines =
+                wrapped_footer_lines(&footer_text, inner.width, Style::default()).len();
+            // Spacer rows are secondary chrome: give them up before the
+            // editable value line falls below the wrapped footer on compact
+            // terminals (#40x12).
+            let spacious = usize::from(inner.height).saturating_sub(reserved_footer_lines) >= 8;
             let mut lines: Vec<Line> = Vec::new();
             let edit_label = config_label_for_key(&edit.key);
             let edit_title = if edit_label == edit.key {
@@ -2282,7 +2293,9 @@ impl ModalView for ConfigView {
                 edit_title,
                 Style::default().fg(palette::WHALE_INFO).bold(),
             )]));
-            lines.push(Line::from(""));
+            if spacious {
+                lines.push(Line::from(""));
+            }
             lines.push(Line::from(vec![
                 Span::styled(
                     self.tr(MessageId::ConfigEditScopeLabel),
@@ -2297,9 +2310,13 @@ impl ModalView for ConfigView {
                 ),
                 Span::raw(truncate_view_text(&edit.original_value, 60)),
             ]));
-            lines.push(Line::from(""));
+            if spacious {
+                lines.push(Line::from(""));
+            }
             lines.push(render_config_editor_value_line(edit, self.locale));
-            lines.push(Line::from(""));
+            if spacious {
+                lines.push(Line::from(""));
+            }
             let hint = config_hint_for_key(&edit.key);
             if !hint.is_empty() {
                 lines.push(Line::from(vec![
@@ -2310,24 +2327,62 @@ impl ModalView for ConfigView {
                     Span::raw(hint),
                 ]));
             }
-            (lines, self.tr(MessageId::ConfigEditFooter).to_string())
+            (lines, footer_text)
         } else {
             let content_height = usize::from(inner.height);
-            // Title (with job subtitle), search, blank, column headers, separator.
-            let header_lines = 5usize;
-            let bottom_lines = 1usize;
-            // The action footer now lives inside the modal body (reserved by
-            // `render_modal_text_footer` below) rather than on the border, so it
-            // claims one inner row that the table must not draw over.
-            let footer_lines = 1usize;
+            let items = self.visible_items();
+            let match_count = self.matching_row_indices().len();
+
+            // Reserve the action footer by its actual wrapped height: the
+            // prose hints wrap to two or three rows at compact widths, and
+            // every wrapped row must come out of the table budget or the
+            // settings rows silently fall off the bottom of the body.
+            let footer_height = |id: MessageId| -> usize {
+                wrapped_footer_lines(&self.tr(id), inner.width, Style::default()).len()
+            };
+            let footer_lines = if !self.filter.is_empty() {
+                footer_height(MessageId::ConfigFooterFiltered)
+            } else {
+                footer_height(MessageId::ConfigFooterScrollable)
+                    .max(footer_height(MessageId::ConfigFooterDefault))
+            }
+            .max(1);
+
+            // Full chrome spends five header rows (in-body title, search,
+            // blank, column captions, separator) plus a status row under the
+            // table. That secondary material collapses before the settings
+            // rows do: compact keeps one search/count line — the surface
+            // hairline already owns the title — and cedes the rest to the
+            // rows the room exists to edit.
+            const FULL_HEADER_LINES: usize = 5;
+            const FULL_BOTTOM_LINES: usize = 1;
+            let full_rows =
+                content_height.saturating_sub(FULL_HEADER_LINES + FULL_BOTTOM_LINES + footer_lines);
+            let compact = full_rows < 4;
+            let header_lines = if compact { 1 } else { FULL_HEADER_LINES };
+            let bottom_lines = if compact {
+                usize::from(self.status.is_some())
+            } else {
+                FULL_BOTTOM_LINES
+            };
             let visible_rows = content_height
                 .saturating_sub(header_lines + bottom_lines + footer_lines)
                 .max(1);
             self.last_visible_rows.set(visible_rows);
 
-            let items = self.visible_items();
-            let match_count = self.matching_row_indices().len();
-            let start = self.scroll.min(items.len());
+            // The stored scroll can predate this frame's geometry (a resize
+            // shrinks the window before any key recomputes it), so anchor the
+            // visible window to the selection here: the row being manipulated
+            // is always rendered.
+            let max_scroll = items.len().saturating_sub(visible_rows);
+            let mut start = self.scroll.min(max_scroll);
+            if let Some(pos) = self.selected_display_position(&items) {
+                if pos < start {
+                    start = pos;
+                } else if pos >= start + visible_rows {
+                    start = pos + 1 - visible_rows;
+                }
+            }
             let end = (start + visible_rows).min(items.len());
             let scrollable = items.len() > visible_rows;
             let search_value = if self.filter.is_empty() {
@@ -2339,45 +2394,50 @@ impl ModalView for ConfigView {
             let table_width = usize::from(inner.width).saturating_sub(usize::from(scrollable));
             let (key_column_width, value_column_width, scope_column_width) =
                 self.table_column_widths(table_width);
-            let mut lines: Vec<Line> = vec![
-                Line::from(vec![
-                    Span::styled(
-                        self.tr(MessageId::ConfigTitle),
-                        Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
-                    ),
-                    Span::styled(
-                        format!(" — {}", self.tr(MessageId::ConfigSubtitle)),
-                        Style::default().fg(palette::TEXT_MUTED),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Search: ", Style::default().fg(palette::TEXT_MUTED)),
-                    Span::raw(search_value),
-                    Span::styled(
-                        format!("  ({match_count}/{})", self.rows.len()),
-                        Style::default().fg(palette::TEXT_MUTED),
-                    ),
-                ]),
-                Line::from(""),
-                Line::from(format!(
-                    "  {:<key_width$} {:<value_width$} {:<scope_width$}",
-                    "Setting",
-                    "Value",
-                    "Scope",
-                    key_width = key_column_width,
-                    value_width = value_column_width,
-                    scope_width = scope_column_width
-                )),
-                Line::from(format!(
-                    "  {}",
-                    "-".repeat(
-                        key_column_width
-                            + value_column_width
-                            + scope_column_width
-                            + CONFIG_COLUMN_GAPS_WIDTH
-                    )
-                )),
-            ];
+            let search_line = Line::from(vec![
+                Span::styled("  Search: ", Style::default().fg(palette::TEXT_MUTED)),
+                Span::raw(search_value),
+                Span::styled(
+                    format!("  ({match_count}/{})", self.rows.len()),
+                    Style::default().fg(palette::TEXT_MUTED),
+                ),
+            ]);
+            let mut lines: Vec<Line> = if compact {
+                vec![search_line]
+            } else {
+                vec![
+                    Line::from(vec![
+                        Span::styled(
+                            self.tr(MessageId::ConfigTitle),
+                            Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
+                        ),
+                        Span::styled(
+                            format!(" — {}", self.tr(MessageId::ConfigSubtitle)),
+                            Style::default().fg(palette::TEXT_MUTED),
+                        ),
+                    ]),
+                    search_line,
+                    Line::from(""),
+                    Line::from(format!(
+                        "  {:<key_width$} {:<value_width$} {:<scope_width$}",
+                        "Setting",
+                        "Value",
+                        "Scope",
+                        key_width = key_column_width,
+                        value_width = value_column_width,
+                        scope_width = scope_column_width
+                    )),
+                    Line::from(format!(
+                        "  {}",
+                        "-".repeat(
+                            key_column_width
+                                + value_column_width
+                                + scope_column_width
+                                + CONFIG_COLUMN_GAPS_WIDTH
+                        )
+                    )),
+                ]
+            };
             let mut row_hitboxes = Vec::new();
 
             for item in items.iter().skip(start).take(visible_rows) {
@@ -2435,34 +2495,37 @@ impl ModalView for ConfigView {
                 )));
             }
 
-            let selected_hint = self.selected_row_hint();
-            let bottom_text = if let Some(status) = self.status.as_ref() {
-                status.clone()
-            } else if !self.filter.is_empty() {
-                format!(
-                    "{}: {match_count}",
-                    self.tr(MessageId::ConfigFilteredSettings)
-                )
-            } else if scrollable && !items.is_empty() {
-                let showing = format!(
-                    "{} {}-{} / {}",
-                    self.tr(MessageId::ConfigShowing),
-                    self.scroll.saturating_add(1),
-                    end,
-                    items.len()
-                );
-                if let Some(hint) = selected_hint {
-                    format!("{showing} | {hint}")
+            if bottom_lines > 0 {
+                let selected_hint = self.selected_row_hint();
+                let bottom_text = if let Some(status) = self.status.as_ref() {
+                    status.clone()
+                } else if !self.filter.is_empty() {
+                    format!(
+                        "{}: {match_count}",
+                        self.tr(MessageId::ConfigFilteredSettings)
+                    )
+                } else if scrollable && !items.is_empty() {
+                    let showing = format!(
+                        "{} {}-{} / {}",
+                        self.tr(MessageId::ConfigShowing),
+                        start.saturating_add(1),
+                        end,
+                        items.len()
+                    );
+                    if let Some(hint) = selected_hint {
+                        format!("{showing} | {hint}")
+                    } else {
+                        showing
+                    }
                 } else {
-                    showing
-                }
-            } else {
-                selected_hint.unwrap_or_default()
-            };
-            lines.push(Line::from(Span::styled(
-                crate::tui::ui_text::semantic_truncate(&bottom_text, usize::from(inner.width)),
-                Style::default().fg(palette::TEXT_MUTED),
-            )));
+                    selected_hint.unwrap_or_default()
+                };
+                lines.push(Line::from(Span::styled(
+                    crate::tui::ui_text::semantic_truncate(&bottom_text, usize::from(inner.width)),
+                    Style::default().fg(palette::TEXT_MUTED),
+                )));
+            }
+            self.last_render_scroll.set(start);
 
             let footer = if !self.filter.is_empty() {
                 self.tr(MessageId::ConfigFooterFiltered)
@@ -2487,7 +2550,7 @@ impl ModalView for ConfigView {
                 content,
                 buf,
                 self.visible_items().len(),
-                self.scroll,
+                self.last_render_scroll.get(),
                 self.last_visible_rows.get().max(1),
                 true,
             )
@@ -3032,7 +3095,8 @@ mod tests {
     use super::{
         ActionHint, ConfigListItem, ConfigView, EmptyState, HelpView, ListDetailLayout, ModalKind,
         ModalView, ViewAction, ViewEvent, ViewStack, action_footer_lines, centered_modal_area,
-        render_modal_footer, render_underwater_surface, subagent_view_agents, truncate_view_text,
+        config_label_for_key, render_modal_footer, render_underwater_surface, subagent_view_agents,
+        truncate_view_text,
     };
     use crate::config::Config;
     use crate::localization::{Locale, MessageId, tr};
@@ -4317,5 +4381,96 @@ base_url = "https://api.xiaomimimo.com/v1"
             out.push('\n');
         }
         out
+    }
+
+    fn buffer_row_text(buf: &Buffer, area: Rect, y: u16) -> String {
+        (area.left()..area.right())
+            .map(|x| buf[(x, y)].symbol())
+            .collect()
+    }
+
+    /// 40x12 regression: the compact tier must surrender secondary chrome
+    /// (in-body title, column captions, separator) before it surrenders the
+    /// settings rows, and the wrapped footer height must come out of the
+    /// table budget instead of silently clipping rows.
+    #[test]
+    fn config_view_compact_heights_always_show_a_selectable_setting() {
+        let mut view = create_config_view(Locale::En);
+        for (width, height, label) in [(40u16, 12u16, "40x12"), (60, 16, "60x16")] {
+            let area = Rect::new(0, 0, width, height);
+            let mut buf = Buffer::empty(area);
+
+            view.render(area, &mut buf);
+
+            let dump = buffer_text(&buf, area);
+            let (selected_y, selected_idx) = {
+                let hitboxes = view.last_row_hitboxes.borrow();
+                assert!(
+                    !hitboxes.is_empty(),
+                    "{label} should register selectable setting hitboxes:\n{dump}"
+                );
+                hitboxes
+                    .iter()
+                    .find(|(_, idx)| *idx == view.selected)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        panic!("{label} selected setting should be rendered:\n{dump}")
+                    })
+            };
+            let row = buffer_row_text(&buf, area, selected_y);
+            let row_label = config_label_for_key(&view.rows[selected_idx].key);
+            let prefix: String = row_label.chars().take(8).collect();
+            assert!(
+                row.contains(&prefix),
+                "{label} hitbox row should contain the selected setting ({row_label:?}); got {row:?}"
+            );
+            assert!(
+                dump.contains("Search:"),
+                "{label} should keep the search affordance:\n{dump}"
+            );
+        }
+
+        // The selection anchor must hold while navigating across sections at
+        // the smallest supported size.
+        let area = Rect::new(0, 0, 40, 12);
+        for step in 0..12 {
+            view.move_selection(1);
+            let mut buf = Buffer::empty(area);
+            view.render(area, &mut buf);
+            let rendered = view
+                .last_row_hitboxes
+                .borrow()
+                .iter()
+                .any(|(_, idx)| *idx == view.selected);
+            assert!(
+                rendered,
+                "selected setting fell out of the 40x12 window after {} moves",
+                step + 1
+            );
+        }
+    }
+
+    /// 40x12 regression: the edit surface must keep the editable value line
+    /// (and its hint) above the wrapped footer.
+    #[test]
+    fn config_view_compact_edit_surface_keeps_value_line_visible() {
+        let mut view = create_config_view(Locale::En);
+        view.selected = view
+            .rows
+            .iter()
+            .position(|row| row.key == "approval_mode")
+            .expect("approval_mode row");
+        view.start_edit();
+        assert!(view.editing.is_some(), "approval_mode should be editable");
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+
+        view.render(area, &mut buf);
+
+        let dump = buffer_text(&buf, area);
+        assert!(
+            dump.contains("New:"),
+            "the editable value line must stay visible at 40x12:\n{dump}"
+        );
     }
 }
