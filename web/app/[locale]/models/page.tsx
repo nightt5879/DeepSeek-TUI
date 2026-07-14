@@ -9,7 +9,7 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
   return buildPageMetadata({
     path: "/models",
     locale,
-    title: isZh ? "模型与提供商 · CodeWhale" : "Models & providers · CodeWhale",
+    title: isZh ? "模型与提供商 · Codewhale" : "Models & providers · Codewhale",
     description: isZh
       ? "自带密钥，没有推理加价，不会悄悄换模型。DeepSeek 一级支持，本地 vLLM / SGLang / Ollama 无需密钥，所有提供商共用同一个运行时和同一套工具。"
       : "Bring your own key, no inference markup, no silent model switching. DeepSeek is first-class, local vLLM / SGLang / Ollama need no key, and every provider routes through the same runtime and tools.",
@@ -49,12 +49,12 @@ export default async function ModelsPage({ params }: { params: Promise<{ locale:
           {(isZh
             ? [
                 { t: "自带密钥", d: "codewhale auth set --provider … 把密钥存进本机的 ~/.codewhale/config.toml。请求直达你配置的提供商。" },
-                { t: "没有推理加价", d: "CodeWhale 不经手计费：没有中转、没有转售。账单在你和提供商之间，跟这个项目无关。" },
+                { t: "没有推理加价", d: "Codewhale 不经手计费：没有中转、没有转售。账单在你和提供商之间，跟这个项目无关。" },
                 { t: "不会悄悄换模型", d: "提供商和模型是你显式设定的路由，不从提示词里猜。换路由是你亲手敲的命令：/provider 和 /model。" },
               ]
             : [
                 { t: "Bring your own key", d: "codewhale auth set --provider … stores keys in your local ~/.codewhale/config.toml. Requests go straight to the provider you configured." },
-                { t: "No inference markup", d: "CodeWhale never sits in the billing path — no relay, no resale. The bill is between you and your provider; this project isn't on it." },
+                { t: "No inference markup", d: "Codewhale never sits in the billing path — no relay, no resale. The bill is between you and your provider; this project isn't on it." },
                 { t: "No silent model switching", d: "The provider and model are an explicit route you set, not inferred from a prompt. Changing it is a command you type: /provider and /model." },
               ]
           ).map((item) => (

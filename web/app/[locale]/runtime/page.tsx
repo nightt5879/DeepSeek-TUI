@@ -8,10 +8,10 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
   return buildPageMetadata({
     path: "/runtime",
     locale,
-    title: isZh ? "Runtime & 集成 · CodeWhale" : "Runtime & Integrations · CodeWhale",
+    title: isZh ? "Runtime & 集成 · Codewhale" : "Runtime & Integrations · Codewhale",
     description: isZh
-      ? "CodeWhale 的本地 Runtime API、HTTP/SSE、ACP 协议、MCP 服务器、VS Code 扩展、Telegram / Feishu 桥接以及实验性微信集成。"
-      : "CodeWhale local Runtime API, HTTP/SSE, ACP protocol, MCP servers, VS Code extension, Telegram and Feishu bridges, and experimental Weixin integration.",
+      ? "Codewhale 的本地 Runtime API、HTTP/SSE、ACP 协议、MCP 服务器、VS Code 扩展、Telegram / Feishu 桥接以及实验性微信集成。"
+      : "Codewhale local Runtime API, HTTP/SSE, ACP protocol, MCP servers, VS Code extension, Telegram and Feishu bridges, and experimental Weixin integration.",
   });
 }
 
@@ -32,26 +32,26 @@ const INTEGRATIONS: Integration[] = [
   },
   {
     name: "ACP (Agent Communication Protocol)",
-    desc: "Open IETF-standard protocol surface for agent-to-agent communication. CodeWhale speaks ACP natively so external agents, tools, and platforms can discover and interact with running sessions.",
-    descZh: "开放的 IETF 标准 Agent 通信协议。CodeWhale 原生支持 ACP，外部 Agent、工具和平台可以发现并互操作运行中的会话。",
+    desc: "Open IETF-standard protocol surface for agent-to-agent communication. Codewhale speaks ACP natively so external agents, tools, and platforms can discover and interact with running sessions.",
+    descZh: "开放的 IETF 标准 Agent 通信协议。Codewhale 原生支持 ACP，外部 Agent、工具和平台可以发现并互操作运行中的会话。",
     docsHref: "/en/docs#acp",
   },
   {
     name: "MCP (Model Context Protocol)",
-    desc: "Connect CodeWhale to external tools and services via MCP servers over stdio or HTTP/SSE. Pre-configured servers include filesystem, Git, SQLite, and popular SaaS platforms.",
-    descZh: "通过 MCP 服务器（stdio 或 HTTP/SSE）将 CodeWhale 连接到外部工具和服务。预配置的服务器包括文件系统、Git、SQLite 和常用 SaaS 平台。",
+    desc: "Connect Codewhale to external tools and services via MCP servers over stdio or HTTP/SSE. Pre-configured servers include filesystem, Git, SQLite, and popular SaaS platforms.",
+    descZh: "通过 MCP 服务器（stdio 或 HTTP/SSE）将 Codewhale 连接到外部工具和服务。预配置的服务器包括文件系统、Git、SQLite 和常用 SaaS 平台。",
     docsHref: "/en/docs#mcp",
   },
   {
     name: "VS Code Extension",
-    desc: "Open-source VS Code extension that embeds CodeWhale as a side-panel agent. Run codewhale inside your editor with full workspace context.",
-    descZh: "开源 VS Code 扩展，将 CodeWhale 嵌入编辑器的侧边面板。在编辑器内利用完整工作区上下文运行 CodeWhale。",
+    desc: "Open-source VS Code extension that embeds Codewhale as a side-panel agent. Run codewhale inside your editor with full workspace context.",
+    descZh: "开源 VS Code 扩展，将 Codewhale 嵌入编辑器的侧边面板。在编辑器内利用完整工作区上下文运行 Codewhale。",
     href: "https://github.com/Hmbown/CodeWhale/tree/main/extensions/vscode",
   },
   {
     name: "Telegram Bridge",
-    desc: "First-party Telegram bot bridge. Start a headless CodeWhale session, then chat with it from any Telegram client — approvals, tool results, and completions surface inline.",
-    descZh: "官方 Telegram 机器人桥接。启动无头 CodeWhale 会话，在任何 Telegram 客户端中与之对话——审批、工具结果和完成状态内联展示。",
+    desc: "First-party Telegram bot bridge. Start a headless Codewhale session, then chat with it from any Telegram client — approvals, tool results, and completions surface inline.",
+    descZh: "官方 Telegram 机器人桥接。启动无头 Codewhale 会话，在任何 Telegram 客户端中与之对话——审批、工具结果和完成状态内联展示。",
     href: "https://github.com/Hmbown/CodeWhale/tree/main/integrations/telegram-bridge",
   },
   {
@@ -90,8 +90,8 @@ export default async function RuntimePage({ params }: { params: Promise<{ locale
 
         <p className="max-w-2xl text-ink-soft leading-relaxed">
           {isZh
-            ? "CodeWhale 不仅是一个终端 Agent——它还是一个可通过多种协议和集成方式嵌入到你现有工作流中的本地控制平面。"
-            : "CodeWhale is more than a terminal agent — it is a local control plane you can embed into your existing workflow through multiple protocols and integrations."}
+            ? "Codewhale 不仅是一个终端 Agent——它还是一个可通过多种协议和集成方式嵌入到你现有工作流中的本地控制平面。"
+            : "Codewhale is more than a terminal agent — it is a local control plane you can embed into your existing workflow through multiple protocols and integrations."}
         </p>
       </section>
 
@@ -130,8 +130,8 @@ export default async function RuntimePage({ params }: { params: Promise<{ locale
             <strong className="text-ink">{isZh ? "开放协议" : "Open protocols"}</strong>
             <p className="mt-1">
               {isZh
-                ? "CodeWhale 使用标准 HTTP/SSE、JSON-RPC 和 ACP，可与任何兼容客户端或平台集成。"
-                : "CodeWhale speaks standard HTTP/SSE, JSON-RPC, and ACP — compatible with any client or platform."}
+                ? "Codewhale 使用标准 HTTP/SSE、JSON-RPC 和 ACP，可与任何兼容客户端或平台集成。"
+                : "Codewhale speaks standard HTTP/SSE, JSON-RPC, and ACP — compatible with any client or platform."}
             </p>
           </div>
         </div>

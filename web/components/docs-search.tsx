@@ -236,7 +236,7 @@ export function DocsSearch({ locale }: { locale: string }) {
         <section className="hairline-t pt-8 mt-12">
           <p className="text-sm text-ink-mute leading-relaxed max-w-2xl">
             {isZh
-              ? "§ 标记的条目在 CodeWhale 网站上有独立页面；↗ 标记的条目链接到 GitHub 仓库中的源文档。所有内容来源于 docs/ 目录下的 40+ 篇 Markdown 文档，通过 docs-map.ts 注册表维护。"
+              ? "§ 标记的条目在 Codewhale 网站上有独立页面；↗ 标记的条目链接到 GitHub 仓库中的源文档。所有内容来源于 docs/ 目录下的 40+ 篇 Markdown 文档，通过 docs-map.ts 注册表维护。"
               : "Entries marked § have dedicated pages on codewhale.net; entries marked ↗ link to source documents in the GitHub repository. All content is sourced from 40+ Markdown documents in the docs/ directory, maintained through the docs-map.ts registry."}
           </p>
         </section>

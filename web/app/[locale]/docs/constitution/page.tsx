@@ -7,7 +7,7 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
   return buildPageMetadata({
     path: "/docs/constitution",
     locale,
-    title: isZh ? "宪法与 /constitution · CodeWhale 文档" : "Constitution and /constitution · CodeWhale Docs",
+    title: isZh ? "宪法与 /constitution · Codewhale 文档" : "Constitution and /constitution · Codewhale Docs",
     description: isZh
       ? "用户全局宪法、仓库本地法、项目说明和运行时边界。"
       : "User-global constitution, repo-local law, project instructions, and runtime boundaries.",
@@ -29,7 +29,7 @@ export default async function ConstitutionPage({ params }: { params: Promise<{ l
         </h2>
         {isZh ? (
           <p className="text-ink-soft mt-3 leading-[1.9] tracking-wide">
-            CodeWhale 先给 Agent 一个可追责的地址，再给上下文冲突一套法律。
+            Codewhale 先给 Agent 一个可追责的地址，再给上下文冲突一套法律。
             <code className="inline">/constitution</code> 是管理个人常驻宪法的主入口：
             它把结构化的用户全局设置保存在 <code className="inline">$CODEWHALE_HOME/constitution.json</code>，
             再渲染成模型可读的 prose block。仓库仍可通过{" "}
@@ -38,7 +38,7 @@ export default async function ConstitutionPage({ params }: { params: Promise<{ l
           </p>
         ) : (
           <p className="text-ink-soft mt-3 leading-relaxed">
-            CodeWhale gives the agent an accountable address, then a legal system for
+            Codewhale gives the agent an accountable address, then a legal system for
             context conflicts. <code className="inline">/constitution</code> is the
             primary personal constitution surface: guided setup stores structured
             user-global data in <code className="inline">$CODEWHALE_HOME/constitution.json</code>

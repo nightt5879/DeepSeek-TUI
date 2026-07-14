@@ -15,9 +15,18 @@ function topics(ids: string[]): DocTopic[] {
   });
 }
 
+const TOPIC_PAGE_OVERRIDES: Record<string, string> = {
+  install: "install",
+  providers: "models",
+};
+
+function topicIsExternal(topic: DocTopic): boolean {
+  return !topic.hasPage && !(topic.id in TOPIC_PAGE_OVERRIDES);
+}
+
 function topicHref(topic: DocTopic, locale: string): string {
-  if (topic.id === "install") return `/${locale}/install`;
-  if (topic.id === "providers") return `/${locale}/models`;
+  const override = TOPIC_PAGE_OVERRIDES[topic.id];
+  if (override) return `/${locale}/${override}`;
   if (topic.hasPage) return `/${locale}/docs/${topic.slug}`;
 
   const source = Array.isArray(topic.repoSource) ? topic.repoSource[0] : topic.repoSource;
@@ -30,7 +39,7 @@ function TopicList({ items, locale }: { items: DocTopic[]; locale: string }) {
   return (
     <div className="portal-topic-list">
       {items.map((topic) => {
-        const external = !topic.hasPage && topic.id !== "install" && topic.id !== "providers";
+        const external = topicIsExternal(topic);
         return (
           <Link
             key={topic.id}

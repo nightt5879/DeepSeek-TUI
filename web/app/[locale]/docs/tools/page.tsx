@@ -7,7 +7,7 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
   return buildPageMetadata({
     path: "/docs/tools",
     locale,
-    title: isZh ? "工具 · CodeWhale 文档" : "Tools · CodeWhale Docs",
+    title: isZh ? "工具 · Codewhale 文档" : "Tools · Codewhale Docs",
     description: isZh
       ? "类型化工具集、工具生命周期和精选工具目录。"
       : "Typed tool surface, tool lifecycle, and the curated tool catalog.",

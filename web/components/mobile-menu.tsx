@@ -61,7 +61,7 @@ export function MobileMenu({
           aria-modal="true"
         >
           <nav className="px-6 py-4">
-            <ul className="divide-y divide-[rgba(14,14,16,0.18)]">
+            <ul className="divide-y divide-[rgba(27,34,48,0.18)]">
               {links.map((l) => {
                 const isActive = pathname === l.href || pathname.startsWith(`${l.href}/`);
                 return (

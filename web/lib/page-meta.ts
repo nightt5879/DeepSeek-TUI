@@ -38,7 +38,7 @@ const OG_IMAGE = {
  *   return buildPageMetadata({
  *     path: "/install",
  *     locale,
- *     title: isZh ? "安装 · CodeWhale" : "Install · CodeWhale",
+ *     title: isZh ? "安装 · Codewhale" : "Install · Codewhale",
  *     description: isZh ? "…" : "…",
  *   });
  * }

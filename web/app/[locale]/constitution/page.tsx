@@ -9,10 +9,10 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
   return buildPageMetadata({
     path: "/constitution",
     locale,
-    title: isZh ? "三层法 · CodeWhale" : "Three layers of law · CodeWhale",
+    title: isZh ? "三层法 · Codewhale" : "Three layers of law · Codewhale",
     description: isZh
-      ? "CodeWhale 的嵌套宪法：内置基础法、你的常备法（/constitution）、仓库自己的法（.codewhale/constitution.json）。位阶由执行框架强制生效，换掉模型也不失效。"
-      : "CodeWhale's nested constitution: bundled base law, your standing law (/constitution), and your repo's law (.codewhale/constitution.json). Rank is enforced in the harness and survives a model swap.",
+      ? "Codewhale 的嵌套宪法：内置基础法、你的常备法（/constitution）、仓库自己的法（.codewhale/constitution.json）。位阶由执行框架强制生效，换掉模型也不失效。"
+      : "Codewhale's nested constitution: bundled base law, your standing law (/constitution), and your repo's law (.codewhale/constitution.json). Rank is enforced in the harness and survives a model swap.",
   });
 }
 
@@ -65,8 +65,8 @@ export default async function ConstitutionPage({ params }: { params: Promise<{ l
         </h1>
         <p className={`max-w-2xl text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
           {isZh
-            ? "项目一变老，指令就开始堆积、彼此冲突：最初的规格、后来推翻它的重构、陈旧的记忆、上一个智能体的交接、你此刻的要求、刚跑出的与交接说法不符的测试结果。扁平的系统提示词让模型靠猜来化解；CodeWhale 用一部嵌套的宪法给出明确的位阶。顺序由执行框架强制生效——有测试断言它不会漂移——换掉模型，结构依然完好。"
-            : "As a project ages, instructions pile up and conflict: the original spec, a refactor that contradicts it, stale memory, a previous agent's handoff, your current request, fresh test output that doesn't match what the handoff claimed. A flat system prompt makes the model resolve that by guess. CodeWhale uses a nested constitution so there is a defined rank instead of vibes — the order is enforced in the harness, with tests asserting it can't drift, and it stays intact when you swap models."}
+            ? "项目一变老，指令就开始堆积、彼此冲突：最初的规格、后来推翻它的重构、陈旧的记忆、上一个智能体的交接、你此刻的要求、刚跑出的与交接说法不符的测试结果。扁平的系统提示词让模型靠猜来化解；Codewhale 用一部嵌套的宪法给出明确的位阶。顺序由执行框架强制生效——有测试断言它不会漂移——换掉模型，结构依然完好。"
+            : "As a project ages, instructions pile up and conflict: the original spec, a refactor that contradicts it, stale memory, a previous agent's handoff, your current request, fresh test output that doesn't match what the handoff claimed. A flat system prompt makes the model resolve that by guess. Codewhale uses a nested constitution so there is a defined rank instead of vibes — the order is enforced in the harness, with tests asserting it can't drift, and it stays intact when you swap models."}
         </p>
 
         {/* v0.8.68 flagship framing */}

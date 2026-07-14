@@ -6,7 +6,7 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
   return buildPageMetadata({
     path: "/docs/modes",
     locale,
-    title: isZh ? "模式 · CodeWhale 文档" : "Modes · CodeWhale Docs",
+    title: isZh ? "模式 · Codewhale 文档" : "Modes · Codewhale Docs",
     description: isZh
       ? "Plan、Act、Operate 三种运行模式与正交审批姿态。"
       : "Plan, Act, Operate modes and orthogonal approval posture.",

@@ -11,10 +11,10 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
   return buildPageMetadata({
     path: "/install",
     locale,
-    title: isZh ? "安装 · CodeWhale" : "Install · CodeWhale",
+    title: isZh ? "安装 · Codewhale" : "Install · Codewhale",
     description: isZh
-      ? "一行 curl -fsSL https://codewhale.net/install.sh | sh 安装或更新 CodeWhale，也支持 npm、Cargo、GitHub Releases、CNB 镜像、Homebrew、预编译二进制、Docker 和源码编译。"
-      : "Install or update CodeWhale with curl -fsSL https://codewhale.net/install.sh | sh, or via npm, cargo, GitHub Releases, the CNB mirror, Homebrew, prebuilt binaries, Docker, or from source.",
+      ? "一行 curl -fsSL https://codewhale.net/install.sh | sh 安装或更新 Codewhale，也支持 npm、Cargo、GitHub Releases、CNB 镜像、Homebrew、预编译二进制、Docker 和源码编译。"
+      : "Install or update Codewhale with curl -fsSL https://codewhale.net/install.sh | sh, or via npm, cargo, GitHub Releases, the CNB mirror, Homebrew, prebuilt binaries, Docker, or from source.",
   });
 }
 
@@ -54,7 +54,7 @@ docker run --rm -it \\
   ghcr.io/hmbown/codewhale:latest`;
 
 const FROM_SOURCE = `git clone https://github.com/Hmbown/CodeWhale
-cd CodeWhale
+cd Codewhale
 cargo build --release --locked
 
 # Install both binaries from the local checkout
@@ -499,7 +499,7 @@ codewhale doctor`;
             {isZh ? (
               <>
                 <strong className="text-ink">codewhale.net</strong> 和{" "}
-                <strong className="text-ink">www.codewhale.net</strong> 是 CodeWhale 的官方站点，
+                <strong className="text-ink">www.codewhale.net</strong> 是 Codewhale 的官方站点，
                 部署在 Cloudflare 上。网站源码位于{" "}
                 <code className="inline">Hmbown/CodeWhale</code> 仓库的{" "}
                 <code className="inline">web/</code> 目录下，任何人都可自行部署为镜像。
@@ -507,7 +507,7 @@ codewhale doctor`;
             ) : (
               <>
                 <strong className="text-ink">codewhale.net</strong> and{" "}
-                <strong className="text-ink">www.codewhale.net</strong> are the official CodeWhale
+                <strong className="text-ink">www.codewhale.net</strong> are the official Codewhale
                 sites, deployed on Cloudflare. The website source lives under{" "}
                 <code className="inline">web/</code> in the{" "}
                 <code className="inline">Hmbown/CodeWhale</code> repository — anyone can
@@ -547,16 +547,16 @@ codewhale doctor`;
               <div className="eyebrow mb-1 text-indigo">{isZh ? "TUNA / 包镜像" : "TUNA / package mirrors"}</div>
               <p>
                 {isZh
-                  ? "Cargo 用户可通过 TUNA（清华大学开源镜像站）加速下载。这些镜像由第三方维护，CodeWhale 项目不控制镜像内容。"
-                  : "Cargo users can accelerate downloads via TUNA (Tsinghua University Open Source Mirror). These mirrors are maintained by third parties; the CodeWhale project does not control mirror content."}
+                  ? "Cargo 用户可通过 TUNA（清华大学开源镜像站）加速下载。这些镜像由第三方维护，Codewhale 项目不控制镜像内容。"
+                  : "Cargo users can accelerate downloads via TUNA (Tsinghua University Open Source Mirror). These mirrors are maintained by third parties; the Codewhale project does not control mirror content."}
               </p>
             </div>
             <div>
               <div className="eyebrow mb-1 text-indigo">{isZh ? "自行部署" : "Self-deployed"}</div>
               <p>
                 {isZh
-                  ? "自行部署的网站副本、镜像站和第三方包不受 CodeWhale 项目控制。请验证下载来源和校验和。"
-                  : "Self-deployed website copies, mirror sites, and third-party packages are not controlled by the CodeWhale project. Verify download sources and checksums."}
+                  ? "自行部署的网站副本、镜像站和第三方包不受 Codewhale 项目控制。请验证下载来源和校验和。"
+                  : "Self-deployed website copies, mirror sites, and third-party packages are not controlled by the Codewhale project. Verify download sources and checksums."}
               </p>
             </div>
           </div>

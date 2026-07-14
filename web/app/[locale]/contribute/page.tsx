@@ -6,10 +6,10 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
   const { locale } = await params;
   const isZh = locale === "zh";
   return {
-    title: isZh ? "参与贡献 · CodeWhale" : "Contribute · CodeWhale",
+    title: isZh ? "参与贡献 · Codewhale" : "Contribute · Codewhale",
     description: isZh
-      ? "如何提交议题、发送合并请求、加入 CodeWhale 社区。"
-      : "How to file issues, send pull requests, and join the CodeWhale community.",
+      ? "如何提交议题、发送合并请求、加入 Codewhale 社区。"
+      : "How to file issues, send pull requests, and join the Codewhale community.",
   };
 }
 
@@ -75,9 +75,9 @@ const stepsZh = [
   },
 ];
 
-const smallPatchPromptEn = `You are running inside CodeWhale.
+const smallPatchPromptEn = `You are running inside Codewhale.
 
-Improve CodeWhale itself by finding exactly one small, reviewable friction point in the harness, docs, tests, or contributor workflow.
+Improve Codewhale itself by finding exactly one small, reviewable friction point in the harness, docs, tests, or contributor workflow.
 
 Prefer bug fixes, regression tests, clearer docs, sharper error messages, or one narrow contributor-experience improvement. Do not change product direction, provider policy, telemetry, sponsorship, branding, auth, sandbox, release/publishing, or global prompts unless the maintainer explicitly asked for that exact scope.
 
@@ -92,9 +92,9 @@ Working rules:
 
 Output: issue summary, files changed, checks run, risks or follow-up, and a suggested PR title.`;
 
-const smallPatchPromptZh = `你正在 CodeWhale 中运行。
+const smallPatchPromptZh = `你正在 Codewhale 中运行。
 
-请改进 CodeWhale 本身：只找一个很小、可审查的摩擦点，范围可以是智能体框架、文档、测试或贡献流程。
+请改进 Codewhale 本身：只找一个很小、可审查的摩擦点，范围可以是智能体框架、文档、测试或贡献流程。
 
 优先处理 bug 修复、回归测试、文档澄清、错误信息改进，或一个很窄的贡献者体验问题。除非维护者明确要求，否则不要改产品方向、提供商策略、遥测、赞助、品牌、认证、沙箱、发布流程或全局提示词。
 
@@ -150,7 +150,7 @@ export default async function ContributePage({ params }: { params: Promise<{ loc
             <div className="lg:col-span-4 min-w-0">
               <Seal char="补" />
               <div className="eyebrow mt-5 mb-3">小补丁提示词 · Small-patch prompt</div>
-              <h2 className="font-display text-3xl">用 CodeWhale 改进 CodeWhale</h2>
+              <h2 className="font-display text-3xl">用 Codewhale 改进 Codewhale</h2>
               <p className="mt-4 text-ink-soft leading-[1.9] tracking-wide">
                 好的贡献提示词不是让 Agent 表演勤奋，而是让它留下一个可以合并的事实：一个真实摩擦点、一个小补丁、最小相关检查，以及审查者需要知道的风险。
               </p>
@@ -210,8 +210,8 @@ export default async function ContributePage({ params }: { params: Promise<{ loc
               <div className="lg:col-span-8 min-w-0">
                 <pre className="code-block">
 {`# 在 GitHub 上 fork，然后：
-git clone git@github.com:YOU/CodeWhale
-cd CodeWhale
+git clone git@github.com:YOU/Codewhale
+cd Codewhale
 git checkout -b feat/your-thing
 
 # 本地构建运行
@@ -270,7 +270,7 @@ gh pr create --fill`}
             <div className="lg:col-span-4 min-w-0">
               <Seal char="补" />
               <div className="eyebrow mt-5 mb-3">Small-patch prompt · 小补丁提示词</div>
-              <h2 className="font-display text-3xl">Use CodeWhale on CodeWhale</h2>
+              <h2 className="font-display text-3xl">Use Codewhale on Codewhale</h2>
               <p className="mt-4 text-ink-soft leading-relaxed">
                 A good contribution prompt does not reward motion. It asks for one mergeable fact: one real friction point, one small patch, the smallest relevant checks, and the risk a reviewer needs to know.
               </p>
@@ -328,8 +328,8 @@ gh pr create --fill`}
               <div className="lg:col-span-8 min-w-0">
                 <pre className="code-block">
 {`# fork on github, then:
-git clone git@github.com:YOU/CodeWhale
-cd CodeWhale
+git clone git@github.com:YOU/Codewhale
+cd Codewhale
 git checkout -b feat/your-thing
 
 # build and run locally

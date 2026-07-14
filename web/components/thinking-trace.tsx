@@ -1,9 +1,9 @@
 /**
  * "See how it decides" — a terminal-styled pane that surfaces REAL reasoning
- * traces from a CodeWhale session, paired with the decision each produced.
+ * traces from a Codewhale session, paired with the decision each produced.
  *
  * The point is "show, don't tell": every agent claims to be aligned/trustworthy;
- * CodeWhale can prove it, because the Constitution is observable in the model's
+ * Codewhale can prove it, because the Constitution is observable in the model's
  * reasoning (it cites "Article II", "Article V", etc. as it decides). No other
  * agent can show this because none have a hierarchy the model reasons against.
  *

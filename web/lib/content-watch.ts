@@ -122,7 +122,7 @@ export async function runLinkCheck(env: WatchEnv): Promise<{ ok: boolean; checke
 
 // --- Semantic drift ---
 
-const SEMANTIC_DRIFT_PROMPT = `You are reviewing copy on a community website (codewhale.net) for the open-source CodeWhale project.
+const SEMANTIC_DRIFT_PROMPT = `You are reviewing copy on a community website (codewhale.net) for the open-source Codewhale project.
 
 Given:
 1. The CHANGELOG entries below (most recent first)

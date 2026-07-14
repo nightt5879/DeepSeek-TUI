@@ -26,10 +26,10 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
   return buildPageMetadata({
     path: "/community",
     locale,
-    title: isZh ? "社区 · CodeWhale" : "Community · CodeWhale",
+    title: isZh ? "社区 · Codewhale" : "Community · Codewhale",
     description: isZh
-      ? "CodeWhale 的社区一角：实时仓库动态、每周摘要、路线图、贡献指南与发布致谢，集中在一处。"
-      : "The community side of CodeWhale in one place: live repo activity, the weekly digest, the roadmap, how to contribute, and release credits.",
+      ? "Codewhale 的社区一角：实时仓库动态、每周摘要、路线图、贡献指南与发布致谢，集中在一处。"
+      : "The community side of Codewhale in one place: live repo activity, the weekly digest, the roadmap, how to contribute, and release credits.",
   });
 }
 
@@ -98,8 +98,8 @@ export default async function CommunityPage({ params }: { params: Promise<{ loca
         </h1>
         <p className={`mt-5 max-w-3xl text-ink-soft text-lg ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
           {isZh
-            ? "CodeWhale 的核心是那部嵌套的法典和它的执行框架。社区是重要的补充，而不是标题——一个人维护，但由许多人塑造。这一页把散落各处的社区线索集中起来：此刻的仓库动态、每周摘要、公开的路线图、上手贡献的路径，以及每个版本背后的致谢。"
-            : "CodeWhale's core is the nested constitution and the harness that enforces it. The community is an important addition, not the headline — maintained by one person, shaped by many. This page gathers the community threads that live in different corners: what's moving in the repo right now, the weekly digest, the roadmap in the open, the path to contributing, and the credits behind every release."}
+            ? "Codewhale 的核心是那部嵌套的法典和它的执行框架。社区是重要的补充，而不是标题——一个人维护，但由许多人塑造。这一页把散落各处的社区线索集中起来：此刻的仓库动态、每周摘要、公开的路线图、上手贡献的路径，以及每个版本背后的致谢。"
+            : "Codewhale's core is the nested constitution and the harness that enforces it. The community is an important addition, not the headline — maintained by one person, shaped by many. This page gathers the community threads that live in different corners: what's moving in the repo right now, the weekly digest, the roadmap in the open, the path to contributing, and the credits behind every release."}
         </p>
       </section>
 

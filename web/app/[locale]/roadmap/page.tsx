@@ -9,10 +9,10 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
   const { locale } = await params;
   const isZh = locale === "zh";
   return {
-    title: isZh ? "路线图 · CodeWhale" : "Roadmap · CodeWhale",
+    title: isZh ? "路线图 · Codewhale" : "Roadmap · Codewhale",
     description: isZh
       ? "已确认、正在评估和已排除的功能规划。"
-      : "What's confirmed, what's being weighed, what's been ruled out for CodeWhale.",
+      : "What's confirmed, what's being weighed, what's been ruled out for Codewhale.",
   };
 }
 
