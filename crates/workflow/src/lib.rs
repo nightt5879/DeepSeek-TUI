@@ -541,13 +541,13 @@ impl IsolationMode {
 
 /// A leaf is write-capable when it can mutate the workspace.
 ///
-/// Used by workflow lowering to decide the default isolation for parallel
-/// children (#4120).
+/// Authority comes from the declared mode and permissions, not the agent's
+/// role identity. In particular, an implementer may be deliberately confined
+/// to a read-only verification task. Used by workflow lowering to decide the
+/// default isolation for parallel children (#4120).
 #[must_use]
 pub fn leaf_is_write_capable(spec: &LeafSpec) -> bool {
-    spec.mode == TaskMode::ReadWrite
-        || spec.permissions.allow_write
-        || matches!(spec.agent_type, AgentType::Implementer)
+    spec.mode == TaskMode::ReadWrite || spec.permissions.allow_write
 }
 
 /// Effective worktree flag for a leaf given whether it is being lowered inside
@@ -2504,6 +2504,18 @@ mod tests {
         };
         assert!(!leaf_is_write_capable(&read_only));
         assert!(!leaf_wants_worktree(&read_only, true));
+
+        let mut read_only_implementer = read_only.clone();
+        read_only_implementer.id = "ro-implementer".to_string();
+        read_only_implementer.agent_type = AgentType::Implementer;
+        assert!(
+            !leaf_is_write_capable(&read_only_implementer),
+            "role identity must not grant write authority"
+        );
+        assert!(
+            !leaf_wants_worktree(&read_only_implementer, true),
+            "parallel read-only implementers stay shared under auto isolation"
+        );
 
         let mut write = read_only.clone();
         write.id = "rw".to_string();

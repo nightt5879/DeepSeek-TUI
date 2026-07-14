@@ -560,6 +560,32 @@ mod tests {
     }
 
     #[test]
+    fn read_only_implementer_role_is_not_write_capable_or_elevated() {
+        let mut implementer = leaf("verify-only", TaskMode::ReadOnly);
+        implementer.agent_type = AgentType::Implementer;
+        implementer.role = Some("implementer".to_string());
+        let spec = spec_with(
+            vec![WorkflowNode::BranchSet(BranchSpec {
+                id: "parallel-read-only".to_string(),
+                description: None,
+                parallel: true,
+                budget: BudgetSpec::default(),
+                permissions: PermissionSpec::default(),
+                model_policy: ModelPolicy::default(),
+                children: vec![WorkflowNode::Leaf(implementer)],
+            })],
+            Some("read_only"),
+        );
+
+        let elevation = assess_workflow_elevation(&spec, ElevationOptions::default());
+        assert!(elevation.is_read_only_envelope(), "{elevation:?}");
+        assert!(!elevation.elevated, "{elevation:?}");
+        assert!(!elevation.writes, "{elevation:?}");
+        assert!(!elevation.shell, "{elevation:?}");
+        assert!(!elevation.worktree, "{elevation:?}");
+    }
+
+    #[test]
     fn write_plan_elevates_and_flags_shell_for_implementer() {
         let spec = spec_with(
             vec![WorkflowNode::Leaf(leaf("impl", TaskMode::ReadWrite))],
