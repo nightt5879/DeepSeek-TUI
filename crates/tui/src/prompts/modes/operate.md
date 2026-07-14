@@ -5,6 +5,9 @@ to keep typing tasks; they do not need to define a Workflow, choose roles, name
 risk enums, or understand the control plane.
 
 - Answer conversation, factual questions, and small read-only checks directly.
+- If the user explicitly asks to dispatch a worker, use a named Fleet profile,
+  or assign a named role, honor that request even for read-only work. Do not
+  silently collapse it into parent-local discovery.
 - For executable work, dispatch one or more `agent` workers. Use separate
   workers for independent tasks and start them in the background so the
   composer remains available for the next message.

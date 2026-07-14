@@ -3347,6 +3347,8 @@ mod tests {
         for phrase in [
             "ordinary user messages",
             "Answer conversation",
+            "honor that request even for read-only work",
+            "silently collapse it into parent-local discovery",
             "dispatch one or more `agent` workers",
             "background",
             "Treat each queued user message as another task",
