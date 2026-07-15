@@ -194,6 +194,21 @@ enum WorkflowUiEventKind {
         blocked_role: Option<String>,
         blocked_reason: Option<String>,
     },
+    HandoffPromoted {
+        artifact_id: String,
+        gate_id: String,
+        kind: String,
+        from_role: String,
+        to_role: String,
+        producer_task_id: String,
+    },
+    HandoffConsumed {
+        artifact_id: String,
+        kind: String,
+        from_role: String,
+        to_role: String,
+        consumer_task_id: String,
+    },
     TaskSchemaValidationFailed {
         task_id: String,
         message: String,
@@ -250,6 +265,8 @@ impl WorkflowUiEventKind {
             Self::TaskStarted(_) => "task_started",
             Self::TaskCompleted { .. } => "task_completed",
             Self::GateUpdated { .. } => "gate_updated",
+            Self::HandoffPromoted { .. } => "handoff_promoted",
+            Self::HandoffConsumed { .. } => "handoff_consumed",
             Self::TaskSchemaValidationFailed { .. } => "task_schema_validation_failed",
             Self::BudgetUpdated { .. } => "budget_updated",
             Self::Log { .. } => "log",
@@ -2023,12 +2040,15 @@ impl SubAgentWorkflowDriver {
         }
     }
 
-    fn prepare_request_for_gates(&self, request: &mut TaskRequest) -> Result<(), DriverError> {
+    fn prepare_request_for_gates(
+        &self,
+        request: &mut TaskRequest,
+    ) -> Result<Vec<HandoffArtifact>, DriverError> {
         let Some(role) = request.role.as_deref().filter(|role| !role.is_empty()) else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         if self.gate_specs.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let (blocked, handoffs) = {
@@ -2058,7 +2078,7 @@ impl SubAgentWorkflowDriver {
         if !handoffs.is_empty() {
             append_handoff_context(request, &handoffs);
         }
-        Ok(())
+        Ok(handoffs)
     }
 
     fn update_gate_status(&self, status: Vec<GateStatusLine>) {
@@ -2098,25 +2118,58 @@ impl SubAgentWorkflowDriver {
             for spec in specs {
                 let outcome =
                     gate_outcome_for_completed_role(record, spec.require_explicit_verdict);
-                if matches!(outcome, GateOutcome::Pass)
+                let mut state = match board.evaluate(&spec, outcome.clone()) {
+                    Ok(state) => state,
+                    Err(err) => {
+                        let state = GateState::Blocked {
+                            reason: err.to_string(),
+                        };
+                        // Evaluation errors must become authoritative board state.
+                        // Otherwise the emitted receipt can say `blocked` while the
+                        // admission check still sees the gate as pending.
+                        board.gates.insert(spec.id.clone(), state.clone());
+                        state
+                    }
+                };
+                let mut promotion = None;
+                if matches!(state, GateState::Passed)
                     && let (Some(kind), Some(to_role)) =
                         (spec.artifact_kind.as_deref(), spec.blocks_role.as_deref())
                 {
-                    let _ = board.record_handoff(HandoffArtifact {
-                        id: format!("{}:{}:{kind}", self.run_id, record.agent_id),
+                    let artifact = HandoffArtifact {
+                        // Gate ids are authored input and are not guaranteed unique.
+                        // Use an opaque id so every promotion has a stable, distinct
+                        // identity even when a malformed workflow repeats a gate id.
+                        id: format!("handoff_{}", Uuid::new_v4()),
                         lane_id: self.run_id.clone(),
                         from_role: spec.role.clone(),
                         to_role: to_role.to_string(),
                         kind: kind.to_string(),
                         payload: record.output.clone().unwrap_or_default(),
                         created_at: now_ms().to_string(),
-                    });
+                    };
+                    match board.record_handoff(artifact.clone()) {
+                        Ok(()) => {
+                            promotion =
+                                Some(WorkflowUiEvent::new(WorkflowUiEventKind::HandoffPromoted {
+                                    artifact_id: artifact.id,
+                                    gate_id: spec.id.clone(),
+                                    kind: artifact.kind,
+                                    from_role: artifact.from_role,
+                                    to_role: artifact.to_role,
+                                    producer_task_id: record.agent_id.clone(),
+                                }));
+                        }
+                        Err(err) => {
+                            state = GateState::Blocked {
+                                reason: format!(
+                                    "gate passed but its handoff could not be recorded: {err}"
+                                ),
+                            };
+                            board.gates.insert(spec.id.clone(), state.clone());
+                        }
+                    }
                 }
-                let state = board
-                    .evaluate(&spec, outcome.clone())
-                    .unwrap_or_else(|err| GateState::Blocked {
-                        reason: err.to_string(),
-                    });
                 events.push(WorkflowUiEvent::new(WorkflowUiEventKind::GateUpdated {
                     gate_id: spec.id.clone(),
                     role: spec.role.clone(),
@@ -2125,6 +2178,9 @@ impl SubAgentWorkflowDriver {
                     blocked_role: spec.blocks_role.clone(),
                     blocked_reason: state.blocked_reason().map(str::to_string),
                 }));
+                if let Some(event) = promotion {
+                    events.push(event);
+                }
             }
             next_status = board.status_summary();
         }
@@ -2225,11 +2281,13 @@ impl SubAgentWorkflowDriver {
                 completed_record = Some(record.clone());
             }
         }
-        if let Some(record) = completed_record.as_ref() {
-            self.evaluate_gates_for_completed_role(record);
-        }
         if let Some(event) = terminal_event {
             self.record_run_event(event);
+        }
+        if let Some(record) = completed_record.as_ref() {
+            // A role-complete gate is caused by this terminal transition, so its
+            // durable task receipt must precede gate evaluation and promotion.
+            self.evaluate_gates_for_completed_role(record);
         }
     }
 
@@ -2297,7 +2355,7 @@ impl WorkflowDriver for SubAgentWorkflowDriver {
                 }
             },
         )?;
-        self.prepare_request_for_gates(&mut request)?;
+        let consumed_handoffs = self.prepare_request_for_gates(&mut request)?;
         // Wait for a concurrent slot (max 16 live children per run).
         let permit = self
             .concurrent_gate
@@ -2349,6 +2407,15 @@ impl WorkflowDriver for SubAgentWorkflowDriver {
         }
         self.record_child(&task_id);
         self.record_task_started(&task_id, &request_record, &result.metadata, &result.result);
+        for artifact in consumed_handoffs {
+            self.record_run_event(WorkflowUiEvent::new(WorkflowUiEventKind::HandoffConsumed {
+                artifact_id: artifact.id,
+                kind: artifact.kind,
+                from_role: artifact.from_role,
+                to_role: artifact.to_role,
+                consumer_task_id: task_id.clone(),
+            }));
+        }
         self.record_task_request(&task_id, &request_record);
         if let Some(limit) = self.total_budget {
             let mut manager = self.manager.write().await;
@@ -3082,6 +3149,33 @@ mod journal {
                 ..sample_record("workflow_abc", WorkflowRunStatus::Completed)
             };
             state.record_snapshot(&completed);
+            state.record_event(
+                "workflow_abc",
+                &WorkflowUiEvent::at(
+                    6,
+                    WorkflowUiEventKind::HandoffPromoted {
+                        artifact_id: "workflow_abc:scout-1:scout-gate:findings".to_string(),
+                        gate_id: "scout-gate".to_string(),
+                        kind: "findings".to_string(),
+                        from_role: "scout".to_string(),
+                        to_role: "implementer".to_string(),
+                        producer_task_id: "scout-1".to_string(),
+                    },
+                ),
+            );
+            state.record_event(
+                "workflow_abc",
+                &WorkflowUiEvent::at(
+                    7,
+                    WorkflowUiEventKind::HandoffConsumed {
+                        artifact_id: "workflow_abc:scout-1:scout-gate:findings".to_string(),
+                        kind: "findings".to_string(),
+                        from_role: "scout".to_string(),
+                        to_role: "implementer".to_string(),
+                        consumer_task_id: "implementer-1".to_string(),
+                    },
+                ),
+            );
 
             let reloaded = WorkflowWorkspaceState::open(tmp.path());
             let runs = reloaded
@@ -3093,9 +3187,43 @@ mod journal {
                 .expect("hydrated run");
             assert_eq!(runs.status, WorkflowRunStatus::Completed);
             assert_eq!(runs.progress, vec!["phase: scan"]);
-            assert_eq!(runs.events.len(), 1);
+            assert_eq!(runs.events.len(), 3);
             assert_eq!(runs.events[0].event_type(), "phase_started");
+            let promoted = serde_json::to_value(&runs.events[1]).expect("promoted receipt");
+            assert_eq!(promoted["type"], "handoff_promoted");
+            assert_eq!(
+                promoted["artifact_id"],
+                "workflow_abc:scout-1:scout-gate:findings"
+            );
+            assert_eq!(promoted["gate_id"], "scout-gate");
+            assert_eq!(promoted["producer_task_id"], "scout-1");
+            assert!(promoted.get("payload").is_none(), "{promoted}");
+            let consumed = serde_json::to_value(&runs.events[2]).expect("consumed receipt");
+            assert_eq!(consumed["type"], "handoff_consumed");
+            assert_eq!(consumed["artifact_id"], promoted["artifact_id"]);
+            assert_eq!(consumed["consumer_task_id"], "implementer-1");
+            assert!(consumed.get("payload").is_none(), "{consumed}");
             assert_eq!(runs.completed_at_ms, Some(99));
+
+            // The event-line replay above must also survive compaction into a
+            // final Snapshot record containing both handoff variants.
+            reloaded.record_snapshot(&runs);
+            let reopened = WorkflowWorkspaceState::open(tmp.path());
+            let compacted = reopened
+                .runs
+                .lock()
+                .expect("runs lock")
+                .get("workflow_abc")
+                .cloned()
+                .expect("snapshot with handoff receipts");
+            assert_eq!(
+                compacted
+                    .events
+                    .iter()
+                    .map(WorkflowUiEvent::event_type)
+                    .collect::<Vec<_>>(),
+                vec!["phase_started", "handoff_promoted", "handoff_consumed"]
+            );
         }
 
         #[test]
@@ -4316,9 +4444,13 @@ reviewer = "reviewer"
             label: Some("fix".to_string()),
             phase: None,
         };
-        driver
+        let handoffs = driver
             .prepare_request_for_gates(&mut implementer)
             .expect("passed gate should admit implementer");
+        assert_eq!(handoffs.len(), 1, "{handoffs:?}");
+        assert_eq!(handoffs[0].kind, "findings");
+        assert_eq!(handoffs[0].from_role, "scout");
+        assert_eq!(handoffs[0].to_role, "implementer");
         assert!(
             implementer
                 .description
@@ -4370,6 +4502,255 @@ reviewer = "reviewer"
             run.events
                 .iter()
                 .any(|event| event.event_type() == "gate_updated"),
+            "{:?}",
+            run.events
+        );
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(|event| event.event_type() == "handoff_promoted")
+                .count(),
+            1,
+            "a later blocked gate must not publish another handoff: {:?}",
+            run.events
+        );
+        assert!(
+            run.events
+                .iter()
+                .all(|event| event.event_type() != "handoff_consumed"),
+            "request preparation alone must not claim consumption: {:?}",
+            run.events
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_gate_evaluation_error_persists_blocked_and_denies_target_role() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+        let runtime = SubAgentRuntime::new(
+            stub_client(),
+            "deepseek-v4-flash".to_string(),
+            ctx,
+            true,
+            None,
+            manager.clone(),
+        );
+        let state = WorkflowWorkspaceState::open(tmp.path());
+        let run_id = "workflow_malformed_gate".to_string();
+        let gates = vec![GateSpec {
+            id: String::new(),
+            role: "scout".to_string(),
+            on: GateOn::RoleComplete,
+            gate: GateKind::Approve,
+            on_fail: codewhale_workflow::GateOnFail::Block,
+            blocks_role: Some("implementer".to_string()),
+            max_retries: 0,
+            artifact_kind: Some("findings".to_string()),
+            require_explicit_verdict: false,
+        }];
+        let spec = WorkflowSpec {
+            id: Some("malformed-gate-fixture".to_string()),
+            goal: "malformed gate must fail closed".to_string(),
+            description: None,
+            budget: BudgetSpec::default(),
+            permissions: Default::default(),
+            model_policy: Default::default(),
+            promotion_policy: Default::default(),
+            gates: gates.clone(),
+            nodes: Vec::new(),
+        };
+        state.runs.lock().expect("runs").insert(
+            run_id.clone(),
+            WorkflowRunRecord::new(run_id.clone(), None, None, Some(&spec)),
+        );
+        let driver = SubAgentWorkflowDriver::new(
+            run_id.clone(),
+            manager,
+            runtime,
+            state.clone(),
+            None,
+            None,
+            None,
+            gates,
+        );
+
+        driver.evaluate_gates_for_completed_role(&RuntimeTaskRecord {
+            agent_id: "scout-agent".to_string(),
+            label: Some("scout".to_string()),
+            role: Some("scout".to_string()),
+            status: IrWorkflowRunStatus::Succeeded,
+            output: Some("findings".to_string()),
+            schema_error: None,
+        });
+
+        let mut request = TaskRequest {
+            description: "Must not be admitted.".to_string(),
+            subagent_type: Some("implementer".to_string()),
+            role: Some("implementer".to_string()),
+            profile: None,
+            model: None,
+            model_strength: None,
+            thinking: None,
+            worktree: false,
+            allowed_tools: Some(Vec::new()),
+            max_depth: None,
+            token_budget: None,
+            response_schema: None,
+            label: Some("blocked".to_string()),
+            phase: None,
+        };
+        let error = driver
+            .prepare_request_for_gates(&mut request)
+            .expect_err("malformed gate must deny its target role");
+        assert!(
+            error.to_string().contains("gate id must not be empty"),
+            "{error}"
+        );
+        let board = driver.gate_board.lock().expect("gate board");
+        assert!(matches!(
+            board.gates.get(""),
+            Some(GateState::Blocked { reason }) if reason.contains("gate id must not be empty")
+        ));
+        assert!(board.artifacts.is_empty(), "{:?}", board.artifacts);
+        drop(board);
+        let run = state
+            .runs
+            .lock()
+            .expect("runs")
+            .get(&run_id)
+            .cloned()
+            .expect("run");
+        assert!(run.gate_status.iter().any(|line| {
+            line.gate_id.is_empty()
+                && line.state == "blocked"
+                && line
+                    .blocked_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("gate id must not be empty"))
+        }));
+        assert!(
+            run.events
+                .iter()
+                .all(|event| event.event_type() != "handoff_promoted"),
+            "{:?}",
+            run.events
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_handoff_record_error_changes_pass_to_blocked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+        let runtime = SubAgentRuntime::new(
+            stub_client(),
+            "deepseek-v4-flash".to_string(),
+            ctx,
+            true,
+            None,
+            manager.clone(),
+        );
+        let state = WorkflowWorkspaceState::open(tmp.path());
+        let run_id = "workflow_handoff_record_error".to_string();
+        let gates = vec![GateSpec {
+            id: "scout-findings".to_string(),
+            role: "scout".to_string(),
+            on: GateOn::RoleComplete,
+            gate: GateKind::Approve,
+            on_fail: codewhale_workflow::GateOnFail::Block,
+            blocks_role: Some("implementer".to_string()),
+            max_retries: 0,
+            artifact_kind: Some("findings".to_string()),
+            require_explicit_verdict: false,
+        }];
+        let spec = WorkflowSpec {
+            id: Some("handoff-record-error-fixture".to_string()),
+            goal: "failed handoff recording must fail closed".to_string(),
+            description: None,
+            budget: BudgetSpec::default(),
+            permissions: Default::default(),
+            model_policy: Default::default(),
+            promotion_policy: Default::default(),
+            gates: gates.clone(),
+            nodes: Vec::new(),
+        };
+        state.runs.lock().expect("runs").insert(
+            run_id.clone(),
+            WorkflowRunRecord::new(run_id.clone(), None, None, Some(&spec)),
+        );
+        let driver = SubAgentWorkflowDriver::new(
+            run_id.clone(),
+            manager,
+            runtime,
+            state.clone(),
+            None,
+            None,
+            None,
+            gates,
+        );
+        driver.gate_board.lock().expect("gate board").lane_id = "wrong-lane".to_string();
+
+        driver.evaluate_gates_for_completed_role(&RuntimeTaskRecord {
+            agent_id: "scout-agent".to_string(),
+            label: Some("scout".to_string()),
+            role: Some("scout".to_string()),
+            status: IrWorkflowRunStatus::Succeeded,
+            output: Some("findings".to_string()),
+            schema_error: None,
+        });
+
+        let mut request = TaskRequest {
+            description: "Must not be admitted.".to_string(),
+            subagent_type: Some("implementer".to_string()),
+            role: Some("implementer".to_string()),
+            profile: None,
+            model: None,
+            model_strength: None,
+            thinking: None,
+            worktree: false,
+            allowed_tools: Some(Vec::new()),
+            max_depth: None,
+            token_budget: None,
+            response_schema: None,
+            label: Some("blocked".to_string()),
+            phase: None,
+        };
+        let error = driver
+            .prepare_request_for_gates(&mut request)
+            .expect_err("unrecorded handoff must deny its target role");
+        assert!(
+            error.to_string().contains("handoff could not be recorded"),
+            "{error}"
+        );
+        let board = driver.gate_board.lock().expect("gate board");
+        assert!(matches!(
+            board.gates.get("scout-findings"),
+            Some(GateState::Blocked { reason }) if reason.contains("does not match board lane")
+        ));
+        assert!(board.artifacts.is_empty(), "{:?}", board.artifacts);
+        drop(board);
+        let run = state
+            .runs
+            .lock()
+            .expect("runs")
+            .get(&run_id)
+            .cloned()
+            .expect("run");
+        assert!(run.events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                WorkflowUiEventKind::GateUpdated {
+                    state,
+                    blocked_reason: Some(reason),
+                    ..
+                } if state == "blocked" && reason.contains("handoff could not be recorded")
+            )
+        }));
+        assert!(
+            run.events
+                .iter()
+                .all(|event| event.event_type() != "handoff_promoted"),
             "{:?}",
             run.events
         );
@@ -4920,6 +5301,115 @@ reviewer = "reviewer"
         assert_eq!(gates[0]["blocked_role"], "implementer");
         assert_eq!(gates[3]["role"], "verifier");
         assert_eq!(gates[3]["blocked_role"], "release_lead");
+
+        let promoted = events
+            .iter()
+            .filter(|event| event["type"] == "handoff_promoted")
+            .collect::<Vec<_>>();
+        let consumed = events
+            .iter()
+            .filter(|event| event["type"] == "handoff_consumed")
+            .collect::<Vec<_>>();
+        let expected_handoffs = [
+            ("scout", "implementer", "source_evidence"),
+            ("implementer", "reviewer", "verification_plan"),
+            ("reviewer", "verifier", "review_report"),
+            ("verifier", "release_lead", "verification_report"),
+        ];
+        assert_eq!(promoted.len(), expected_handoffs.len(), "{promoted:#?}");
+        assert_eq!(consumed.len(), expected_handoffs.len(), "{consumed:#?}");
+        let artifact_ids = promoted
+            .iter()
+            .map(|event| {
+                event["artifact_id"]
+                    .as_str()
+                    .filter(|id| id.starts_with("handoff_") && id.len() > "handoff_".len())
+                    .expect("opaque non-empty handoff artifact id")
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            artifact_ids.len(),
+            promoted.len(),
+            "every promotion must have a unique artifact id: {promoted:#?}"
+        );
+        for (index, (from_role, to_role, kind)) in expected_handoffs.into_iter().enumerate() {
+            assert_eq!(promoted[index]["from_role"], from_role);
+            assert_eq!(promoted[index]["to_role"], to_role);
+            assert_eq!(promoted[index]["kind"], kind);
+            assert_eq!(promoted[index]["gate_id"], gates[index]["gate_id"]);
+            assert_eq!(
+                promoted[index]["producer_task_id"],
+                started[index]["task_id"]
+            );
+            assert!(
+                promoted[index].get("payload").is_none(),
+                "{:#?}",
+                promoted[index]
+            );
+
+            assert_eq!(
+                consumed[index]["artifact_id"],
+                promoted[index]["artifact_id"]
+            );
+            assert_eq!(consumed[index]["from_role"], from_role);
+            assert_eq!(consumed[index]["to_role"], to_role);
+            assert_eq!(consumed[index]["kind"], kind);
+            assert_eq!(
+                consumed[index]["consumer_task_id"],
+                started[index + 1]["task_id"]
+            );
+            assert!(
+                consumed[index].get("payload").is_none(),
+                "{:#?}",
+                consumed[index]
+            );
+
+            let producer_task_id = promoted[index]["producer_task_id"]
+                .as_str()
+                .expect("producer task id");
+            let consumer_task_id = consumed[index]["consumer_task_id"]
+                .as_str()
+                .expect("consumer task id");
+            let gate_id = promoted[index]["gate_id"].as_str().expect("gate id");
+            let artifact_id = promoted[index]["artifact_id"]
+                .as_str()
+                .expect("artifact id");
+            let task_completed_index = events
+                .iter()
+                .position(|event| {
+                    event["type"] == "task_completed" && event["task_id"] == producer_task_id
+                })
+                .expect("producer completion receipt");
+            let gate_updated_index = events
+                .iter()
+                .position(|event| event["type"] == "gate_updated" && event["gate_id"] == gate_id)
+                .expect("gate update receipt");
+            let promoted_index = events
+                .iter()
+                .position(|event| {
+                    event["type"] == "handoff_promoted" && event["artifact_id"] == artifact_id
+                })
+                .expect("handoff promotion receipt");
+            let consumer_started_index = events
+                .iter()
+                .position(|event| {
+                    event["type"] == "task_started" && event["task_id"] == consumer_task_id
+                })
+                .expect("consumer start receipt");
+            let consumed_index = events
+                .iter()
+                .position(|event| {
+                    event["type"] == "handoff_consumed" && event["artifact_id"] == artifact_id
+                })
+                .expect("handoff consumption receipt");
+            assert!(
+                task_completed_index < gate_updated_index
+                    && gate_updated_index < promoted_index
+                    && promoted_index < consumer_started_index
+                    && consumer_started_index < consumed_index,
+                "causal receipt order must be task_completed -> gate_updated -> handoff_promoted -> task_started -> handoff_consumed: {events:#?}"
+            );
+        }
         assert!(
             events.iter().any(|event| {
                 event["type"] == "run_completed" && event["status"] == "completed"
