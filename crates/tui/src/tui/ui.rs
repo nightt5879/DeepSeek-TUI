@@ -1616,7 +1616,16 @@ fn configured_instruction_sources(config: &Config) -> Vec<prompts::InstructionSo
         .collect()
 }
 
+#[cfg(test)]
 fn build_app_system_prompt(app: &App, config: &Config) -> SystemPrompt {
+    build_app_system_prompt_with_goal(app, config, app.hunt.quarry.as_deref())
+}
+
+fn build_app_system_prompt_with_goal(
+    app: &App,
+    config: &Config,
+    goal_objective: Option<&str>,
+) -> SystemPrompt {
     let instructions = configured_instruction_sources(config);
     prompts::system_prompt_for_mode_with_context_skills_and_session(
         &app.workspace,
@@ -1625,7 +1634,7 @@ fn build_app_system_prompt(app: &App, config: &Config) -> SystemPrompt {
         Some(&instructions),
         prompts::PromptSessionContext {
             user_memory_block: None,
-            goal_objective: app.hunt.quarry.as_deref(),
+            goal_objective,
             project_context_pack_enabled: config.project_context_pack_enabled(),
             locale_tag: app.ui_locale.tag(),
             translation_enabled: app.translation_enabled,
@@ -2191,7 +2200,7 @@ async fn run_event_loop(
         let mut subagent_list_refresh_requested = false;
         let mut queued_to_send: Option<QueuedMessage> = None;
         let mut respawn_after_provider_rollback: Option<String> = None;
-        let mut fallback_after_engine_error: Option<ApiProvider> = None;
+        let mut fallback_after_engine_error: Option<ProviderFallbackRollback> = None;
         {
             let mut rx = engine_handle.rx_event.write().await;
             let mut progress_redraw_agents: HashSet<String> = HashSet::new();
@@ -3005,6 +3014,12 @@ async fn run_event_loop(
                         recoverable: _,
                     } => {
                         let provider_before_error = app.api_provider;
+                        let identity_before_error = ProviderIdentity {
+                            provider: provider_before_error,
+                            key: app.provider_identity_for_persistence().to_string(),
+                            exact_id: app.provider_id_for_persistence().map(str::to_string),
+                        };
+                        let fallback_chain_before_error = app.provider_chain.clone();
                         let (health_provider, health_model) =
                             error_health_route(app, provider_before_error);
                         app.provider_health.record_failure(
@@ -3020,7 +3035,14 @@ async fn run_event_loop(
                             ) && app.pending_provider_switch.is_some();
                         apply_engine_error_to_app(app, envelope);
                         if app.api_provider != provider_before_error && app.is_fallback_active() {
-                            fallback_after_engine_error = Some(provider_before_error);
+                            // Several queued errors can be drained together.
+                            // The first route remains the rollback authority;
+                            // later chain advances must not overwrite it with
+                            // an enum/key pair from the half-applied fallback.
+                            fallback_after_engine_error.get_or_insert(ProviderFallbackRollback {
+                                identity: identity_before_error,
+                                chain: fallback_chain_before_error,
+                            });
                         }
                         if rollback_after_auth_failure
                             && let Some(rollback_warning) =
@@ -3578,9 +3600,8 @@ async fn run_event_loop(
                 events_drained = events_drained.saturating_add(1);
             }
         }
-        if let Some(previous_provider) = fallback_after_engine_error {
-            apply_provider_fallback_switch(app, &mut engine_handle, config, previous_provider)
-                .await;
+        if let Some(rollback) = fallback_after_engine_error {
+            apply_provider_fallback_switch(app, &mut engine_handle, config, rollback).await;
         }
         if let Some(rollback_warning) = respawn_after_provider_rollback {
             let _ = engine_handle.send(Op::Shutdown).await;
@@ -7585,6 +7606,14 @@ impl PausedCommandDispatch {
         }
     }
 
+    fn goal_objective(&self, app: &App) -> Option<String> {
+        match self {
+            Self::Resume { quarry, .. } => Some(quarry.clone()),
+            Self::Detach { .. } | Self::ClearWithoutQuarry => None,
+            Self::None => app.hunt.quarry.clone(),
+        }
+    }
+
     fn apply(self, app: &mut App, engine_handle: &EngineHandle) {
         engine_handle.set_paused(false);
         match self {
@@ -7807,10 +7836,78 @@ async fn dispatch_user_message(
         &turn_route.model,
         turn_route_limits,
     );
+    let goal_objective = paused_dispatch.goal_objective(app);
+    let next_system_prompt =
+        build_app_system_prompt_with_goal(app, config, goal_objective.as_deref());
+    let next_api_message = Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::Text {
+            text: content.clone(),
+            cache_control: None,
+        }],
+    };
+    let auto_controls_reasoning = app.auto_model || app.reasoning_effort == ReasoningEffort::Auto;
+    let selected_reasoning_effort = if auto_controls_reasoning {
+        let effort = auto_selection
+            .as_ref()
+            .and_then(|selection| selection.reasoning_effort)
+            .unwrap_or_else(|| {
+                auto_router::normalize_auto_routed_effort(crate::auto_reasoning::select(
+                    false,
+                    &message.display,
+                ))
+            });
+        Some(effort)
+    } else {
+        None
+    };
+    let effective_reasoning_effort = if let Some(effort) = selected_reasoning_effort {
+        effort
+            .api_value_for_provider(effective_provider)
+            .map(str::to_string)
+    } else {
+        app.reasoning_effort
+            .api_value_for_provider(effective_provider)
+            .map(str::to_string)
+    };
+
+    // Enqueue the turn before applying any paused-command transition or
+    // mutating transcript/session state. A closed mailbox therefore leaves
+    // the exact App state, persisted checkpoint, and engine pause gate intact.
+    // SendMessage carries the route-bound compaction policy; the engine adds
+    // the user message and evaluates auto-compaction inside this same op before
+    // the provider request. Never split pre-send compaction into a second
+    // mailbox operation or a receiver-close race can partially dispatch.
+    engine_handle
+        .send(Op::SendMessage {
+            content,
+            mode: app.mode,
+            route: Box::new(turn_route),
+            compaction: Box::new(turn_compaction.clone()),
+            goal_objective,
+            goal_token_budget: app.hunt.token_budget,
+            goal_status: app.hunt.verdict.goal_status(),
+            reasoning_effort: effective_reasoning_effort,
+            reasoning_effort_auto: auto_controls_reasoning,
+            auto_model: app.auto_model,
+            allow_shell: app.allow_shell,
+            trust_mode: app.trust_mode,
+            auto_approve: app_auto_approve_enabled(app),
+            approval_mode: app.approval_mode,
+            translation_enabled: app.translation_enabled,
+            show_thinking: app.show_thinking,
+            allowed_tools: app.active_allowed_tools.clone(),
+            dynamic_tools: Vec::new(),
+            hook_executor: app.runtime_services.hook_executor.clone(),
+            verbosity: app.verbosity.clone(),
+            provenance: crate::core::ops::UserInputProvenance::ExternalUser,
+        })
+        .await?;
+
     paused_dispatch.apply(app, engine_handle);
 
-    // Set only after route validation to prevent double-dispatch before the
-    // TurnStarted event arrives without leaving a failed dispatch stuck.
+    // Set only after the operation is accepted so a failed dispatch cannot
+    // claim a turn or alter the retryable user input.
     let dispatch_started_at = Instant::now();
     app.is_loading = true;
     app.dispatch_started_at = Some(dispatch_started_at);
@@ -7821,67 +7918,30 @@ async fn dispatch_user_message(
     app.tool_evidence.clear();
 
     let message_index = app.api_messages.len();
-    app.system_prompt = Some(build_app_system_prompt(app, config));
+    app.system_prompt = Some(next_system_prompt);
     app.add_message(HistoryCell::User {
         content: message.display.clone(),
     });
     let history_cell = app.history.len().saturating_sub(1);
     app.record_context_references(history_cell, message_index, references);
     app.scroll_to_bottom();
-    app.api_messages.push(Message {
-        role: "user".to_string(),
-        content: vec![ContentBlock::Text {
-            text: content.clone(),
-            cache_control: None,
-        }],
-    });
+    app.api_messages.push(next_api_message);
     maybe_warn_context_pressure_for_config(app, &turn_compaction);
-    if should_auto_compact_before_send_with_config(app, &turn_compaction) {
-        app.status_message =
-            Some("Context threshold reached; compacting before send...".to_string());
-        let _ = engine_handle
-            .send(Op::CompactContext {
-                route: Box::new(turn_route.clone()),
-                compaction: Box::new(turn_compaction.clone()),
-            })
-            .await;
-    }
     app.session.last_prompt_tokens = None;
     app.session.last_completion_tokens = None;
     app.session.last_output_throughput = None;
     app.session.last_prompt_cache_hit_tokens = None;
     app.session.last_prompt_cache_miss_tokens = None;
     app.session.last_reasoning_replay_tokens = None;
-    // Persist immediately so abrupt termination can recover this in-flight turn.
-    // Offloaded to the persistence actor.
+    // Persist only after the engine accepted the turn. A failed mailbox send
+    // must not leave a checkpoint for work that never started.
     if let Ok(manager) = SessionManager::default_location()
         && let Ok(session) = build_session_snapshot(app, &manager)
     {
         persistence_actor::persist(PersistRequest::Checkpoint(session));
     }
 
-    let auto_controls_reasoning = app.auto_model || app.reasoning_effort == ReasoningEffort::Auto;
-    let effective_reasoning_effort = if auto_controls_reasoning {
-        let effort = auto_selection
-            .as_ref()
-            .and_then(|selection| selection.reasoning_effort)
-            .unwrap_or_else(|| {
-                auto_router::normalize_auto_routed_effort(crate::auto_reasoning::select(
-                    false,
-                    &message.display,
-                ))
-            });
-        app.last_effective_reasoning_effort = Some(effort);
-        effort
-            .api_value_for_provider(effective_provider)
-            .map(str::to_string)
-    } else {
-        app.last_effective_reasoning_effort = None;
-        app.reasoning_effort
-            .api_value_for_provider(effective_provider)
-            .map(str::to_string)
-    };
-
+    app.last_effective_reasoning_effort = selected_reasoning_effort;
     if let Some(selection) = auto_selection.as_ref() {
         if app.auto_model {
             app.last_effective_model = Some(effective_model.clone());
@@ -7903,40 +7963,7 @@ async fn dispatch_user_message(
         app.last_effective_model = None;
         app.last_effective_provider = None;
     }
-
-    app.pending_turn_route = Some((effective_provider, effective_model.clone(), app.auto_model));
-    if let Err(err) = engine_handle
-        .send(Op::SendMessage {
-            content,
-            mode: app.mode,
-            route: Box::new(turn_route),
-            compaction: Box::new(turn_compaction),
-            goal_objective: app.hunt.quarry.clone(),
-            goal_token_budget: app.hunt.token_budget,
-            goal_status: app.hunt.verdict.goal_status(),
-            reasoning_effort: effective_reasoning_effort,
-            reasoning_effort_auto: auto_controls_reasoning,
-            auto_model: app.auto_model,
-            allow_shell: app.allow_shell,
-            trust_mode: app.trust_mode,
-            auto_approve: app_auto_approve_enabled(app),
-            approval_mode: app.approval_mode,
-            translation_enabled: app.translation_enabled,
-            show_thinking: app.show_thinking,
-            allowed_tools: app.active_allowed_tools.clone(),
-            dynamic_tools: Vec::new(),
-            hook_executor: app.runtime_services.hook_executor.clone(),
-            verbosity: app.verbosity.clone(),
-            provenance: crate::core::ops::UserInputProvenance::ExternalUser,
-        })
-        .await
-    {
-        app.is_loading = false;
-        app.dispatch_started_at = None;
-        app.last_send_at = None;
-        app.pending_turn_route = None;
-        return Err(err);
-    }
+    app.pending_turn_route = Some((effective_provider, effective_model, app.auto_model));
 
     Ok(())
 }
@@ -8582,20 +8609,30 @@ async fn switch_provider(
     }
 }
 
+struct ProviderFallbackRollback {
+    identity: ProviderIdentity,
+    chain: Option<codewhale_config::ProviderChain>,
+}
+
 async fn apply_provider_fallback_switch(
     app: &mut App,
     engine_handle: &mut EngineHandle,
     config: &mut Config,
-    previous_provider: ApiProvider,
+    rollback: ProviderFallbackRollback,
 ) {
+    let ProviderFallbackRollback {
+        identity: previous_identity,
+        chain: previous_chain,
+    } = rollback;
+    let previous_provider = previous_identity.provider;
     let target = app.api_provider;
     let previous_model = app.model.clone();
-    let previous_identity = config.provider_identity_for(previous_provider);
 
     let resolved_route = match resolve_runtime_route(config, target, None) {
         Ok(route) => route,
         Err(reason) => {
-            app.set_provider_identity(previous_provider, previous_identity.clone());
+            app.set_provider_identity_record(previous_identity.clone());
+            app.provider_chain = previous_chain.clone();
             app.last_fallback_reason = Some(format!(
                 "Fallback provider {} route was rejected: {reason}",
                 target.as_str()
@@ -8608,12 +8645,14 @@ async fn apply_provider_fallback_switch(
             return;
         }
     };
+    let target_identity = resolved_route.identity.clone();
     let resolved_endpoint = resolved_route.candidate.endpoint.base_url.clone();
     let next_config = resolved_route.config;
     let new_model = resolved_route.model;
 
     if let Err(err) = DeepSeekClient::from_candidate(&next_config, &resolved_route.candidate) {
-        app.set_provider_identity(previous_provider, previous_identity);
+        app.set_provider_identity_record(previous_identity);
+        app.provider_chain = previous_chain;
         app.last_fallback_reason = Some(format!(
             "Fallback provider {} was unavailable: {err}",
             target.as_str()
@@ -8626,6 +8665,7 @@ async fn apply_provider_fallback_switch(
         return;
     }
     *config = next_config;
+    app.set_provider_identity_record(target_identity);
     app.billing_presentation = crate::route_billing::for_route(config, target);
 
     let new_base_url = resolved_endpoint;
@@ -14027,6 +14067,7 @@ fn should_auto_compact_before_send(app: &App) -> bool {
     should_auto_compact_before_send_with_config(app, &config)
 }
 
+#[cfg(test)]
 fn should_auto_compact_before_send_with_config(
     app: &App,
     config: &crate::compaction::CompactionConfig,

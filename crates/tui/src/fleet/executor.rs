@@ -198,6 +198,69 @@ pub fn map_exec_stream_line(line: &str) -> Option<FleetWorkerEventPayload> {
     }
 }
 
+#[derive(Debug)]
+enum ParsedTerminalRoute {
+    NotTerminal,
+    Valid(FleetWorkerReportedRoute),
+    Invalid,
+}
+
+/// Parse one allowlisted, secret-free route identity from terminal exec
+/// metadata. Once a line declares itself as a terminal receipt, malformed
+/// route fields are distinct from ordinary non-terminal stream noise so a
+/// prior valid record cannot survive contradictory evidence.
+fn parse_exec_terminal_route(line: &str) -> ParsedTerminalRoute {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return ParsedTerminalRoute::NotTerminal;
+    };
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("metadata") {
+        return ParsedTerminalRoute::NotTerminal;
+    }
+    let Some(meta) = value.get("meta").and_then(serde_json::Value::as_object) else {
+        return ParsedTerminalRoute::NotTerminal;
+    };
+    if meta.get("receipt_kind").and_then(serde_json::Value::as_str) != Some("terminal") {
+        return ParsedTerminalRoute::NotTerminal;
+    }
+
+    let route = (|| {
+        let provider = meta.get("provider")?.as_str()?.trim();
+        let model = meta.get("model")?.as_str()?.trim();
+        if provider.is_empty() || model.is_empty() {
+            return None;
+        }
+        let provider_kind = crate::config::ApiProvider::parse(provider)?;
+        let provider_exact_id = match meta.get("provider_id") {
+            None => None,
+            Some(value) => {
+                let id = value.as_str()?.trim();
+                if id.is_empty() {
+                    return None;
+                }
+                Some(id.to_string())
+            }
+        };
+        if provider_exact_id.is_some() && provider_kind != crate::config::ApiProvider::Custom {
+            return None;
+        }
+        Some(FleetWorkerReportedRoute {
+            provider: provider.to_string(),
+            provider_exact_id,
+            model: model.to_string(),
+        })
+    })();
+
+    route.map_or(ParsedTerminalRoute::Invalid, ParsedTerminalRoute::Valid)
+}
+
+#[cfg(test)]
+fn map_exec_terminal_route(line: &str) -> Option<FleetWorkerReportedRoute> {
+    match parse_exec_terminal_route(line) {
+        ParsedTerminalRoute::Valid(route) => Some(route),
+        ParsedTerminalRoute::NotTerminal | ParsedTerminalRoute::Invalid => None,
+    }
+}
+
 /// Classify a worker process exit into a terminal fleet event.
 ///
 /// `stopped` means the operator stopped the worker (cancellation), which takes
@@ -244,6 +307,41 @@ struct WorkerStream {
     offset: u64,
     pending: String,
     terminal: bool,
+    terminal_route: TerminalRouteEvidence,
+}
+
+#[derive(Debug, Clone, Default)]
+enum TerminalRouteEvidence {
+    #[default]
+    Missing,
+    Valid(FleetWorkerReportedRoute),
+    InvalidOrAmbiguous,
+}
+
+impl TerminalRouteEvidence {
+    fn observe(&mut self, parsed: ParsedTerminalRoute) {
+        match parsed {
+            ParsedTerminalRoute::NotTerminal => {}
+            ParsedTerminalRoute::Invalid => *self = Self::InvalidOrAmbiguous,
+            ParsedTerminalRoute::Valid(route) => {
+                *self = if matches!(&*self, Self::Missing) {
+                    Self::Valid(route)
+                } else {
+                    // The stream contract emits exactly one terminal receipt.
+                    // Any second record, even an identical one, is ambiguous
+                    // provenance and must permanently fail closed.
+                    Self::InvalidOrAmbiguous
+                };
+            }
+        }
+    }
+
+    fn reported_route(&self) -> Option<&FleetWorkerReportedRoute> {
+        match self {
+            Self::Valid(route) => Some(route),
+            Self::Missing | Self::InvalidOrAmbiguous => None,
+        }
+    }
 }
 
 enum WorkerStreamHost {
@@ -252,9 +350,23 @@ enum WorkerStreamHost {
 }
 
 #[derive(Debug, Clone)]
+pub struct FleetWorkerReportedRoute {
+    pub provider: String,
+    pub provider_exact_id: Option<String>,
+    pub model: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct FleetWorkerTerminalEvent {
     pub payload: FleetWorkerEventPayload,
     pub exit_code: Option<i32>,
+    /// Non-terminal payloads discovered by the mandatory post-exit drain.
+    pub tail_payloads: Vec<FleetWorkerEventPayload>,
+    pub reported_route: Option<FleetWorkerReportedRoute>,
+    /// A real headless exec process must report its actual route. Callers use
+    /// this bit to distinguish a missing/invalid report (fail closed) from
+    /// pre-launch or simulated paths that only have declared route intent.
+    pub requires_reported_route: bool,
 }
 
 impl FleetExecutor {
@@ -317,6 +429,7 @@ impl FleetExecutor {
                 offset: 0,
                 pending: String::new(),
                 terminal: false,
+                terminal_route: TerminalRouteEvidence::default(),
             },
         );
         Ok(handle)
@@ -370,7 +483,11 @@ impl FleetExecutor {
             stream.pending.push_str(&String::from_utf8_lossy(&buf));
             while let Some(idx) = stream.pending.find('\n') {
                 let line: String = stream.pending.drain(..=idx).collect();
-                if let Some(event) = map_exec_stream_line(line.trim_end()) {
+                let line = line.trim_end();
+                stream
+                    .terminal_route
+                    .observe(parse_exec_terminal_route(line));
+                if let Some(event) = map_exec_stream_line(line) {
                     events.push(event);
                 }
             }
@@ -413,12 +530,35 @@ impl FleetExecutor {
                 classify_worker_exit(status.exit_code, false)
             }
         };
+        // Once status is terminal the worker can no longer append. Drain one
+        // final time before snapshotting route evidence so metadata written
+        // between the scheduler's ordinary drain and this status poll cannot
+        // be lost when the worker is forgotten.
+        let mut tail_payloads = self.drain_events(worker_id);
+        if let Some(stream) = self.streams.get_mut(worker_id) {
+            let trailing_line = std::mem::take(&mut stream.pending);
+            let trailing_line = trailing_line.trim();
+            if !trailing_line.is_empty() {
+                stream
+                    .terminal_route
+                    .observe(parse_exec_terminal_route(trailing_line));
+                if let Some(payload) = map_exec_stream_line(trailing_line) {
+                    tail_payloads.push(payload);
+                }
+            }
+        }
         if let Some(stream) = self.streams.get_mut(worker_id) {
             stream.terminal = true;
         }
         Some(FleetWorkerTerminalEvent {
             payload: terminal,
             exit_code: status.exit_code,
+            tail_payloads,
+            reported_route: self
+                .streams
+                .get(worker_id)
+                .and_then(|stream| stream.terminal_route.reported_route().cloned()),
+            requires_reported_route: true,
         })
     }
 
@@ -752,6 +892,89 @@ mod tests {
     }
 
     #[test]
+    fn terminal_route_keeps_exact_literal_custom_distinct_from_idless_root_and_redacts() {
+        let exact = map_exec_terminal_route(
+            r#"{"type":"metadata","meta":{"receipt_kind":"terminal","provider":"custom","provider_id":"custom","model":"literal-model","base_url":"https://must-not-cross.invalid/v1","api_key":"sk-must-not-cross"}}"#,
+        )
+        .expect("literal custom terminal route");
+        assert_eq!(exact.provider, "custom");
+        assert_eq!(exact.provider_exact_id.as_deref(), Some("custom"));
+        assert_eq!(exact.model, "literal-model");
+
+        let root = map_exec_terminal_route(
+            r#"{"type":"metadata","meta":{"receipt_kind":"terminal","provider":"custom","model":"root-model"}}"#,
+        )
+        .expect("idless root custom terminal route");
+        assert_eq!(root.provider, "custom");
+        assert_eq!(root.provider_exact_id, None);
+        assert_eq!(root.model, "root-model");
+
+        let named = map_exec_terminal_route(
+            r#"{"type":"metadata","meta":{"receipt_kind":"terminal","provider":"custom","provider_id":"lm-studio","model":"local-model"}}"#,
+        )
+        .expect("named custom terminal route");
+        assert_eq!(named.provider, "custom");
+        assert_eq!(named.provider_exact_id.as_deref(), Some("lm-studio"));
+        assert_eq!(named.model, "local-model");
+
+        let reported = format!("{exact:?}").to_ascii_lowercase();
+        for forbidden in ["base_url", "https://", "api_key", "sk-must-not-cross"] {
+            assert!(
+                !reported.contains(forbidden),
+                "allowlisted terminal route leaked {forbidden:?}: {reported}"
+            );
+        }
+
+        for malformed in [
+            r#"{"type":"metadata","meta":{"receipt_kind":"terminal","provider":"custom","provider_id":"","model":"root-model"}}"#,
+            r#"{"type":"metadata","meta":{"receipt_kind":"terminal","provider":"custom","provider_id":"   ","model":"root-model"}}"#,
+            r#"{"type":"metadata","meta":{"receipt_kind":"terminal","provider":"custom","provider_id":7,"model":"root-model"}}"#,
+            r#"{"type":"metadata","meta":{"receipt_kind":"terminal","provider":"deepseek","provider_id":"custom-x","model":"deepseek-v4-pro"}}"#,
+            r#"{"type":"metadata","meta":{"receipt_kind":"terminal","provider":"unknown-kind","model":"unknown-model"}}"#,
+        ] {
+            assert!(
+                map_exec_terminal_route(malformed).is_none(),
+                "malformed present exact id must not collapse to idless root: {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_route_evidence_requires_exactly_one_valid_envelope() {
+        let route_x = r#"{"type":"metadata","meta":{"receipt_kind":"terminal","provider":"custom","provider_id":"remote-x","model":"worker-model-x"}}"#;
+        let route_y = r#"{"type":"metadata","meta":{"receipt_kind":"terminal","provider":"custom","provider_id":"remote-y","model":"worker-model-y"}}"#;
+        let malformed = r#"{"type":"metadata","meta":{"receipt_kind":"terminal","provider":"custom","provider_id":"","model":"worker-model-x"}}"#;
+        let noise = r#"{"type":"content","delta":"progress"}"#;
+
+        let observe = |lines: &[&str]| {
+            let mut evidence = TerminalRouteEvidence::default();
+            for line in lines {
+                evidence.observe(parse_exec_terminal_route(line));
+            }
+            evidence.reported_route().cloned()
+        };
+
+        let only = observe(&[noise, route_x]).expect("one valid route");
+        assert_eq!(only.provider_exact_id.as_deref(), Some("remote-x"));
+        assert!(
+            observe(&[route_x, malformed]).is_none(),
+            "valid then malformed must invalidate stale evidence"
+        );
+        assert!(
+            observe(&[malformed, route_x]).is_none(),
+            "malformed then valid must remain invalid"
+        );
+        assert!(
+            observe(&[route_x, route_y]).is_none(),
+            "conflicting valid routes must be ambiguous"
+        );
+        assert!(
+            observe(&[route_x, route_x]).is_none(),
+            "even identical duplicates violate the exactly-one contract"
+        );
+    }
+
+    #[test]
     fn exit_classification() {
         assert!(matches!(
             classify_worker_exit(Some(0), false),
@@ -813,6 +1036,54 @@ mod tests {
             "expected a terminal Completed event, got {events:?}"
         );
         assert!(exec.all_terminal());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_poll_final_drains_route_metadata_and_tail_payloads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut exec = FleetExecutor::new(tmp.path());
+        let script = r#"printf '%s\n' '{"type":"content","delta":"tail progress"}'; printf '%s' '{"type":"metadata","meta":{"receipt_kind":"terminal","provider":"custom","provider_id":"remote-x","model":"worker-model-x"}}'"#;
+        let command = FleetWorkerCommand::new("sh", vec!["-c".to_string(), script.to_string()]);
+        exec.start_worker("tail-worker", command, None).unwrap();
+
+        // Deliberately do not call the ordinary event drain. Poll only after
+        // exit, reproducing the scheduler gap where the previous poll saw EOF
+        // just before the worker wrote its terminal tail.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let terminal = exec
+            .poll_terminal_with_status("tail-worker")
+            .expect("terminal worker");
+        let route = terminal.reported_route.expect("final-drained route");
+        assert_eq!(route.provider, "custom");
+        assert_eq!(route.provider_exact_id.as_deref(), Some("remote-x"));
+        assert_eq!(route.model, "worker-model-x");
+        assert!(
+            terminal
+                .tail_payloads
+                .iter()
+                .any(|payload| matches!(payload, FleetWorkerEventPayload::Running))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_poll_trailing_malformed_route_invalidates_prior_valid_route() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut exec = FleetExecutor::new(tmp.path());
+        let script = r#"printf '%s\n' '{"type":"metadata","meta":{"receipt_kind":"terminal","provider":"custom","provider_id":"remote-x","model":"worker-model-x"}}'; printf '%s' '{"type":"metadata","meta":{"receipt_kind":"terminal","provider":"custom","provider_id":"","model":"worker-model-x"}}'"#;
+        let command = FleetWorkerCommand::new("sh", vec!["-c".to_string(), script.to_string()]);
+        exec.start_worker("ambiguous-tail-worker", command, None)
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let terminal = exec
+            .poll_terminal_with_status("ambiguous-tail-worker")
+            .expect("terminal worker");
+        assert!(
+            terminal.reported_route.is_none(),
+            "malformed trailing terminal evidence must invalidate the prior valid route"
+        );
     }
 
     /// Dogfood smoke (#3166): several concurrent exec-style workers with one

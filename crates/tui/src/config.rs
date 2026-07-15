@@ -3779,7 +3779,11 @@ impl Config {
         let kind = provider_kind
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let id = provider_id.map(str::trim).filter(|value| !value.is_empty());
+        // Missing and malformed are different security states. An explicitly
+        // persisted empty id must reach `resolve_exact_provider_identity` so
+        // it fails closed instead of being reinterpreted as an id-less legacy
+        // root route.
+        let id = provider_id.map(str::trim);
 
         let Some(kind) = kind else {
             return id.map_or_else(

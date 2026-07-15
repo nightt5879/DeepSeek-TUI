@@ -425,6 +425,14 @@ impl RuntimeThreadStore {
         write_json_atomic(&self.item_path(&item.id)?, item)
     }
 
+    fn remove_turn(&self, turn_id: &str) -> Result<()> {
+        remove_file_if_exists(&self.turn_path(turn_id)?)
+    }
+
+    fn remove_item(&self, item_id: &str) -> Result<()> {
+        remove_file_if_exists(&self.item_path(item_id)?)
+    }
+
     pub fn load_thread(&self, thread_id: &str) -> Result<ThreadRecord> {
         let path = self.thread_path(thread_id)?;
         let raw = read_store_file(&path)
@@ -1037,9 +1045,10 @@ impl RuntimeThreadManager {
                 let provider_kind = turn
                     .effective_provider
                     .filter(|provider| !provider.trim().is_empty());
-                let provider_id = turn
-                    .effective_provider_id
-                    .filter(|provider| !provider.trim().is_empty());
+                // Preserve an explicitly empty additive id so malformed
+                // imported receipts fail closed instead of becoming an
+                // id-less legacy custom route.
+                let provider_id = turn.effective_provider_id;
                 ((provider_kind.is_some() || provider_id.is_some()) && !model.is_empty())
                     .then_some((provider_kind, provider_id, model))
             });
@@ -1066,10 +1075,7 @@ impl RuntimeThreadManager {
             .model_provider
             .as_deref()
             .is_some_and(|provider| !provider.trim().is_empty())
-            || thread
-                .model_provider_id
-                .as_deref()
-                .is_some_and(|provider| !provider.trim().is_empty());
+            || thread.model_provider_id.is_some();
         let identity = if has_persisted_route {
             config.resolve_persisted_provider_identity(
                 thread.model_provider.as_deref(),
@@ -1385,10 +1391,10 @@ impl RuntimeThreadManager {
                 .model_provider
                 .as_deref()
                 .filter(|provider| !provider.trim().is_empty());
-            let requested_id = req
-                .model_provider_id
-                .as_deref()
-                .filter(|provider| !provider.trim().is_empty());
+            // `Some("")` is malformed provenance, not absence. Pass it to
+            // the resolver so an imported/API-created record cannot silently
+            // acquire the root custom route.
+            let requested_id = req.model_provider_id.as_deref().map(str::trim);
             let identity = if requested_kind.is_some() || requested_id.is_some() {
                 config.resolve_persisted_provider_identity(requested_kind, requested_id)
             } else {
@@ -2281,6 +2287,68 @@ impl RuntimeThreadManager {
         Ok(())
     }
 
+    fn rollback_unstarted_turn_records(
+        &self,
+        previous_thread: &ThreadRecord,
+        turn_id: &str,
+        item_id: Option<&str>,
+    ) -> Result<()> {
+        let mut errors = Vec::new();
+        if let Err(err) = self.store.save_thread(previous_thread) {
+            errors.push(format!("restore thread: {err}"));
+        }
+        if let Some(item_id) = item_id
+            && let Err(err) = self.store.remove_item(item_id)
+        {
+            errors.push(format!("remove item: {err}"));
+        }
+        if let Err(err) = self.store.remove_turn(turn_id) {
+            errors.push(format!("remove turn: {err}"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!(errors.join("; "))
+        }
+    }
+
+    async fn restore_unstarted_turn_claim(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        previous_route: &(ProviderIdentity, String),
+    ) {
+        let mut active = self.active.lock().await;
+        if let Some(state) = active.engines.get_mut(thread_id)
+            && state
+                .active_turn
+                .as_ref()
+                .is_some_and(|active_turn| active_turn.turn_id == turn_id)
+        {
+            state.active_turn = None;
+            state.route_identity.clone_from(&previous_route.0);
+            state.route_model.clone_from(&previous_route.1);
+        }
+    }
+
+    /// Restore durable state while the failed turn still owns the active
+    /// claim, then release that claim. Clearing the claim first would let a
+    /// concurrent start persist a winner that this older rollback could
+    /// overwrite with `previous_thread`.
+    async fn rollback_unstarted_turn(
+        &self,
+        previous_thread: &ThreadRecord,
+        turn_id: &str,
+        item_id: Option<&str>,
+        previous_route: &(ProviderIdentity, String),
+    ) -> Result<()> {
+        let durable_result =
+            self.rollback_unstarted_turn_records(previous_thread, turn_id, item_id);
+        self.restore_unstarted_turn_claim(&previous_thread.id, turn_id, previous_route)
+            .await;
+        durable_result
+    }
+
     pub async fn start_turn(&self, thread_id: &str, req: StartTurnRequest) -> Result<TurnRecord> {
         let prompt = req.prompt.trim().to_string();
         if prompt.is_empty() {
@@ -2288,6 +2356,7 @@ impl RuntimeThreadManager {
         }
 
         let mut thread = self.get_thread(thread_id).await?;
+        let thread_before_turn = thread.clone();
         let engine = self.ensure_engine_loaded(&thread).await?;
 
         let client_preflight_required = {
@@ -2410,43 +2479,15 @@ impl RuntimeThreadManager {
         };
 
         turn.item_ids.push(user_item_id.clone());
-        self.store.save_item(&user_item)?;
-        self.store.save_turn(&turn)?;
-
-        thread.latest_turn_id = Some(turn_id.clone());
-        thread.updated_at = now;
-        self.store.save_thread(&thread)?;
-
-        self.emit_event(
-            thread_id,
-            Some(&turn_id),
-            None,
-            "turn.started",
-            json!({ "turn": turn.clone() }),
-        )
-        .await?;
-        self.emit_event(
-            thread_id,
-            Some(&turn_id),
-            Some(&user_item_id),
-            "item.started",
-            json!({ "item": user_item.clone() }),
-        )
-        .await?;
-        self.emit_event(
-            thread_id,
-            Some(&turn_id),
-            Some(&user_item_id),
-            "item.completed",
-            json!({ "item": user_item }),
-        )
-        .await?;
-
-        {
+        let previous_active_route = {
             let mut active = self.active.lock().await;
             let Some(state) = active.engines.get_mut(thread_id) else {
                 bail!("Thread engine not loaded");
             };
+            if state.active_turn.is_some() {
+                bail!("Thread already has an active turn");
+            }
+            let previous = (state.route_identity.clone(), state.route_model.clone());
             state.active_turn = Some(ActiveTurnState {
                 turn_id: turn_id.clone(),
                 interrupt_requested: false,
@@ -2455,13 +2496,37 @@ impl RuntimeThreadManager {
             });
             state.route_identity = provider_identity;
             state.route_model.clone_from(&model);
-            touch_lru(&mut active.lru, thread_id);
+            previous
+        };
+
+        let persistence_result = (|| -> Result<()> {
+            self.store.save_item(&user_item)?;
+            self.store.save_turn(&turn)?;
+            thread.latest_turn_id = Some(turn_id.clone());
+            thread.updated_at = now;
+            self.store.save_thread(&thread)
+        })();
+        if let Err(persistence_error) = persistence_result {
+            let rollback = self
+                .rollback_unstarted_turn(
+                    &thread_before_turn,
+                    &turn_id,
+                    Some(&user_item_id),
+                    &previous_active_route,
+                )
+                .await;
+            return match rollback {
+                Ok(()) => Err(persistence_error),
+                Err(rollback_error) => Err(anyhow!(
+                    "Failed to persist turn: {persistence_error}; rollback also failed: {rollback_error}"
+                )),
+            };
         }
         let allow_shell = req.allow_shell.unwrap_or(thread.allow_shell);
         let trust_mode = req.trust_mode.unwrap_or(thread.trust_mode);
         let auto_approve = req.auto_approve.unwrap_or(thread.auto_approve);
 
-        engine
+        if let Err(send_error) = engine
             .send(Op::SendMessage {
                 content: prompt,
                 mode,
@@ -2490,7 +2555,64 @@ impl RuntimeThreadManager {
                 provenance: crate::core::ops::UserInputProvenance::ExternalUser,
             })
             .await
-            .map_err(|e| anyhow!("Failed to start turn: {e}"))?;
+        {
+            let rollback = self
+                .rollback_unstarted_turn(
+                    &thread_before_turn,
+                    &turn_id,
+                    Some(&user_item_id),
+                    &previous_active_route,
+                )
+                .await;
+            return match rollback {
+                Ok(()) => Err(anyhow!("Failed to start turn: {send_error}")),
+                Err(rollback_error) => Err(anyhow!(
+                    "Failed to start turn: {send_error}; rollback also failed: {rollback_error}"
+                )),
+            };
+        }
+
+        {
+            let mut active = self.active.lock().await;
+            touch_lru(&mut active.lru, thread_id);
+        }
+
+        if let Err(err) = self
+            .emit_event(
+                thread_id,
+                Some(&turn_id),
+                None,
+                "turn.started",
+                json!({ "turn": turn.clone() }),
+            )
+            .await
+        {
+            tracing::warn!("Failed to persist turn.started after engine acceptance: {err}");
+        }
+        if let Err(err) = self
+            .emit_event(
+                thread_id,
+                Some(&turn_id),
+                Some(&user_item_id),
+                "item.started",
+                json!({ "item": user_item.clone() }),
+            )
+            .await
+        {
+            tracing::warn!("Failed to persist item.started after engine acceptance: {err}");
+        }
+        if let Err(err) = self
+            .emit_event(
+                thread_id,
+                Some(&turn_id),
+                Some(&user_item_id),
+                "item.completed",
+                json!({ "item": user_item }),
+            )
+            .await
+        {
+            tracing::warn!("Failed to persist item.completed after engine acceptance: {err}");
+        }
 
         let manager = Arc::new(self.clone());
         let thread_id_owned = thread_id.to_string();
@@ -2646,6 +2768,7 @@ impl RuntimeThreadManager {
         req: CompactThreadRequest,
     ) -> Result<TurnRecord> {
         let mut thread = self.get_thread(thread_id).await?;
+        let thread_before_turn = thread.clone();
         let engine = self.ensure_engine_loaded(&thread).await?;
 
         let client_preflight_required = {
@@ -2705,17 +2828,15 @@ impl RuntimeThreadManager {
             item_ids: Vec::new(),
             steer_count: 0,
         };
-        self.store.save_turn(&turn)?;
-
-        thread.latest_turn_id = Some(turn_id.clone());
-        thread.updated_at = now;
-        self.store.save_thread(&thread)?;
-
-        {
+        let previous_active_route = {
             let mut active = self.active.lock().await;
             let Some(state) = active.engines.get_mut(thread_id) else {
                 bail!("Thread engine not loaded");
             };
+            if state.active_turn.is_some() {
+                bail!("Thread already has an active turn");
+            }
+            let previous = (state.route_identity.clone(), state.route_model.clone());
             state.active_turn = Some(ActiveTurnState {
                 turn_id: turn_id.clone(),
                 interrupt_requested: false,
@@ -2724,25 +2845,74 @@ impl RuntimeThreadManager {
             });
             state.route_identity = route_identity;
             state.route_model = route_model;
-            touch_lru(&mut active.lru, thread_id);
+            previous
+        };
+
+        let persistence_result = (|| -> Result<()> {
+            self.store.save_turn(&turn)?;
+            thread.latest_turn_id = Some(turn_id.clone());
+            thread.updated_at = now;
+            self.store.save_thread(&thread)
+        })();
+        if let Err(persistence_error) = persistence_result {
+            let rollback = self
+                .rollback_unstarted_turn(
+                    &thread_before_turn,
+                    &turn_id,
+                    None,
+                    &previous_active_route,
+                )
+                .await;
+            return match rollback {
+                Ok(()) => Err(persistence_error),
+                Err(rollback_error) => Err(anyhow!(
+                    "Failed to persist compaction: {persistence_error}; rollback also failed: {rollback_error}"
+                )),
+            };
         }
 
-        self.emit_event(
-            thread_id,
-            Some(&turn_id),
-            None,
-            "turn.started",
-            json!({ "turn": turn.clone(), "manual_compaction": true }),
-        )
-        .await?;
-
-        engine
+        if let Err(send_error) = engine
             .send(Op::CompactContext {
                 route: Box::new(route),
                 compaction: Box::new(compaction),
             })
             .await
-            .map_err(|e| anyhow!("Failed to trigger compaction: {e}"))?;
+        {
+            let rollback = self
+                .rollback_unstarted_turn(
+                    &thread_before_turn,
+                    &turn_id,
+                    None,
+                    &previous_active_route,
+                )
+                .await;
+            return match rollback {
+                Ok(()) => Err(anyhow!("Failed to trigger compaction: {send_error}")),
+                Err(rollback_error) => Err(anyhow!(
+                    "Failed to trigger compaction: {send_error}; rollback also failed: {rollback_error}"
+                )),
+            };
+        }
+
+        {
+            let mut active = self.active.lock().await;
+            touch_lru(&mut active.lru, thread_id);
+        }
+
+        if let Err(err) = self
+            .emit_event(
+                thread_id,
+                Some(&turn_id),
+                None,
+                "turn.started",
+                json!({ "turn": turn.clone(), "manual_compaction": true }),
+            )
+            .await
+        {
+            tracing::warn!(
+                "Failed to persist compaction turn.started after engine acceptance: {err}"
+            );
+        }
 
         let manager = Arc::new(self.clone());
         let thread_id_owned = thread_id.to_string();
@@ -4513,6 +4683,15 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let payload = serde_json::to_string_pretty(value)?;
     crate::utils::write_atomic(path, payload.as_bytes())
         .with_context(|| format!("Failed to write {}", path.display()))
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    reject_symlinked_store_file(path)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("Failed to remove {}", path.display())),
+    }
 }
 
 #[cfg(test)]

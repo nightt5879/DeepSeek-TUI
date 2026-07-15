@@ -17,7 +17,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::executor::{
-    FleetExecutor, FleetWorkerTerminalEvent, build_worker_exec_command_with_profiles,
+    FleetExecutor, FleetWorkerReportedRoute, FleetWorkerTerminalEvent,
+    build_worker_exec_command_with_profiles,
 };
 use super::host::FleetHostErrorKind;
 use super::ledger::{FleetLedger, FleetLedgerState, FleetTaskLedgerStatus, FleetTaskState};
@@ -884,6 +885,9 @@ impl FleetManager {
                             recoverable,
                         },
                         exit_code: None,
+                        tail_payloads: Vec::new(),
+                        reported_route: None,
+                        requires_reported_route: false,
                     };
                     let _ = self.record_task_outcome(&task, terminal)?;
                 }
@@ -931,15 +935,31 @@ impl FleetManager {
             return Ok(false);
         }
 
-        let (receipt_result, failure_kind, exit_code) =
-            task_receipt_outcome(&terminal.payload, terminal.exit_code);
-        let terminal_completed =
-            matches!(&terminal.payload, FleetWorkerEventPayload::Completed { .. });
+        let FleetWorkerTerminalEvent {
+            payload,
+            exit_code,
+            tail_payloads,
+            reported_route,
+            requires_reported_route,
+        } = terminal;
+        let (receipt_result, failure_kind, exit_code) = task_receipt_outcome(&payload, exit_code);
+        let terminal_completed = matches!(&payload, FleetWorkerEventPayload::Completed { .. });
+        for tail_payload in tail_payloads {
+            if is_terminal_payload(&tail_payload) {
+                continue;
+            }
+            self.append_worker_event(
+                &task.entry.run_id,
+                &task.worker_id,
+                &task.entry.task_id,
+                tail_payload,
+            )?;
+        }
         self.append_worker_event(
             &task.entry.run_id,
             &task.worker_id,
             &task.entry.task_id,
-            terminal.payload,
+            payload,
         )?;
 
         let artifacts = self.task_artifacts_for_receipt(
@@ -947,10 +967,20 @@ impl FleetManager {
             &task.entry.task_id,
             &task.worker_id,
         )?;
-        // Mint the resolved-route snapshot once (#3154) so every receipt path —
-        // verification and the simulated/transport fallback below — persists the
-        // same honest, secret-free route detail.
-        let resolved_route = self.resolve_task_route(&task.task_spec);
+        // A terminal worker report is the sole authority for provider/model
+        // actually used. Never re-resolve those fields through manager-local
+        // config: remote workers may intentionally run a different config.
+        // A headless worker that omits or malforms the terminal route fails
+        // closed to no actual route. Pre-launch transport/simulated paths have
+        // no process evidence by design, so they retain the explicitly labeled
+        // intent route rather than pretending it was observed.
+        let resolved_route = match (reported_route.as_ref(), requires_reported_route) {
+            (Some(reported_route), _) => {
+                self.resolve_reported_task_route(&task.task_spec, reported_route)
+            }
+            (None, true) => None,
+            (None, false) => self.resolve_task_route(&task.task_spec),
+        };
         let effective_permissions = self.resolve_task_effective_permissions(task);
         let verification_input = FleetTaskVerificationInput {
             run_id: task.entry.run_id.clone(),
@@ -1023,6 +1053,22 @@ impl FleetManager {
             roster.members(),
             self.session_model(),
             self.route_config.as_ref(),
+        )
+    }
+
+    fn resolve_reported_task_route(
+        &self,
+        task_spec: &FleetTaskSpec,
+        reported_route: &FleetWorkerReportedRoute,
+    ) -> Option<FleetResolvedRoute> {
+        let roster = self.agent_roster();
+        worker_runtime::resolve_fleet_route_from_worker_report(
+            task_spec,
+            roster.members(),
+            self.session_model(),
+            &reported_route.provider,
+            reported_route.provider_exact_id.as_deref(),
+            &reported_route.model,
         )
     }
 
@@ -2198,6 +2244,10 @@ exit 0
         let receipt = &state.receipts[&format!("{}:task-a", report.run_id.0)];
         assert_eq!(receipt.result, FleetTaskResult::Pass);
         assert_eq!(receipt.failure_kind, None);
+        assert_eq!(
+            receipt.resolved_route, None,
+            "a headless worker with no terminal route report must fail closed"
+        );
         assert!(receipt.score.as_ref().unwrap().value > 0.99);
         assert!(
             receipt
@@ -2344,6 +2394,139 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn remote_terminal_route_x_wins_manager_config_y_and_receipt_is_secret_free() {
+        let tmp = TempDir::new().unwrap();
+        let manager_config = Config {
+            provider: Some("manager-y".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom: std::collections::HashMap::from([(
+                    "manager-y".to_string(),
+                    crate::config::ProviderConfig {
+                        kind: Some("openai-compatible".to_string()),
+                        base_url: Some("https://manager-y.invalid/v1".to_string()),
+                        model: Some("manager-model-y".to_string()),
+                        api_key: Some("sk-manager-y-must-not-leak".to_string()),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let manager = FleetManager::open(tmp.path())
+            .unwrap()
+            .with_session_model("manager-model-y")
+            .with_route_config(manager_config);
+        let fake = fake_codewhale(
+            &tmp,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"metadata","meta":{"receipt_kind":"terminal","provider":"custom","provider_id":"remote-x","model":"worker-model-x","base_url":"https://remote-x.invalid/v1","api_key":"sk-remote-x-must-not-leak"}}'
+printf '%s\n' '{"type":"done"}'
+"#,
+        );
+        let report = manager
+            .create_run(
+                FleetTaskSpecDocument {
+                    name: Some("remote config drift".to_string()),
+                    labels: BTreeMap::new(),
+                    security_policy: None,
+                    workers: vec![],
+                    tasks: vec![task("route-drift")],
+                },
+                1,
+            )
+            .unwrap();
+
+        let status = complete_with_fake_codewhale(&manager, &report.run_id, 1, &fake);
+        assert_eq!(status.completed, 1);
+        let state = manager.ledger.rebuild_state().unwrap();
+        let receipt = &state.receipts[&format!("{}:route-drift", report.run_id.0)];
+        let route = receipt
+            .resolved_route
+            .as_ref()
+            .expect("terminal-reported route receipt");
+        assert_eq!(route.provider_id, "remote-x");
+        assert_eq!(route.provider_exact_id.as_deref(), Some("remote-x"));
+        assert_eq!(route.provider_kind, "custom");
+        assert_eq!(route.wire_model_id, "worker-model-x");
+        assert_eq!(route.canonical_model, None);
+        assert_eq!(route.protocol, "unreported");
+        assert_eq!(route.source, "worker_terminal_metadata");
+
+        let output = serde_json::to_string(receipt).unwrap().to_ascii_lowercase();
+        for forbidden in [
+            "manager-y",
+            "manager-model-y",
+            "base_url",
+            "https://",
+            "api_key",
+            "sk-manager-y-must-not-leak",
+            "sk-remote-x-must-not-leak",
+        ] {
+            assert!(
+                !output.contains(forbidden),
+                "receipt leaked manager drift or secret field {forbidden:?}: {output}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn headless_terminal_with_invalid_route_metadata_does_not_fall_back_to_manager_config() {
+        let tmp = TempDir::new().unwrap();
+        let manager = FleetManager::open(tmp.path())
+            .unwrap()
+            .with_session_model("manager-model-y")
+            .with_route_config(Config {
+                provider: Some("manager-y".to_string()),
+                providers: Some(crate::config::ProvidersConfig {
+                    custom: std::collections::HashMap::from([(
+                        "manager-y".to_string(),
+                        crate::config::ProviderConfig {
+                            kind: Some("openai-compatible".to_string()),
+                            base_url: Some("https://manager-y.invalid/v1".to_string()),
+                            model: Some("manager-model-y".to_string()),
+                            api_key: Some("sk-manager-y-must-not-leak".to_string()),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let fake = fake_codewhale(
+            &tmp,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"metadata","meta":{"receipt_kind":"terminal","provider":"deepseek","provider_id":"custom-x","model":"deepseek-v4-pro"}}'
+printf '%s\n' '{"type":"done"}'
+"#,
+        );
+        let report = manager
+            .create_run(
+                FleetTaskSpecDocument {
+                    name: Some("invalid terminal route".to_string()),
+                    labels: BTreeMap::new(),
+                    security_policy: None,
+                    workers: vec![],
+                    tasks: vec![task("invalid-route")],
+                },
+                1,
+            )
+            .unwrap();
+
+        let status = complete_with_fake_codewhale(&manager, &report.run_id, 1, &fake);
+        assert_eq!(status.completed, 1);
+        let state = manager.ledger.rebuild_state().unwrap();
+        let receipt = &state.receipts[&format!("{}:invalid-route", report.run_id.0)];
+        assert_eq!(receipt.resolved_route, None);
+        let output = serde_json::to_string(receipt).unwrap().to_ascii_lowercase();
+        assert!(!output.contains("manager-y"));
+        assert!(!output.contains("manager-model-y"));
+        assert!(!output.contains("sk-manager-y-must-not-leak"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn fleet_smoke_runs_three_roles_ten_tasks_with_receipts_and_failure() {
         let tmp = TempDir::new().unwrap();
         let manager = FleetManager::open(tmp.path()).unwrap();
@@ -2353,12 +2536,14 @@ esac
 case "$*" in
   *intentional-failure*)
     printf '{"type":"tool_use","name":"exec_shell","id":"fail","input":{}}\n'
+    printf '{"type":"metadata","meta":{"receipt_kind":"terminal","provider":"deepseek","model":"deepseek-v4-pro"}}\n'
     printf '{"type":"error","error":"intentional failure"}\n'
     exit 7
     ;;
   *)
     printf '{"type":"tool_use","name":"read_file","id":"ok","input":{}}\n'
     printf '{"type":"content","delta":"ok"}\n'
+    printf '{"type":"metadata","meta":{"receipt_kind":"terminal","provider":"deepseek","model":"deepseek-v4-pro"}}\n'
     printf '{"type":"done"}\n'
     exit 0
     ;;
@@ -2503,8 +2688,8 @@ esac
                 "receipt {key} resolved-route should record a role"
             );
             assert_eq!(
-                route.source, "resolver",
-                "receipt {key} resolved-route source must be the resolver"
+                route.source, "worker_terminal_metadata",
+                "receipt {key} resolved-route source must be the worker terminal"
             );
             assert!(
                 route

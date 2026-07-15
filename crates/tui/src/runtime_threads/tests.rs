@@ -383,6 +383,120 @@ async fn real_turn_client_preflight_failure_writes_no_in_progress_record() -> Re
     Ok(())
 }
 
+#[tokio::test]
+async fn closed_turn_mailbox_rolls_back_durable_records_and_active_claim() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let harness = install_mock_engine(&manager, &thread.id).await;
+    let before_active = {
+        let active = manager.active.lock().await;
+        let state = active.engines.get(&thread.id).expect("installed engine");
+        (
+            state.active_turn.as_ref().map(|turn| turn.turn_id.clone()),
+            state.route_identity.clone(),
+            state.route_model.clone(),
+            active.lru.clone(),
+        )
+    };
+    let before_thread = serde_json::to_value(manager.get_thread(&thread.id).await?)?;
+    let before_events = serde_json::to_value(manager.events_since(&thread.id, None)?)?;
+    drop(harness.rx_op);
+
+    let error = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "mailbox is already closed".to_string(),
+                ..StartTurnRequest::default()
+            },
+        )
+        .await
+        .expect_err("closed mailbox must reject the turn")
+        .to_string();
+    assert!(error.contains("Failed to start turn"), "{error}");
+
+    assert!(manager.store.list_turns_for_thread(&thread.id)?.is_empty());
+    assert_eq!(
+        serde_json::to_value(manager.get_thread(&thread.id).await?)?,
+        before_thread
+    );
+    assert_eq!(
+        serde_json::to_value(manager.events_since(&thread.id, None)?)?,
+        before_events
+    );
+    assert_eq!(
+        std::fs::read_dir(&manager.store.items_dir)?.count(),
+        0,
+        "failed send must remove the optimistic user item"
+    );
+    let after_active = {
+        let active = manager.active.lock().await;
+        let state = active.engines.get(&thread.id).expect("installed engine");
+        (
+            state.active_turn.as_ref().map(|turn| turn.turn_id.clone()),
+            state.route_identity.clone(),
+            state.route_model.clone(),
+            active.lru.clone(),
+        )
+    };
+    assert_eq!(after_active, before_active);
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_turn_starts_leave_one_claim_and_one_consistent_durable_turn() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let first = manager.start_turn(
+        &thread.id,
+        StartTurnRequest {
+            prompt: "first concurrent turn".to_string(),
+            ..StartTurnRequest::default()
+        },
+    );
+    let second = manager.start_turn(
+        &thread.id,
+        StartTurnRequest {
+            prompt: "second concurrent turn".to_string(),
+            ..StartTurnRequest::default()
+        },
+    );
+
+    let (first, second) = tokio::join!(first, second);
+    let (turn, rejection) = match (first, second) {
+        (Ok(turn), Err(error)) | (Err(error), Ok(turn)) => (turn, error),
+        (first, second) => {
+            panic!("expected one accepted turn and one rejection: {first:?} {second:?}")
+        }
+    };
+    assert!(
+        rejection.to_string().contains("already has an active turn"),
+        "{rejection}"
+    );
+    let turns = manager.store.list_turns_for_thread(&thread.id)?;
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].id, turn.id);
+    assert_eq!(
+        manager.get_thread(&thread.id).await?.latest_turn_id,
+        Some(turn.id.clone())
+    );
+    assert_eq!(
+        manager.active_turn_flags(&thread.id, &turn.id).await,
+        Some((false, false))
+    );
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage { .. })
+    ));
+    assert!(harness.rx_op.try_recv().is_err());
+    Ok(())
+}
+
 #[test]
 fn legacy_custom_thread_stays_on_root_when_literal_table_coexists() -> Result<()> {
     let mut custom = std::collections::HashMap::new();
@@ -442,6 +556,61 @@ fn legacy_custom_thread_stays_on_root_when_literal_table_coexists() -> Result<()
         .to_string();
     assert!(error.contains("[providers.custom]"), "{error}");
     assert!(error.contains("will not fall back"), "{error}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_imported_custom_id_fails_closed_when_root_and_table_coexist() -> Result<()> {
+    let mut custom = std::collections::HashMap::new();
+    custom.insert(
+        "custom".to_string(),
+        crate::config::ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("http://127.0.0.1:18182/v1".to_string()),
+            model: Some("table-model".to_string()),
+            ..crate::config::ProviderConfig::default()
+        },
+    );
+    let config = Config {
+        provider: Some("custom".to_string()),
+        base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+        default_text_model: Some("legacy-root-model".to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom,
+            ..crate::config::ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+    let manager = RuntimeThreadManager::open(
+        config.clone(),
+        PathBuf::from("."),
+        test_manager_config(test_runtime_dir()),
+    )?;
+
+    let mut imported = sample_thread("thr_empty_custom_id");
+    imported.model_provider = Some("custom".to_string());
+    imported.model_provider_id = Some("   ".to_string());
+    let error = manager
+        .resolved_route_for_thread(&config, &imported)
+        .expect_err("malformed imported identity must not acquire the root route")
+        .to_string();
+    assert!(error.contains("empty exact provider id"), "{error}");
+
+    let before = manager.store.list_threads()?.len();
+    let request_error = manager
+        .create_thread(CreateThreadRequest {
+            model_provider: Some("custom".to_string()),
+            model_provider_id: Some(String::new()),
+            ..CreateThreadRequest::default()
+        })
+        .await
+        .expect_err("malformed create request must fail before persistence")
+        .to_string();
+    assert!(
+        request_error.contains("empty exact provider id"),
+        "{request_error}"
+    );
+    assert_eq!(manager.store.list_threads()?.len(), before);
     Ok(())
 }
 
@@ -2044,6 +2213,57 @@ async fn compact_thread_preserves_thread_auto_approve_policy() -> Result<()> {
         Some((false, false))
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn closed_compaction_mailbox_rolls_back_durable_records_and_active_claim() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let harness = install_mock_engine(&manager, &thread.id).await;
+    let before_active = {
+        let active = manager.active.lock().await;
+        let state = active.engines.get(&thread.id).expect("installed engine");
+        (
+            state.active_turn.as_ref().map(|turn| turn.turn_id.clone()),
+            state.route_identity.clone(),
+            state.route_model.clone(),
+            active.lru.clone(),
+        )
+    };
+    let before_thread = serde_json::to_value(manager.get_thread(&thread.id).await?)?;
+    let before_events = serde_json::to_value(manager.events_since(&thread.id, None)?)?;
+    drop(harness.rx_op);
+
+    let error = manager
+        .compact_thread(&thread.id, CompactThreadRequest::default())
+        .await
+        .expect_err("closed mailbox must reject compaction")
+        .to_string();
+    assert!(error.contains("Failed to trigger compaction"), "{error}");
+
+    assert!(manager.store.list_turns_for_thread(&thread.id)?.is_empty());
+    assert_eq!(
+        serde_json::to_value(manager.get_thread(&thread.id).await?)?,
+        before_thread
+    );
+    assert_eq!(
+        serde_json::to_value(manager.events_since(&thread.id, None)?)?,
+        before_events
+    );
+    let after_active = {
+        let active = manager.active.lock().await;
+        let state = active.engines.get(&thread.id).expect("installed engine");
+        (
+            state.active_turn.as_ref().map(|turn| turn.turn_id.clone()),
+            state.route_identity.clone(),
+            state.route_model.clone(),
+            active.lru.clone(),
+        )
+    };
+    assert_eq!(after_active, before_active);
     Ok(())
 }
 

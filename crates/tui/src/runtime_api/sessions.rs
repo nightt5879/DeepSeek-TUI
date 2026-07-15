@@ -297,11 +297,7 @@ pub(super) fn stamp_session_provider_from_thread(
         .model_provider
         .as_deref()
         .is_some_and(|provider| !provider.trim().is_empty())
-        || detail
-            .thread
-            .model_provider_id
-            .as_deref()
-            .is_some_and(|provider| !provider.trim().is_empty());
+        || detail.thread.model_provider_id.is_some();
     let provider_identity = if thread_has_route {
         config.resolve_persisted_provider_identity(
             detail.thread.model_provider.as_deref(),
@@ -311,10 +307,7 @@ pub(super) fn stamp_session_provider_from_thread(
         turn.effective_provider
             .as_deref()
             .is_some_and(|provider| !provider.trim().is_empty())
-            || turn
-                .effective_provider_id
-                .as_deref()
-                .is_some_and(|provider| !provider.trim().is_empty())
+            || turn.effective_provider_id.is_some()
     }) {
         config.resolve_persisted_provider_identity(
             turn.effective_provider.as_deref(),

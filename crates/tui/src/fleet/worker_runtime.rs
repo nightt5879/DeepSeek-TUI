@@ -168,7 +168,7 @@ pub(crate) fn resolve_fleet_route_with_config(
     let model_selector = model_selector.as_deref();
 
     let explicit_provider_id = explicit_fleet_provider_id(agent_profile);
-    let (candidate, provider_id, route_source) = if let Some(config) = config {
+    let (candidate, provider_id, provider_exact_id, route_source) = if let Some(config) = config {
         let identity = match explicit_provider_id.as_deref() {
             Some(provider_id) => config.resolve_provider_identity(provider_id).ok()?,
             None => config
@@ -181,7 +181,15 @@ pub(crate) fn resolve_fleet_route_with_config(
             .ok()?
             .validate()
             .ok()?;
-        (route.candidate, route.identity.key, "runtime_route")
+        let provider_exact_id = (route.identity.provider == ApiProvider::Custom)
+            .then_some(route.identity.exact_id)
+            .flatten();
+        (
+            route.candidate,
+            route.identity.key,
+            provider_exact_id,
+            "runtime_route",
+        )
     } else {
         let provider = match explicit_provider_id.as_deref() {
             Some(provider_id) => {
@@ -195,11 +203,12 @@ pub(crate) fn resolve_fleet_route_with_config(
         };
         let candidate = resolve_route_candidate(provider, model_selector, None, None, None).ok()?;
         let provider_id = candidate.provider_id.as_str().to_string();
-        (candidate, provider_id, "resolver")
+        (candidate, provider_id, None, "resolver")
     };
 
     Some(FleetResolvedRoute {
         provider_id,
+        provider_exact_id,
         provider_kind: candidate.provider_kind.as_str().to_string(),
         canonical_model: candidate
             .canonical_model
@@ -223,6 +232,68 @@ pub(crate) fn resolve_fleet_route_with_config(
         model_class_source: model_class_source.map(str::to_string),
         model_source: Some(model_source.to_string()),
         source: route_source.to_string(),
+    })
+}
+
+/// Build the receipt route from route identity reported by the worker itself.
+///
+/// Provider/model fields in this path are process-boundary evidence, not a
+/// second resolution attempt in the manager's potentially different config.
+/// Fleet task/profile fields remain intent metadata and are safe to derive
+/// locally. Protocol and canonical model stay explicitly unreported because
+/// the current exec terminal envelope does not carry them.
+pub(crate) fn resolve_fleet_route_from_worker_report(
+    task_spec: &FleetTaskSpec,
+    agent_profiles: &[AgentProfile],
+    session_model: Option<&str>,
+    provider: &str,
+    provider_exact_id: Option<&str>,
+    model: &str,
+) -> Option<FleetResolvedRoute> {
+    let provider = non_empty_trimmed(provider)?;
+    let model = non_empty_trimmed(model)?;
+    let provider_exact_id = match provider_exact_id {
+        Some(provider_exact_id) => Some(non_empty_trimmed(provider_exact_id)?),
+        None => None,
+    };
+    let provider_kind = ApiProvider::parse(provider)?;
+    if provider_exact_id.is_some() && provider_kind != ApiProvider::Custom {
+        return None;
+    }
+    let provider_id = provider_exact_id.unwrap_or(provider);
+    let agent_profile = resolve_task_agent_profile(task_spec, agent_profiles)
+        .ok()
+        .flatten();
+    let worker_profile = task_spec.worker.as_ref();
+    let (role, role_source) = effective_fleet_role_with_source(worker_profile, agent_profile);
+    let (loadout, loadout_source) =
+        effective_fleet_loadout_with_source(worker_profile, agent_profile);
+    let (model_class, model_class_source) = task_model_class_with_source(worker_profile);
+    let (model_selector, model_source) =
+        fleet_route_model_selector_with_source(worker_profile, agent_profile, session_model);
+    Some(FleetResolvedRoute {
+        provider_id: provider_id.to_string(),
+        provider_exact_id: provider_exact_id.map(str::to_string),
+        provider_kind: provider_kind.as_str().to_string(),
+        canonical_model: None,
+        wire_model_id: model.to_string(),
+        protocol: "unreported".to_string(),
+        role,
+        loadout: loadout_intent_label(&loadout),
+        model_class,
+        model_route: Some(
+            model_route_label(&fleet_model_route_for_loadout(
+                model_selector.as_deref().unwrap_or("auto"),
+                &loadout,
+            ))
+            .to_string(),
+        ),
+        reasoning_effort: effective_fleet_reasoning_effort(agent_profile),
+        role_source: role_source.map(str::to_string),
+        loadout_source: loadout_source.map(str::to_string),
+        model_class_source: model_class_source.map(str::to_string),
+        model_source: Some(model_source.to_string()),
+        source: "worker_terminal_metadata".to_string(),
     })
 }
 
@@ -1534,6 +1605,7 @@ mod tests {
         .expect("live config should prove the named custom route");
 
         assert_eq!(route.provider_id, "lm-studio");
+        assert_eq!(route.provider_exact_id.as_deref(), Some("lm-studio"));
         assert_eq!(route.provider_kind, "custom");
         assert_eq!(route.wire_model_id, "qwen-2.5-7b");
         assert_eq!(route.protocol, "chat_completions");
@@ -1618,8 +1690,90 @@ mod tests {
         )
         .expect("live config route proof");
         assert_eq!(route.provider_id, "CUSTOM");
+        assert_eq!(route.provider_exact_id.as_deref(), Some("CUSTOM"));
         assert_eq!(route.provider_kind, "custom");
         assert_eq!(route.source, "runtime_route");
+    }
+
+    #[test]
+    fn worker_report_route_preserves_literal_custom_vs_idless_root_without_local_resolution() {
+        let task = fleet_task("reported-custom", None);
+        let literal = resolve_fleet_route_from_worker_report(
+            &task,
+            &[],
+            Some("manager-model-y"),
+            "custom",
+            Some("custom"),
+            "worker-model-x",
+        )
+        .expect("literal custom worker report");
+        let root = resolve_fleet_route_from_worker_report(
+            &task,
+            &[],
+            Some("manager-model-y"),
+            "custom",
+            None,
+            "worker-model-root",
+        )
+        .expect("idless root custom worker report");
+
+        assert_eq!(literal.provider_id, "custom");
+        assert_eq!(literal.provider_exact_id.as_deref(), Some("custom"));
+        assert_eq!(literal.wire_model_id, "worker-model-x");
+        assert_eq!(root.provider_id, "custom");
+        assert_eq!(root.provider_exact_id, None);
+        assert_eq!(root.wire_model_id, "worker-model-root");
+        assert_eq!(literal.source, "worker_terminal_metadata");
+        assert_eq!(root.source, "worker_terminal_metadata");
+
+        let literal_json = serde_json::to_value(&literal).unwrap();
+        let root_json = serde_json::to_value(&root).unwrap();
+        assert_eq!(literal_json["provider_exact_id"], "custom");
+        assert!(root_json.get("provider_exact_id").is_none());
+        assert_ne!(literal, root);
+    }
+
+    #[test]
+    fn worker_report_builtin_route_does_not_become_custom_exact_route() {
+        let task = fleet_task("reported-built-in", None);
+        let route = resolve_fleet_route_from_worker_report(
+            &task,
+            &[],
+            None,
+            "deepseek",
+            None,
+            "deepseek-v4-pro",
+        )
+        .expect("built-in worker report");
+
+        assert_eq!(route.provider_id, "deepseek");
+        assert_eq!(route.provider_exact_id, None);
+        assert_eq!(route.provider_kind, "deepseek");
+
+        assert!(
+            resolve_fleet_route_from_worker_report(
+                &task,
+                &[],
+                None,
+                "deepseek",
+                Some("custom-x"),
+                "deepseek-v4-pro",
+            )
+            .is_none(),
+            "built-in kind plus custom exact id is contradictory provenance"
+        );
+        assert!(
+            resolve_fleet_route_from_worker_report(
+                &task,
+                &[],
+                None,
+                "custom",
+                Some("   "),
+                "root-model",
+            )
+            .is_none(),
+            "present-empty exact id must not collapse to idless custom root"
+        );
     }
 
     #[test]

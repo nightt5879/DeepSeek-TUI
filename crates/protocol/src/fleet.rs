@@ -887,6 +887,15 @@ impl FleetAlertEndpoint {
 pub struct FleetResolvedRoute {
     /// Resolved provider canonical id (e.g. `"deepseek"`).
     pub provider_id: String,
+    /// Exact configured provider-table id when the worker used one.
+    ///
+    /// This is intentionally additive to `provider_id`: literal
+    /// `[providers.custom]` resolves to `Some("custom")`, while the legacy
+    /// idless root custom route resolves to `None`. Keeping the distinction
+    /// prevents a receipt from silently collapsing two different credential
+    /// and endpoint authorities into the same generic `custom` label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_exact_id: Option<String>,
     /// Resolved provider kind (e.g. `"deepseek"`).
     pub provider_kind: String,
     /// Canonical, provider-agnostic model identity, when known.
@@ -1501,6 +1510,7 @@ mod tests {
             score: None,
             resolved_route: Some(FleetResolvedRoute {
                 provider_id: "deepseek".to_string(),
+                provider_exact_id: None,
                 provider_kind: "deepseek".to_string(),
                 canonical_model: Some("deepseek-v4-pro".to_string()),
                 wire_model_id: "deepseek-v4-pro".to_string(),

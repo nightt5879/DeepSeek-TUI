@@ -8274,6 +8274,31 @@ fn persisted_custom_fields_distinguish_legacy_root_from_exact_literal_table() {
 }
 
 #[test]
+fn persisted_empty_custom_id_never_falls_back_to_legacy_root() {
+    let mut config =
+        session_custom_provider_config("custom", "openai-compatible", "http://127.0.0.1:18181/v1");
+    config.base_url = Some("http://127.0.0.1:18180/v1".to_string());
+    config.default_text_model = Some("legacy-root-model".to_string());
+
+    for malformed_id in ["", "   "] {
+        let error = config
+            .resolve_persisted_provider_identity(Some("custom"), Some(malformed_id))
+            .expect_err("an explicit empty exact id must never authorize the root route");
+        assert!(error.contains("empty exact provider id"), "{error}");
+        assert!(error.contains("will not guess or fall back"), "{error}");
+    }
+
+    let root = config
+        .resolve_persisted_provider_identity(Some("custom"), None)
+        .expect("a genuinely missing id retains legacy root compatibility");
+    assert_eq!(root.exact_id, None);
+    let exact = config
+        .resolve_persisted_provider_identity(Some("custom"), Some("custom"))
+        .expect("a non-empty exact id selects the literal table");
+    assert_eq!(exact.exact_id.as_deref(), Some("custom"));
+}
+
+#[test]
 fn persisted_provider_pair_never_collapses_builtin_into_same_key_custom_route() {
     let config =
         session_custom_provider_config("openai", "openai-compatible", "http://127.0.0.1:1234/v1");

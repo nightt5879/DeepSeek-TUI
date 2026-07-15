@@ -7782,10 +7782,27 @@ fn one_shot_exec_json_receipt(
     })
 }
 
+fn exec_stream_provider_route(
+    identity: &crate::config::ProviderIdentity,
+) -> (String, Option<String>) {
+    let provider = identity.provider.as_str().to_string();
+    let provider_id = if identity.provider == crate::config::ApiProvider::Custom {
+        identity.exact_id.clone()
+    } else {
+        None
+    };
+    (provider, provider_id)
+}
+
 #[derive(serde::Serialize)]
 struct ExecStreamMeta {
     receipt_kind: &'static str,
     provider: String,
+    /// Exact configured provider-table id, when one selected the route.
+    /// `None` deliberately distinguishes the legacy idless root custom route
+    /// from literal `[providers.custom]`, whose exact id is `"custom"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_id: Option<String>,
     model: String,
     route_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8017,7 +8034,11 @@ async fn run_workflow_tool_command_inner(cli: &Cli, args: WorkflowToolArgs) -> R
     )
     .await?;
     let execution_config = config_for_cli_route(&config, &route);
-    let route_provider = execution_config.provider_identity_for(route.provider);
+    let route_identity = execution_config
+        .active_provider_identity(route.provider)
+        .map_err(anyhow::Error::msg)
+        .context("workflow terminal route lost its exact provider identity")?;
+    let (route_provider, route_provider_id) = exec_stream_provider_route(&route_identity);
     let workflow_input_sha256 = format!(
         "sha256:{}",
         crate::hashing::sha256_hex(&serde_json::to_vec(&input)?)
@@ -8092,6 +8113,7 @@ async fn run_workflow_tool_command_inner(cli: &Cli, args: WorkflowToolArgs) -> R
         meta: Box::new(ExecStreamMeta {
             receipt_kind: "terminal",
             provider: route_provider,
+            provider_id: route_provider_id,
             // No parent/operator model call occurs on this host-owned path;
             // child model/provider usage remains attributable in typed task
             // receipts rather than being misreported as one root model.
@@ -8676,6 +8698,8 @@ async fn run_exec_agent(
     .map_err(anyhow::Error::msg)?;
     let effective_provider_name = validated_route.identity.key.clone();
     let effective_provider_id = validated_route.identity.exact_id.clone();
+    let (effective_provider_kind, effective_stream_provider_id) =
+        exec_stream_provider_route(&validated_route.identity);
     let route_source = if auto_model {
         "auto_resolver"
     } else {
@@ -9241,7 +9265,8 @@ async fn run_exec_agent(
                     emit_exec_stream_event(&ExecStreamEvent::Metadata {
                         meta: Box::new(ExecStreamMeta {
                             receipt_kind: "terminal",
-                            provider: effective_provider_name.clone(),
+                            provider: effective_provider_kind.clone(),
+                            provider_id: effective_stream_provider_id.clone(),
                             model: latest_model.clone(),
                             route_source: route_source.clone(),
                             input_tokens: Some(usage.input_tokens),
@@ -11123,6 +11148,47 @@ mod terminal_mode_tests {
     }
 
     #[test]
+    fn exec_stream_provider_pair_preserves_named_literal_and_root_custom_provenance() {
+        let named = crate::config::ProviderIdentity {
+            provider: crate::config::ApiProvider::Custom,
+            key: "lm-studio".to_string(),
+            exact_id: Some("lm-studio".to_string()),
+        };
+        let literal = crate::config::ProviderIdentity {
+            provider: crate::config::ApiProvider::Custom,
+            key: "custom".to_string(),
+            exact_id: Some("custom".to_string()),
+        };
+        let root = crate::config::ProviderIdentity {
+            provider: crate::config::ApiProvider::Custom,
+            key: "custom".to_string(),
+            exact_id: None,
+        };
+        let built_in = crate::config::ProviderIdentity {
+            provider: crate::config::ApiProvider::Deepseek,
+            key: "deepseek".to_string(),
+            exact_id: Some("deepseek".to_string()),
+        };
+
+        assert_eq!(
+            exec_stream_provider_route(&named),
+            ("custom".to_string(), Some("lm-studio".to_string()))
+        );
+        assert_eq!(
+            exec_stream_provider_route(&literal),
+            ("custom".to_string(), Some("custom".to_string()))
+        );
+        assert_eq!(
+            exec_stream_provider_route(&root),
+            ("custom".to_string(), None)
+        );
+        assert_eq!(
+            exec_stream_provider_route(&built_in),
+            ("deepseek".to_string(), None)
+        );
+    }
+
+    #[test]
     fn resumed_exec_persistence_updates_provider_and_model_as_one_route() {
         let saved_a = saved_exec_session("custom-a", crate::config::ZAI_GLM_5_2_MODEL);
         let mut config = custom_exec_config("custom-a");
@@ -11508,6 +11574,7 @@ mod terminal_mode_tests {
             meta: Box::new(ExecStreamMeta {
                 receipt_kind: "terminal",
                 provider: "deepseek".to_string(),
+                provider_id: None,
                 model: "deepseek-v4-flash".to_string(),
                 route_source: "explicit_or_configured".to_string(),
                 input_tokens: Some(123),

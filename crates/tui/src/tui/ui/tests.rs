@@ -4115,6 +4115,109 @@ async fn dispatch_user_message_failed_send_clears_loading_state() {
 }
 
 #[tokio::test]
+async fn failed_paused_dispatch_preserves_app_checkpoint_state_and_engine_gate() {
+    let mut app = create_test_app();
+    app.pausable = true;
+    app.paused = true;
+    app.paused_quarry = Some("finish the paused audit".to_string());
+    app.hunt.quarry = None;
+    app.hunt.tokens_used = 7;
+    app.hunt.time_used_seconds = 11;
+    app.hunt.continuation_count = 2;
+    app.api_messages
+        .push(text_message("assistant", "existing conversation"));
+    app.add_message(HistoryCell::System {
+        content: "existing transcript".to_string(),
+    });
+    let before_messages = app.api_messages.clone();
+    let before_history = format!("{:?}", app.history);
+    let before_context_references = app.session_context_references.clone();
+    let before_system_prompt = app.system_prompt.clone();
+    let before_last_prompt = app.last_submitted_prompt.clone();
+    let engine = mock_engine_handle();
+    engine.handle.set_paused(true);
+    drop(engine.rx_op);
+
+    dispatch_user_message(
+        &mut app,
+        &Config::default(),
+        &engine.handle,
+        QueuedMessage::new("please continue".to_string(), None),
+    )
+    .await
+    .expect_err("closed engine mailbox must reject the paused dispatch");
+
+    assert!(app.paused);
+    assert!(app.pausable);
+    assert_eq!(
+        app.paused_quarry.as_deref(),
+        Some("finish the paused audit")
+    );
+    assert!(app.hunt.quarry.is_none());
+    assert_eq!(app.hunt.tokens_used, 7);
+    assert_eq!(app.hunt.time_used_seconds, 11);
+    assert_eq!(app.hunt.continuation_count, 2);
+    assert!(engine.handle.is_paused());
+    assert_eq!(app.api_messages, before_messages);
+    assert_eq!(format!("{:?}", app.history), before_history);
+    assert_eq!(app.session_context_references, before_context_references);
+    assert_eq!(app.system_prompt, before_system_prompt);
+    assert_eq!(app.last_submitted_prompt, before_last_prompt);
+    assert!(!app.is_loading);
+    assert!(app.dispatch_started_at.is_none());
+    assert!(app.last_send_at.is_none());
+    assert!(app.pending_turn_route.is_none());
+}
+
+#[tokio::test]
+async fn paused_dispatch_at_compaction_threshold_enqueues_one_atomic_send() {
+    let mut app = create_test_app();
+    app.pausable = true;
+    app.paused = true;
+    app.paused_quarry = Some("finish the paused audit".to_string());
+    app.hunt.quarry = None;
+    app.auto_compact_user_configured = true;
+    app.auto_compact = true;
+    app.auto_compact_threshold_percent = 10.0;
+    app.api_messages = vec![text_message("assistant", &"context ".repeat(240_000))];
+    let planned_compaction =
+        app.compaction_config_for_route(app.api_provider, &app.model, app.active_route_limits);
+    assert!(
+        should_auto_compact_before_send_with_config(&app, &planned_compaction),
+        "fixture must already require compaction"
+    );
+
+    let mut engine = mock_engine_handle();
+    engine.handle.set_paused(true);
+    dispatch_user_message(
+        &mut app,
+        &Config::default(),
+        &engine.handle,
+        QueuedMessage::new("please continue".to_string(), None),
+    )
+    .await
+    .expect("atomic paused dispatch");
+
+    match engine.rx_op.recv().await.expect("single send operation") {
+        Op::SendMessage {
+            compaction,
+            goal_objective,
+            ..
+        } => {
+            assert!(compaction.enabled);
+            assert_eq!(goal_objective.as_deref(), Some("finish the paused audit"));
+        }
+        other => panic!("expected SendMessage, got {other:?}"),
+    }
+    assert!(
+        engine.rx_op.try_recv().is_err(),
+        "route-bound compaction must travel inside the one SendMessage op"
+    );
+    assert!(!app.paused);
+    assert!(!engine.handle.is_paused());
+}
+
+#[tokio::test]
 async fn real_engine_client_preflight_failure_leaves_dispatch_state_atomic() {
     let mut config =
         named_custom_session_config("lm-studio", "http://127.0.0.1:1234/v1", "local-model");
@@ -10900,6 +11003,47 @@ fn session_load_rejects_exact_custom_table_record_when_only_root_remains() {
 }
 
 #[test]
+fn session_load_rejects_empty_custom_id_when_root_and_table_coexist() {
+    let mut config =
+        named_custom_session_config("custom", "http://127.0.0.1:18182/v1", "table-model");
+    config.base_url = Some("http://127.0.0.1:18181/v1".to_string());
+    config.default_text_model = Some("legacy-root-model".to_string());
+    let mut app = create_test_app();
+    app.api_messages
+        .push(text_message("user", "current conversation"));
+    app.set_provider_identity(ApiProvider::Deepseek, "deepseek");
+    app.set_model_selection("deepseek-v4-pro".to_string());
+    let previous_messages = app.api_messages.clone();
+    let previous_provider = app.api_provider;
+    let previous_identity = app.provider_identity_for_persistence().to_string();
+    let previous_provider_id = app.provider_id_for_persistence().map(str::to_string);
+    let previous_model = app.model.clone();
+    let previous_config_provider = config.provider.clone();
+
+    let mut session = saved_session_with_messages(vec![
+        text_message("user", "malformed custom conversation"),
+        text_message("assistant", "must never load"),
+    ]);
+    session.metadata.model_provider = "custom".to_string();
+    session.metadata.model_provider_id = Some("   ".to_string());
+    session.metadata.model = "legacy-root-model".to_string();
+
+    let error = apply_loaded_session(&mut app, &mut config, &session)
+        .expect_err("an explicit empty id must not load either custom route");
+    assert!(error.contains("empty exact provider id"), "{error}");
+    assert_eq!(app.api_messages, previous_messages);
+    assert_eq!(app.api_provider, previous_provider);
+    assert_eq!(app.provider_identity_for_persistence(), previous_identity);
+    assert_eq!(
+        app.provider_id_for_persistence().map(str::to_string),
+        previous_provider_id
+    );
+    assert_eq!(app.model, previous_model);
+    assert_eq!(config.provider, previous_config_provider);
+    assert_eq!(config.deepseek_base_url(), "http://127.0.0.1:18182/v1");
+}
+
+#[test]
 fn file_load_respawns_engine_when_same_custom_identity_changes_endpoint() {
     let workspace = PathBuf::from("/tmp/atomic-file-load-same-custom");
     let mut stale_config =
@@ -13110,6 +13254,75 @@ fn fallback_switch_status_shows_one_based_position_and_reason() {
     assert!(
         status.contains("Switched to openrouter") && status.contains("(fallback 1/"),
         "visible status must show the destination and 1-based position: {status}"
+    );
+}
+
+#[tokio::test]
+async fn failed_fallback_restores_exact_literal_custom_identity_without_root_crossover() {
+    let mut config = Config {
+        provider: Some("custom".to_string()),
+        api_key: Some("legacy-root-key".to_string()),
+        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
+        default_text_model: Some("legacy-root-model".to_string()),
+        providers: Some(ProvidersConfig {
+            custom: HashMap::from([(
+                "custom".to_string(),
+                ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    api_key: Some("literal-table-key".to_string()),
+                    base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+                    model: Some("literal-table-model".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let previous_identity = ProviderIdentity {
+        provider: ApiProvider::Custom,
+        key: "custom".to_string(),
+        exact_id: Some("custom".to_string()),
+    };
+    let mut app = create_test_app();
+    app.set_provider_identity_record(previous_identity.clone());
+    app.set_model_selection("literal-table-model".to_string());
+    // Mirror `apply_engine_error_to_app`: the fallback chain has advanced the
+    // enum while the previous exact route remains the rollback authority.
+    app.api_provider = ApiProvider::Openrouter;
+    let mut engine = mock_engine_handle();
+    let previous_chain = app.provider_chain.clone();
+
+    apply_provider_fallback_switch(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        ProviderFallbackRollback {
+            identity: previous_identity.clone(),
+            chain: previous_chain,
+        },
+    )
+    .await;
+
+    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.provider_identity_for_persistence(), "custom");
+    assert_eq!(app.provider_id_for_persistence(), Some("custom"));
+    let (restored_identity, restored_config) = app_scoped_runtime_config(&app, &config);
+    assert_eq!(restored_identity, previous_identity);
+    let route = resolve_runtime_route_for_identity(
+        &restored_config,
+        &restored_identity,
+        Some("literal-table-model"),
+    )
+    .expect("restored identity must still resolve the exact literal table");
+    assert_eq!(route.identity.exact_id.as_deref(), Some("custom"));
+    assert_eq!(
+        route.candidate.endpoint.base_url,
+        "http://127.0.0.1:18181/v1"
+    );
+    assert_ne!(
+        route.candidate.endpoint.base_url,
+        "http://127.0.0.1:18180/v1"
     );
 }
 
