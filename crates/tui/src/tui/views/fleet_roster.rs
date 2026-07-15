@@ -55,8 +55,13 @@ impl OperatorInfo {
         } else {
             app.model.clone()
         };
+        let provider = if app.api_provider == crate::config::ApiProvider::Custom {
+            app.provider_identity_for_persistence().to_string()
+        } else {
+            app.api_provider.display_name().to_string()
+        };
         Self {
-            provider: app.api_provider.display_name().to_string(),
+            provider,
             model,
             reasoning: app.reasoning_effort_display_label(),
         }

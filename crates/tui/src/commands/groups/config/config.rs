@@ -2238,8 +2238,8 @@ pub fn lsp_command(app: &mut App, arg: Option<&str>) -> CommandResult {
 /// `codewhale auth clear --provider <id>` and
 /// `codewhale auth set --provider <id>`.
 pub fn logout(app: &mut App) -> CommandResult {
-    let provider_name = app.api_provider.as_str();
-    match clear_active_provider_api_key(provider_name) {
+    let provider_name = app.provider_identity_for_persistence().to_string();
+    match clear_active_provider_api_key(&provider_name) {
         Ok(()) => {
             app.onboarding = OnboardingState::ApiKey;
             app.onboarding_needs_api_key = true;
@@ -4009,5 +4009,53 @@ max_concurrent = 4
 
         let updated = fs::read_to_string(config_path).unwrap();
         assert!(!updated.contains("api_key"));
+    }
+
+    #[test]
+    fn logout_clears_only_exact_named_custom_provider_key() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-custom-logout-test-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&temp_root).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+        let config_path = temp_root.join(".deepseek").join("config.toml");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(
+            &config_path,
+            "[providers.custom-a]\napi_key = \"a-key\"\n\n[providers.custom-b]\napi_key = \"b-key\"\n",
+        )
+        .unwrap();
+        let mut app = create_test_app();
+        app.set_provider_identity(ApiProvider::Custom, "custom-a");
+
+        let result = logout(&mut app);
+
+        assert!(result.message.is_some());
+        let updated = fs::read_to_string(config_path).unwrap();
+        assert!(!updated.contains("a-key"), "{updated}");
+        assert!(updated.contains("b-key"), "{updated}");
+    }
+
+    #[test]
+    fn named_custom_provider_url_write_fails_closed() {
+        let mut app = create_test_app();
+        app.set_provider_identity(ApiProvider::Custom, "custom-a");
+
+        let result = config_command(
+            &mut app,
+            Some("provider_url http://127.0.0.1:18181/v1 --save"),
+        );
+        let message = result.message.expect("error message");
+
+        assert!(
+            message.contains("named [providers.<name>] table"),
+            "{message}"
+        );
     }
 }

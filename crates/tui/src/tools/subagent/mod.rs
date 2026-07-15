@@ -1070,7 +1070,14 @@ fn worker_profile_for_spawn(
     let mut requested = WorkerRuntimeProfile::for_role(agent_type.clone());
     requested.tools = worker_tool_scope(tool_profile);
     requested.model = model_route.unwrap_or_else(|| ModelRoute::Fixed(effective_model.to_string()));
-    requested.provider = Some(runtime.client.api_provider().as_str().to_string());
+    let provider = runtime.client.api_provider();
+    requested.provider = Some(
+        runtime
+            .api_config
+            .as_ref()
+            .map(|config| config.provider_identity_for(provider))
+            .unwrap_or_else(|| provider.as_str().to_string()),
+    );
     requested.max_spawn_depth = runtime.max_spawn_depth.saturating_sub(runtime.spawn_depth);
     requested.background = true;
     runtime.worker_profile.derive_child(&requested)
@@ -1770,7 +1777,10 @@ impl SubAgentRuntime {
     /// credentials/base URL cannot be resolved. Callers MUST surface that error
     /// rather than fall back to the session client: a silent fallback would send
     /// the pinned model id to the session provider's endpoint (#4093).
-    fn client_for_provider_id(&self, provider_id: &str) -> Result<DeepSeekClient, String> {
+    fn scoped_config_for_provider_id(
+        &self,
+        provider_id: &str,
+    ) -> Result<(crate::config::Config, crate::config::ProviderIdentity), String> {
         let Some(api_config) = self.api_config.as_ref() else {
             return Err(
                 "session Config was not threaded into this runtime; cannot build a \
@@ -1782,31 +1792,15 @@ impl SubAgentRuntime {
         if provider_id.is_empty() {
             return Err("provider pin was blank".to_string());
         }
-        let built_in = crate::config::ApiProvider::parse(provider_id);
-        let custom = built_in.is_none()
-            && api_config
-                .providers
-                .as_ref()
-                .and_then(|providers| providers.custom_provider_config(provider_id))
-                .is_some();
-        if built_in.is_none() && !custom {
-            return Err(format!(
-                "provider '{provider_id}' is neither a built-in provider nor a configured \
-                 [providers.{provider_id}] custom provider"
-            ));
-        }
+        let identity = api_config.resolve_provider_identity(provider_id)?;
         let mut provider_config = (**api_config).clone();
         // EPIC #2608: the provider is taken verbatim from the profile pin
         // (built-in id or configured custom id), never inferred from the model
         // id. Overriding only `provider` makes `Config::api_provider`,
         // `deepseek_base_url`, and `deepseek_api_key` all re-resolve for the
         // pinned provider.
-        provider_config.provider = Some(
-            built_in
-                .map(|provider| provider.as_str().to_string())
-                .unwrap_or_else(|| provider_id.to_string()),
-        );
-        DeepSeekClient::new(&provider_config).map_err(|err| err.to_string())
+        provider_config.provider = Some(identity.key.clone());
+        Ok((provider_config, identity))
     }
 
     /// Install the merged fleet roster (#fleet-roster cutover (v0.8.67)).
@@ -5035,6 +5029,18 @@ async fn wait_result_payload(
 fn provider_pin_matches_session(runtime: &SubAgentRuntime, provider_id: &str) -> bool {
     let provider_id = provider_id.trim();
     let session_provider = runtime.client.api_provider();
+    if let Some(config) = runtime.api_config.as_ref() {
+        let Ok(pinned) = config.resolve_provider_identity(provider_id) else {
+            return false;
+        };
+        let active_identity = config.provider_identity_for(session_provider);
+        if pinned.provider == crate::config::ApiProvider::Custom
+            || session_provider == crate::config::ApiProvider::Custom
+        {
+            return pinned.provider == session_provider && pinned.key == active_identity;
+        }
+        return pinned.provider == session_provider;
+    }
     if let Some(provider) = crate::config::ApiProvider::parse(provider_id) {
         return provider == session_provider;
     }
@@ -5045,6 +5051,51 @@ fn provider_pin_matches_session(runtime: &SubAgentRuntime, provider_id: &str) ->
             .and_then(|config| config.provider.as_deref())
             .map(str::trim)
             .is_some_and(|active| active == provider_id)
+}
+
+struct ChildProviderBinding {
+    client: DeepSeekClient,
+    api_config: Option<std::sync::Arc<crate::config::Config>>,
+}
+
+fn child_provider_binding(
+    runtime: &SubAgentRuntime,
+    member: Option<&crate::fleet::profile::AgentProfile>,
+) -> Result<ChildProviderBinding, ToolError> {
+    let session_provider = runtime.client.api_provider();
+    match crate::fleet::worker_runtime::explicit_fleet_provider_id(member) {
+        Some(pinned_id) if !provider_pin_matches_session(runtime, &pinned_id) => {
+            let (scoped_config, _) =
+                runtime
+                    .scoped_config_for_provider_id(&pinned_id)
+                    .map_err(|err| {
+                        ToolError::execution_failed(format!(
+                            "fleet profile pins provider '{}' but its client could not be built \
+                         ({err}). Configure that provider's credentials/base URL, or drop the \
+                         provider pin to inherit the session provider '{}'.",
+                            pinned_id,
+                            session_provider.as_str()
+                        ))
+                    })?;
+            let client = DeepSeekClient::new(&scoped_config).map_err(|err| {
+                ToolError::execution_failed(format!(
+                    "fleet profile pins provider '{}' but its client could not be built \
+                     ({err}). Configure that provider's credentials/base URL, or drop the \
+                     provider pin to inherit the session provider '{}'.",
+                    pinned_id,
+                    session_provider.as_str()
+                ))
+            })?;
+            Ok(ChildProviderBinding {
+                client,
+                api_config: Some(std::sync::Arc::new(scoped_config)),
+            })
+        }
+        _ => Ok(ChildProviderBinding {
+            client: runtime.client.clone(),
+            api_config: runtime.api_config.clone(),
+        }),
+    }
 }
 
 /// Resolve the LLM client a freshly spawned in-process child should run on,
@@ -5063,25 +5114,12 @@ fn provider_pin_matches_session(runtime: &SubAgentRuntime, provider_id: &str) ->
 /// to the session client (that silent fallback IS the #4093 misroute). The
 /// provider comes only from the explicit pin ([`explicit_fleet_provider`]),
 /// never inferred from the model id (EPIC #2608).
+#[cfg(test)]
 fn child_client_for_member(
     runtime: &SubAgentRuntime,
     member: Option<&crate::fleet::profile::AgentProfile>,
 ) -> Result<DeepSeekClient, ToolError> {
-    let session_provider = runtime.client.api_provider();
-    match crate::fleet::worker_runtime::explicit_fleet_provider_id(member) {
-        Some(pinned_id) if !provider_pin_matches_session(runtime, &pinned_id) => {
-            runtime.client_for_provider_id(&pinned_id).map_err(|err| {
-                ToolError::execution_failed(format!(
-                    "fleet profile pins provider '{}' but its client could not be built \
-                     ({err}). Configure that provider's credentials/base URL, or drop the \
-                     provider pin to inherit the session provider '{}'.",
-                    pinned_id,
-                    session_provider.as_str()
-                ))
-            })
-        }
-        _ => Ok(runtime.client.clone()),
-    }
+    child_provider_binding(runtime, member).map(|binding| binding.client)
 }
 
 async fn spawn_subagent_from_input(
@@ -5125,7 +5163,9 @@ async fn spawn_subagent_from_input(
     // `child_runtime.client.api_provider()`, so swapping the client here is what
     // actually routes the request to provider B's endpoint with B's creds —
     // rather than tagging `provider = B` on a client still pointed at A (#4093).
-    child_runtime.client = child_client_for_member(&runtime, profile_member.as_ref())?;
+    let provider_binding = child_provider_binding(&runtime, profile_member.as_ref())?;
+    child_runtime.client = provider_binding.client;
+    child_runtime.api_config = provider_binding.api_config;
     child_runtime.max_spawn_depth = child_max_spawn_depth_for_spawn(
         child_runtime.max_spawn_depth,
         child_runtime.spawn_depth,
@@ -5240,7 +5280,11 @@ async fn spawn_subagent_from_input(
         .map(|member| member.id.clone())
         .or_else(|| spawn_request.profile.clone());
     let spawn_metadata = WorkflowTaskSpawnMetadata {
-        resolved_provider: child_runtime.client.api_provider().as_str().to_string(),
+        resolved_provider: child_runtime
+            .api_config
+            .as_ref()
+            .map(|config| config.provider_identity_for(child_runtime.client.api_provider()))
+            .unwrap_or_else(|| child_runtime.client.api_provider().as_str().to_string()),
         resolved_model: effective_model.clone(),
         route_source: model_selection.source.as_str().to_string(),
         resolved_role,

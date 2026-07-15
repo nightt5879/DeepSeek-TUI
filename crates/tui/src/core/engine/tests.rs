@@ -19,6 +19,381 @@ use tempfile::tempdir;
 const WORKING_SET_SUMMARY_MARKER: &str = "## Repo Working Set";
 
 #[test]
+fn custom_route_identity_change_rebuilds_client_for_new_named_endpoint() {
+    let mut custom = HashMap::new();
+    for (name, base_url, model) in [
+        ("custom-a", "http://127.0.0.1:18181/v1", "model-a"),
+        ("custom-b", "http://127.0.0.1:18182/v1", "model-b"),
+    ] {
+        custom.insert(
+            name.to_string(),
+            crate::config::ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some(base_url.to_string()),
+                model: Some(model.to_string()),
+                api_key: Some("local-test-key".to_string()),
+                ..crate::config::ProviderConfig::default()
+            },
+        );
+    }
+    let config = Config {
+        provider: Some("custom-a".to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom,
+            ..crate::config::ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+    let (mut engine, _handle) = Engine::new(EngineConfig::default(), &config);
+    assert_eq!(engine.api_provider_identity, "custom-a");
+    assert_eq!(
+        engine
+            .deepseek_client
+            .as_ref()
+            .expect("custom A client")
+            .base_url(),
+        "http://127.0.0.1:18181/v1"
+    );
+
+    let mut target = config.clone();
+    target.provider = Some("custom-b".to_string());
+    let route = resolve_runtime_route(&target, ApiProvider::Custom, Some("model-b"))
+        .expect("resolve custom B")
+        .validate()
+        .expect("preflight custom B");
+    engine.install_validated_runtime_route(route);
+
+    assert_eq!(engine.api_provider_identity, "custom-b");
+    assert_eq!(
+        engine
+            .deepseek_client
+            .as_ref()
+            .expect("custom B client")
+            .base_url(),
+        "http://127.0.0.1:18182/v1"
+    );
+}
+
+#[test]
+fn custom_route_config_reload_rebuilds_client_when_identity_is_unchanged() {
+    let mut custom = HashMap::new();
+    custom.insert(
+        "lm-studio".to_string(),
+        crate::config::ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+            model: Some("local-model".to_string()),
+            api_key: Some("old-local-test-key".to_string()),
+            ..crate::config::ProviderConfig::default()
+        },
+    );
+    let config = Config {
+        provider: Some("lm-studio".to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom,
+            ..crate::config::ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+    let (mut engine, _handle) = Engine::new(EngineConfig::default(), &config);
+
+    let mut reloaded = config;
+    let provider = reloaded
+        .providers
+        .as_mut()
+        .and_then(|providers| providers.custom.get_mut("lm-studio"))
+        .expect("named custom provider");
+    provider.base_url = Some("http://127.0.0.1:18182/v1".to_string());
+    provider.api_key = Some("new-local-test-key".to_string());
+
+    let route = resolve_runtime_route(&reloaded, ApiProvider::Custom, Some("local-model"))
+        .expect("resolve reloaded route")
+        .validate()
+        .expect("preflight reloaded route");
+    engine.install_validated_runtime_route(route);
+
+    assert_eq!(engine.api_provider_identity, "lm-studio");
+    assert_eq!(
+        engine
+            .deepseek_client
+            .as_ref()
+            .expect("reloaded custom client")
+            .base_url(),
+        "http://127.0.0.1:18182/v1"
+    );
+    assert_eq!(
+        engine.api_config.deepseek_base_url(),
+        "http://127.0.0.1:18182/v1"
+    );
+}
+
+#[test]
+fn failed_same_identity_route_preflight_leaves_old_client_untouched() {
+    let mut custom = HashMap::new();
+    custom.insert(
+        "lm-studio".to_string(),
+        crate::config::ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+            model: Some("local-model".to_string()),
+            api_key: Some("old-local-test-key".to_string()),
+            ..crate::config::ProviderConfig::default()
+        },
+    );
+    let config = Config {
+        provider: Some("lm-studio".to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom,
+            ..crate::config::ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+    let (engine, _handle) = Engine::new(EngineConfig::default(), &config);
+    assert!(engine.deepseek_client.is_some());
+
+    let mut invalid = config;
+    invalid
+        .providers
+        .as_mut()
+        .and_then(|providers| providers.custom.get_mut("lm-studio"))
+        .expect("named custom provider")
+        .base_url = Some("ftp://invalid.example/v1".to_string());
+    let err = resolve_runtime_route(&invalid, ApiProvider::Custom, Some("local-model"))
+        .expect_err("invalid route must fail before installation");
+
+    assert!(err.contains("must be an http(s) URL with a host"), "{err}");
+    assert_eq!(engine.api_provider_identity, "lm-studio");
+    assert!(engine.deepseek_client.is_some());
+    assert!(engine.model_client.is_some());
+    assert!(engine.deepseek_client_error.is_none());
+}
+
+#[tokio::test]
+async fn exact_turn_snapshot_restores_custom_endpoint_and_turn_receipt_after_builtin_route() {
+    let mut custom = HashMap::new();
+    custom.insert(
+        "custom-a".to_string(),
+        crate::config::ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+            model: Some("local-model".to_string()),
+            api_key: Some("local-test-key".to_string()),
+            ..crate::config::ProviderConfig::default()
+        },
+    );
+    let config = Config {
+        provider: Some("custom-a".to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            openai: crate::config::ProviderConfig {
+                base_url: Some("http://127.0.0.1:18182/v1".to_string()),
+                model: Some("gpt-5.5".to_string()),
+                api_key: Some("builtin-test-key".to_string()),
+                ..crate::config::ProviderConfig::default()
+            },
+            custom,
+            ..crate::config::ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+    let engine_config = EngineConfig {
+        max_steps: 0,
+        snapshots_enabled: false,
+        ..EngineConfig::default()
+    };
+    let (mut engine, handle) = Engine::new(engine_config, &config);
+
+    let mut builtin_config = config.clone();
+    builtin_config.provider = Some("openai".to_string());
+    let builtin_route =
+        resolve_runtime_route(&builtin_config, ApiProvider::Openai, Some("gpt-5.5"))
+            .expect("resolve intervening builtin route")
+            .validate()
+            .expect("preflight intervening builtin route");
+    engine.install_validated_runtime_route(builtin_route);
+    assert_eq!(engine.api_provider, ApiProvider::Openai);
+    assert_eq!(
+        engine
+            .deepseek_client
+            .as_ref()
+            .expect("builtin client")
+            .base_url(),
+        "http://127.0.0.1:18182/v1"
+    );
+
+    let run_task = tokio::spawn(engine.run());
+    handle
+        .send(Op::SendMessage {
+            content: "verify exact route".to_string(),
+            mode: AppMode::Agent,
+            route: Box::new(
+                resolve_runtime_route(&config, ApiProvider::Custom, Some("local-model"))
+                    .expect("resolve exact custom route"),
+            ),
+            compaction: Box::new(CompactionConfig::default()),
+            goal_objective: None,
+            goal_token_budget: None,
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: true,
+            allow_shell: false,
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: crate::tui::approval::ApprovalMode::Suggest,
+            translation_enabled: false,
+            show_thinking: false,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+        })
+        .await
+        .expect("send exact custom turn");
+
+    let mut saw_exact_start = false;
+    let mut saw_exact_endpoint = false;
+    for _ in 0..20 {
+        let event = tokio::time::timeout(Duration::from_secs(2), async {
+            handle.rx_event.write().await.recv().await
+        })
+        .await
+        .expect("engine event timeout")
+        .expect("engine event");
+        match event {
+            Event::TurnStarted {
+                route: Some(route), ..
+            } => {
+                assert_eq!(route.provider, ApiProvider::Custom);
+                assert_eq!(route.provider_identity, "custom-a");
+                assert_eq!(route.model, "local-model");
+                saw_exact_start = true;
+            }
+            Event::TurnComplete { base_url, .. } => {
+                assert_eq!(base_url.as_deref(), Some("http://127.0.0.1:18181/v1"));
+                saw_exact_endpoint = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_exact_start);
+    assert!(saw_exact_endpoint);
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+}
+
+#[tokio::test]
+async fn goal_continuation_resolves_updated_authoritative_route_after_active_turn() {
+    let mut custom = HashMap::new();
+    custom.insert(
+        "custom-a".to_string(),
+        crate::config::ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+            model: Some("local-model".to_string()),
+            api_key: Some("local-test-key".to_string()),
+            ..crate::config::ProviderConfig::default()
+        },
+    );
+    let config = Config {
+        provider: Some("custom-a".to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom,
+            ..crate::config::ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+    let engine_config = EngineConfig {
+        max_steps: 0,
+        snapshots_enabled: false,
+        goal_objective: Some("keep going".to_string()),
+        ..EngineConfig::default()
+    };
+    let authoritative = Arc::new(parking_lot::RwLock::new(config.clone()));
+    let (mut engine, handle) = Engine::new(engine_config, &config);
+    engine.authoritative_route_config = Some(Arc::clone(&authoritative));
+
+    handle
+        .send(Op::SendMessage {
+            content: "first turn".to_string(),
+            mode: AppMode::Agent,
+            route: resolved_route_for_test(&config, "local-model"),
+            compaction: Box::new(CompactionConfig::default()),
+            goal_objective: Some("keep going".to_string()),
+            goal_token_budget: None,
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: false,
+            allow_shell: false,
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: crate::tui::approval::ApprovalMode::Suggest,
+            translation_enabled: false,
+            show_thinking: false,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+        })
+        .await
+        .expect("send first goal turn");
+
+    let mut reloaded = config;
+    reloaded
+        .providers
+        .as_mut()
+        .and_then(|providers| providers.custom.get_mut("custom-a"))
+        .expect("custom route")
+        .base_url = Some("http://127.0.0.1:18182/v1".to_string());
+    *authoritative.write() = reloaded;
+    let run_task = tokio::spawn(engine.run());
+
+    let mut starts = 0;
+    let mut completes = 0;
+    while completes < 2 {
+        let event = tokio::time::timeout(Duration::from_secs(3), async {
+            handle.rx_event.write().await.recv().await
+        })
+        .await
+        .expect("goal engine event timeout")
+        .expect("goal engine event");
+        match event {
+            Event::TurnStarted {
+                route: Some(route), ..
+            } => {
+                starts += 1;
+                assert_eq!(route.provider_identity, "custom-a");
+                if starts == 2 {
+                    handle
+                        .send(Op::SetGoalStatus {
+                            status: crate::tools::goal::GoalStatus::Paused,
+                            clear: false,
+                        })
+                        .await
+                        .expect("queue goal pause");
+                    handle.send(Op::Shutdown).await.expect("queue shutdown");
+                }
+            }
+            Event::TurnComplete { base_url, .. } => {
+                completes += 1;
+                let expected = if completes == 1 {
+                    "http://127.0.0.1:18181/v1"
+                } else {
+                    "http://127.0.0.1:18182/v1"
+                };
+                assert_eq!(base_url.as_deref(), Some(expected));
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(starts, 2);
+    run_task.await.expect("engine task");
+}
+
+#[test]
 fn idle_and_in_turn_subagent_delivery_claim_each_completion_once() {
     use crate::tools::subagent::SubAgentCompletion;
 
@@ -57,10 +432,12 @@ async fn idle_subagent_delivery_releases_claim_when_route_fails_before_recording
     };
     let (mut engine, _handle) =
         Engine::new(deterministic_engine_config(workspace.path()), &api_config);
-    // Keep the already-built provider client so route activation is a no-op,
-    // but force the pre-record client check to fail without any network call.
-    engine.model_client = None;
-    engine.deepseek_client_error = Some("forced missing model client".to_string());
+    // Make the persisted exact identity structurally unresolvable. The
+    // completion is claimed before route resolution, so this exercises the
+    // early error branch before a transcript record can be written.
+    engine.api_provider = ApiProvider::Custom;
+    engine.api_provider_identity = "missing-custom".to_string();
+    engine.api_provider_id = Some("missing-custom".to_string());
 
     engine
         .handle_idle_subagent_completion(SubAgentCompletion {
@@ -538,13 +915,21 @@ fn model_turn_event_timeout() -> Duration {
     }
 }
 
-fn external_user_message_op(content: &str, mode: AppMode) -> Op {
+fn resolved_route_for_test(
+    config: &Config,
+    model: &str,
+) -> Box<crate::route_runtime::ResolvedRuntimeRoute> {
+    Box::new(
+        resolve_runtime_route(config, config.api_provider(), Some(model))
+            .expect("resolve test route"),
+    )
+}
+
+fn external_user_message_op(content: &str, mode: AppMode, config: &Config) -> Op {
     Op::SendMessage {
         content: content.to_string(),
         mode,
-        provider: None,
-        model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
-        route_limits: None,
+        route: resolved_route_for_test(config, crate::config::DEFAULT_TEXT_MODEL),
         compaction: Box::new(CompactionConfig::default()),
         goal_objective: None,
         goal_token_budget: None,
@@ -644,6 +1029,7 @@ async fn injected_model_drives_real_engine_navigation_trajectory() {
         .send(external_user_message_op(
             "Read README.md and report what it contains.",
             AppMode::Agent,
+            &Config::default(),
         ))
         .await
         .expect("send deterministic navigation turn");
@@ -706,6 +1092,7 @@ async fn injected_model_receives_malformed_tool_feedback_and_recovers() {
         .send(external_user_message_op(
             "Exercise malformed tool feedback.",
             AppMode::Agent,
+            &Config::default(),
         ))
         .await
         .expect("send malformed trajectory");
@@ -766,6 +1153,7 @@ async fn engine_cancellation_drops_active_injected_model_request() {
         .send(external_user_message_op(
             "Block until explicitly cancelled.",
             AppMode::Agent,
+            &Config::default(),
         ))
         .await
         .expect("send cancellation trajectory");
@@ -837,6 +1225,7 @@ async fn operate_conversation_reaches_provider_when_workers_are_disabled() {
         .send(external_user_message_op(
             "what is a Rust worktree?",
             AppMode::Operate,
+            &api_config,
         ))
         .await
         .expect("send Operate turn");
@@ -3187,9 +3576,7 @@ async fn yolo_mode_does_not_prompt_for_model_driven_typed_ask_rule() {
         .send(Op::SendMessage {
             content: "please exercise the shell path".to_string(),
             mode: AppMode::Yolo,
-            provider: None,
-            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
-            route_limits: None,
+            route: resolved_route_for_test(&api_config, crate::config::DEFAULT_TEXT_MODEL),
             compaction: Box::new(CompactionConfig::default()),
             goal_objective: None,
             goal_token_budget: None,
@@ -3315,9 +3702,7 @@ async fn yolo_mode_still_prompts_for_background_destructive_shell() {
         .send(Op::SendMessage {
             content: "please run a background shell".to_string(),
             mode: AppMode::Yolo,
-            provider: None,
-            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
-            route_limits: None,
+            route: resolved_route_for_test(&api_config, crate::config::DEFAULT_TEXT_MODEL),
             compaction: Box::new(CompactionConfig::default()),
             goal_objective: None,
             goal_token_budget: None,
@@ -3471,9 +3856,7 @@ async fn yolo_mode_does_not_prompt_for_background_shell() {
         .send(Op::SendMessage {
             content: "please run a background shell".to_string(),
             mode: AppMode::Yolo,
-            provider: None,
-            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
-            route_limits: None,
+            route: resolved_route_for_test(&api_config, crate::config::DEFAULT_TEXT_MODEL),
             compaction: Box::new(CompactionConfig::default()),
             goal_objective: None,
             goal_token_budget: None,
@@ -3607,9 +3990,7 @@ async fn yolo_mode_prompts_for_publish_like_shell_safety_floor() {
         .send(Op::SendMessage {
             content: "please publish this crate".to_string(),
             mode: AppMode::Yolo,
-            provider: None,
-            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
-            route_limits: None,
+            route: resolved_route_for_test(&api_config, crate::config::DEFAULT_TEXT_MODEL),
             compaction: Box::new(CompactionConfig::default()),
             goal_objective: None,
             goal_token_budget: None,
@@ -3761,9 +4142,7 @@ async fn yolo_mode_does_not_prompt_for_mcp_action() {
         .send(Op::SendMessage {
             content: "please open the PR".to_string(),
             mode: AppMode::Yolo,
-            provider: None,
-            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
-            route_limits: None,
+            route: resolved_route_for_test(&api_config, crate::config::DEFAULT_TEXT_MODEL),
             compaction: Box::new(CompactionConfig::default()),
             goal_objective: None,
             goal_token_budget: None,
@@ -4931,6 +5310,40 @@ async fn sync_session_restores_current_mode() {
 
     assert_eq!(snapshot.mode, "plan");
 
+    run.abort();
+}
+
+#[tokio::test]
+async fn session_snapshot_omits_id_for_legacy_root_custom_route() {
+    let tmp = tempdir().expect("tempdir");
+    let api_config = Config {
+        provider: Some("custom".to_string()),
+        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
+        default_text_model: Some("legacy-root-model".to_string()),
+        ..Config::default()
+    };
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        model: "legacy-root-model".to_string(),
+        ..Default::default()
+    };
+    let (engine, handle) = Engine::new(config, &api_config);
+
+    let run = tokio::spawn(engine.run());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    handle
+        .send(Op::GetSessionSnapshot {
+            tx: std::sync::Arc::new(std::sync::Mutex::new(Some(tx))),
+        })
+        .await
+        .expect("request snapshot");
+    let snapshot = tokio::time::timeout(Duration::from_secs(2), rx)
+        .await
+        .expect("snapshot response")
+        .expect("snapshot");
+
+    assert_eq!(snapshot.model_provider, "custom");
+    assert_eq!(snapshot.model_provider_id, None);
     run.abort();
 }
 
@@ -7568,6 +7981,7 @@ fn engine_handle_try_send_does_not_block_when_op_channel_is_full() {
         tx_user_input: mpsc::channel(1).0,
         tx_steer: mpsc::channel(1).0,
         shared_paused: Arc::new(StdMutex::new(false)),
+        client_preflight_required: true,
     };
 
     // Fill the op channel with one message (capacity = 1).

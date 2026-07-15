@@ -970,6 +970,7 @@ mod tests {
         });
         app.push_turn_cache_record(TurnCacheRecord {
             provider: None,
+            provider_identity: None,
             model: None,
             auto_model: false,
             input_tokens: 100,
@@ -1234,6 +1235,7 @@ mod tests {
         app.model = "deepseek-v4-pro".to_string();
         app.push_turn_cache_record(TurnCacheRecord {
             provider: None,
+            provider_identity: None,
             model: None,
             auto_model: false,
             input_tokens: 100,
@@ -1258,6 +1260,7 @@ mod tests {
         app.model = "deepseek-v4-pro".to_string();
         app.push_turn_cache_record(TurnCacheRecord {
             provider: None,
+            provider_identity: None,
             model: None,
             auto_model: false,
             input_tokens: 100,

@@ -64,20 +64,21 @@ pub(crate) fn route_identity_for_model(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .or_else(|| {
-            matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
-                .then(|| config.base_url.as_deref())
-                .flatten()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
+            (matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
+                || (provider == ApiProvider::Custom && config.uses_legacy_literal_custom_route()))
+            .then_some(config.base_url.as_deref())
+            .flatten()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
         })
         .unwrap_or_else(|| provider.default_base_url())
         .trim_end_matches('/')
-        .to_ascii_lowercase();
+        .to_string();
     ProviderRouteIdentity {
         provider,
-        provider_id: provider_id.to_ascii_lowercase(),
+        provider_id: provider_id.to_string(),
         endpoint,
-        model: model.trim().to_ascii_lowercase(),
+        model: model.trim().to_string(),
         auth_class: auth_class_for_provider(config, provider),
     }
 }
@@ -132,6 +133,20 @@ pub(crate) fn credential_state_for_provider(
         return CredentialState::Legacy;
     }
     if provider == ApiProvider::Custom {
+        if config.uses_legacy_literal_custom_route() {
+            if config
+                .base_url
+                .as_deref()
+                .is_some_and(crate::config::base_url_uses_local_host)
+            {
+                return CredentialState::Local;
+            }
+            return if crate::config::has_api_key_for(config, provider) {
+                CredentialState::Saved
+            } else {
+                CredentialState::MissingKey
+            };
+        }
         let Some(configured) = config.provider_config_for(provider) else {
             return CredentialState::MissingKey;
         };
@@ -280,6 +295,13 @@ pub(crate) fn route_is_valid_for_model(
         saved_provider_model: None,
         base_url_override: if provider == ApiProvider::DeepseekCN {
             None
+        } else if provider == ApiProvider::Custom && config.uses_legacy_literal_custom_route() {
+            config
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
         } else {
             configured
                 .and_then(|entry| entry.base_url.as_deref())
@@ -543,6 +565,62 @@ mod tests {
         assert_eq!(
             credential_state_for_provider(&configured, ApiProvider::DeepseekCN),
             CredentialState::Saved
+        );
+    }
+
+    #[test]
+    fn custom_readiness_identity_preserves_case_sensitive_route_parts() {
+        let custom = std::collections::HashMap::from([
+            (
+                "CUSTOM".to_string(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some("https://example.test/TenantA/v1".to_string()),
+                    model: Some("Vendor/ModelA".to_string()),
+                    api_key: Some("test-key-a".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "custom".to_string(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some("https://example.test/tenanta/v1".to_string()),
+                    model: Some("vendor/modela".to_string()),
+                    api_key: Some("test-key-b".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let upper = crate::config::Config {
+            provider: Some("CUSTOM".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom: custom.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let lower = crate::config::Config {
+            provider: Some("custom".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let upper_identity = route_identity_for_model(&upper, ApiProvider::Custom, "Vendor/ModelA");
+        let lower_identity = route_identity_for_model(&lower, ApiProvider::Custom, "vendor/modela");
+
+        assert_ne!(upper_identity, lower_identity);
+        assert_eq!(upper_identity.provider_id, "CUSTOM");
+        assert_eq!(upper_identity.endpoint, "https://example.test/TenantA/v1");
+        assert_eq!(upper_identity.model, "Vendor/ModelA");
+
+        let mut checks = ProviderReadinessSnapshot::default();
+        checks.record_success(&upper, ApiProvider::Custom, "Vendor/ModelA");
+        assert_eq!(
+            resolve_for_model(&lower, ApiProvider::Custom, "vendor/modela", &checks),
+            ResolvedProviderReadiness::SavedUnchecked
         );
     }
 

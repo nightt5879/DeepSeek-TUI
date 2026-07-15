@@ -41,7 +41,11 @@ use crate::models::{
 use crate::prompts;
 use crate::purge::{emit_purge_completed, emit_purge_failed, emit_purge_started, run_purge};
 use crate::resource_telemetry::ResourceTelemetry;
+#[cfg(test)]
 use crate::route_runtime::resolve_runtime_route;
+use crate::route_runtime::{
+    ResolvedRuntimeRoute, ValidatedRuntimeRoute, resolve_runtime_route_for_identity,
+};
 use crate::seam_manager::{SeamConfig, SeamManager};
 use crate::tools::goal::{GoalSnapshot, GoalStatus, SharedGoalState, new_shared_goal_state};
 use crate::tools::plan::{PlanSnapshot, SharedPlanState, new_shared_plan_state};
@@ -579,6 +583,10 @@ pub struct EngineHandle {
     tx_steer: mpsc::Sender<String>,
     /// Shared pause flag set by the TUI and read by the turn loop.
     shared_paused: Arc<StdMutex<bool>>,
+    /// Whether the host must construct the route's concrete provider client
+    /// before it mutates turn state. Real engines own concrete provider I/O;
+    /// explicit injected/mock engines own that seam themselves.
+    client_preflight_required: bool,
 }
 
 // `impl EngineHandle { ... }` moved to `engine/handle.rs` so the
@@ -590,11 +598,19 @@ pub struct EngineHandle {
 pub struct Engine {
     config: EngineConfig,
     api_config: Config,
+    /// Runtime-host authority consulted only when constructing a later turn
+    /// descriptor (goal continuation, idle child completion, `/edit`). Active
+    /// turns keep their already-installed immutable descriptor.
+    authoritative_route_config: Option<Arc<parking_lot::RwLock<Config>>>,
     deepseek_client: Option<DeepSeekClient>,
     /// Provider-neutral client used by the canonical main turn loop. Concrete
     /// clients remain temporarily available to provider-specific helper tools
     /// while those boundaries migrate independently.
     model_client: Option<SharedModelClient>,
+    /// Test/embedding seam: an explicitly injected provider-neutral client
+    /// remains the I/O authority while typed routes still validate receipts,
+    /// endpoint metadata, and budgets.
+    model_client_injected: bool,
     deepseek_client_error: Option<String>,
     api_key_env_only_recovery: Option<String>,
     session: Session,
@@ -602,6 +618,12 @@ pub struct Engine {
     shell_manager: SharedShellManager,
     mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
     api_provider: ApiProvider,
+    /// Exact configured route key. Named custom providers share the `Custom`
+    /// enum, so the enum alone cannot prove that the active client is current.
+    api_provider_identity: String,
+    /// Additive exact provider id. `None` preserves the legacy root-literal
+    /// custom route across snapshots and config reloads.
+    api_provider_id: Option<String>,
     active_route_limits: Option<codewhale_config::route::RouteLimits>,
     rx_op: mpsc::Receiver<Op>,
     /// Clone of the op-channel sender, so the engine can self-dispatch ops
@@ -835,49 +857,101 @@ impl Engine {
         format!("{message}\n\n{hint}")
     }
 
-    fn activate_runtime_route(&mut self, provider: ApiProvider, model: &str) -> Result<(), String> {
-        if self.api_provider == provider
-            && self
-                .deepseek_client
-                .as_ref()
-                .is_some_and(|client| client.api_provider() == provider)
-        {
+    /// Install a route that the host already resolved and client-preflighted.
+    /// No identity guessing or config re-resolution is allowed at this
+    /// boundary: the descriptor is the single authority for the turn.
+    fn install_validated_runtime_route(&mut self, route: ValidatedRuntimeRoute) {
+        let provider = route.identity.provider;
+        let identity = route.identity.key;
+        let provider_id = route.identity.exact_id;
+        let model = route.model;
+        let limits = crate::route_budget::known_route_limits(route.candidate.limits);
+        let api_config = *route.config;
+        let client = route.client;
+
+        self.api_provider = provider;
+        self.api_provider_identity = identity;
+        self.api_provider_id = provider_id;
+        self.api_config = api_config;
+        self.active_route_limits = limits;
+        self.api_key_env_only_recovery = Self::env_only_api_key_recovery_hint(&self.api_config);
+        self.deepseek_client = Some(client.clone());
+        if !self.model_client_injected {
+            self.model_client = Some(Arc::new(client.clone()));
+        }
+        self.deepseek_client_error = None;
+        self.session.model = model;
+        self.config.model.clone_from(&self.session.model);
+        self.seam_manager = self
+            .seam_manager
+            .as_ref()
+            .filter(|manager| manager.config().enabled)
+            .map(|manager| SeamManager::new(client, manager.config().clone()));
+    }
+
+    /// Activate a structurally resolved route at the engine boundary. Normal
+    /// engines construct the concrete client before any turn state changes.
+    /// Embedders/tests that explicitly injected a provider-neutral client keep
+    /// that client as the I/O authority while still installing the exact route
+    /// identity, model, config, and budget receipt.
+    fn install_resolved_runtime_route(
+        &mut self,
+        mut route: ResolvedRuntimeRoute,
+    ) -> Result<(), String> {
+        if !self.model_client_injected {
+            self.install_validated_runtime_route(route.validate()?);
             return Ok(());
         }
 
-        let route =
-            resolve_runtime_route(&self.api_config, provider, Some(model)).map_err(|reason| {
-                format!(
-                    "Failed to resolve provider route {} / {}: {reason}",
-                    provider.as_str(),
-                    model
-                )
-            })?;
-        let route_config = route.config;
-        match DeepSeekClient::from_candidate(&route_config, &route.candidate) {
+        let preflighted_client = route.take_preflighted_client();
+        let provider = route.identity.provider;
+        let identity = route.identity.key;
+        let provider_id = route.identity.exact_id;
+        let model = route.model;
+        let limits = crate::route_budget::known_route_limits(route.candidate.limits);
+        let api_config = route.config;
+        let concrete_client = preflighted_client
+            .map(Ok)
+            .unwrap_or_else(|| DeepSeekClient::from_candidate(&api_config, &route.candidate));
+
+        self.api_provider = provider;
+        self.api_provider_identity = identity;
+        self.api_provider_id = provider_id;
+        self.api_config = api_config;
+        self.active_route_limits = limits;
+        self.api_key_env_only_recovery = Self::env_only_api_key_recovery_hint(&self.api_config);
+        match concrete_client {
             Ok(client) => {
-                self.api_provider = provider;
-                self.api_config = route_config;
-                self.active_route_limits =
-                    crate::route_budget::known_route_limits(route.candidate.limits);
-                self.api_key_env_only_recovery =
-                    Self::env_only_api_key_recovery_hint(&self.api_config);
                 self.deepseek_client = Some(client.clone());
-                self.model_client = Some(Arc::new(client.clone()));
                 self.deepseek_client_error = None;
                 self.seam_manager = self
                     .seam_manager
                     .as_ref()
                     .filter(|manager| manager.config().enabled)
                     .map(|manager| SeamManager::new(client, manager.config().clone()));
-                Ok(())
             }
-            Err(err) => Err(format!(
-                "Failed to configure provider route {} / {}: {err}",
-                provider.as_str(),
-                model
-            )),
+            Err(err) => {
+                self.deepseek_client = None;
+                self.deepseek_client_error = Some(err.to_string());
+                self.seam_manager = None;
+            }
         }
+        self.session.model = model;
+        self.config.model.clone_from(&self.session.model);
+        Ok(())
+    }
+
+    fn current_runtime_route(&self) -> Result<ResolvedRuntimeRoute, String> {
+        let config = self
+            .authoritative_route_config
+            .as_ref()
+            .map(|config| config.read().clone())
+            .unwrap_or_else(|| self.api_config.clone());
+        let identity = config.resolve_persisted_provider_identity(
+            Some(self.api_provider.as_str()),
+            self.api_provider_id.as_deref(),
+        )?;
+        resolve_runtime_route_for_identity(&config, &identity, Some(&self.session.model))
     }
 
     /// Create a new engine with the given configuration
@@ -914,6 +988,16 @@ impl Engine {
             .as_ref()
             .map(|client| Arc::new(client.clone()) as SharedModelClient);
         let api_provider = api_config.api_provider();
+        let (api_provider_identity, api_provider_id) = api_config
+            .active_provider_identity(api_provider)
+            .map(|identity| (identity.key, identity.exact_id))
+            .unwrap_or_else(|_| {
+                let key = api_config.provider_identity_for(api_provider);
+                let exact_id = (!(api_provider == ApiProvider::Custom
+                    && api_config.uses_legacy_literal_custom_route()))
+                .then(|| key.clone());
+                (key, exact_id)
+            });
         let api_key_env_only_recovery = Self::env_only_api_key_recovery_hint(api_config);
 
         let mut session = Session::new(
@@ -1052,8 +1136,10 @@ impl Engine {
         let engine = Engine {
             config,
             api_config: api_config.clone(),
+            authoritative_route_config: None,
             deepseek_client,
             model_client,
+            model_client_injected: false,
             deepseek_client_error,
             api_key_env_only_recovery,
             session,
@@ -1061,6 +1147,8 @@ impl Engine {
             shell_manager,
             mcp_pool: None,
             api_provider,
+            api_provider_identity,
+            api_provider_id,
             active_route_limits,
             rx_op,
             tx_op: tx_op.clone(),
@@ -1095,6 +1183,7 @@ impl Engine {
             tx_user_input,
             tx_steer,
             shared_paused,
+            client_preflight_required: true,
         };
 
         (engine, handle)
@@ -1110,9 +1199,11 @@ impl Engine {
         api_config: &Config,
         client: SharedModelClient,
     ) -> (Self, EngineHandle) {
-        let (mut engine, handle) = Self::new(config, api_config);
+        let (mut engine, mut handle) = Self::new(config, api_config);
         engine.model_client = Some(client);
+        engine.model_client_injected = true;
         engine.deepseek_client_error = None;
+        handle.client_preflight_required = false;
         (engine, handle)
     }
 
@@ -1433,9 +1524,7 @@ impl Engine {
                     Op::SendMessage {
                         content,
                         mode,
-                        provider,
-                        model,
-                        route_limits,
+                        route,
                         compaction,
                         goal_objective,
                         goal_token_budget,
@@ -1458,9 +1547,7 @@ impl Engine {
                         self.handle_send_message(
                             content,
                             mode,
-                            provider,
-                            model,
-                            route_limits,
+                            *route,
                             *compaction,
                             goal_objective,
                             goal_token_budget,
@@ -1849,7 +1936,17 @@ impl Engine {
                             .send(Event::status("Session context synced".to_string()))
                             .await;
                     }
-                    Op::CompactContext => {
+                    Op::CompactContext { route, compaction } => {
+                        if let Err(err) = self.install_resolved_runtime_route(*route) {
+                            let _ = self
+                                .tx_event
+                                .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                                    "Cannot compact context because its provider route is not ready: {err}"
+                                ))))
+                                .await;
+                            continue;
+                        }
+                        self.config.compaction = *compaction;
                         self.handle_manual_compaction().await;
                     }
                     Op::GetSessionSnapshot { tx } => {
@@ -1859,9 +1956,8 @@ impl Engine {
                             messages: self.session.messages.to_vec(),
                             total_tokens,
                             model: self.session.model.clone(),
-                            model_provider: self
-                                .api_config
-                                .provider_identity_for(self.api_provider),
+                            model_provider: self.api_provider.as_str().to_string(),
+                            model_provider_id: self.api_provider_id.clone(),
                             workspace: self.session.workspace.clone(),
                             system_prompt: self.session.system_prompt.clone(),
                             mode: self.current_mode.as_setting().to_string(),
@@ -1896,6 +1992,18 @@ impl Engine {
                         self.handle_purge().await;
                     }
                     Op::EditLastTurn { new_message } => {
+                        let route = match self.current_runtime_route() {
+                            Ok(route) => route,
+                            Err(err) => {
+                                let _ = self
+                                    .tx_event
+                                    .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                                        "Cannot edit the last turn because its provider route is no longer valid: {err}"
+                                    ))))
+                                    .await;
+                                continue;
+                            }
+                        };
                         // #383: /edit — remove the last user+assistant exchange
                         // from the session, then re-send with the new content.
                         // Pop messages from the tail until we've removed the
@@ -1918,9 +2026,7 @@ impl Engine {
                         self.handle_send_message(
                             new_message,
                             mode,
-                            Some(self.api_provider),
-                            self.session.model.clone(),
-                            self.active_route_limits,
+                            route,
                             self.config.compaction.clone(),
                             self.config.goal_objective.clone(),
                             self.config.goal_token_budget,
@@ -2274,11 +2380,27 @@ impl Engine {
             return;
         }
 
-        let count = completions.len();
         let claimed_ids = completions
             .iter()
             .map(|completion| completion.agent_id.clone())
             .collect::<Vec<_>>();
+        let route = match self.current_runtime_route() {
+            Ok(route) => route,
+            Err(err) => {
+                for agent_id in claimed_ids {
+                    self.delivered_subagent_completion_ids.remove(&agent_id);
+                }
+                let _ = self
+                    .tx_event
+                    .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                        "Cannot resume the turn because its provider route is no longer valid: {err}"
+                    ))))
+                    .await;
+                return;
+            }
+        };
+
+        let count = completions.len();
         let content = completions
             .iter()
             .map(|completion| turn_loop::subagent_completion_runtime_text(&completion.payload))
@@ -2296,9 +2418,7 @@ impl Engine {
             .handle_send_message(
                 content,
                 self.current_mode,
-                Some(self.api_provider),
-                self.session.model.clone(),
-                self.active_route_limits,
+                route,
                 self.config.compaction.clone(),
                 self.config.goal_objective.clone(),
                 self.config.goal_token_budget,
@@ -2424,9 +2544,7 @@ impl Engine {
         &mut self,
         content: String,
         mode: AppMode,
-        provider: Option<ApiProvider>,
-        model: String,
-        route_limits: Option<codewhale_config::route::RouteLimits>,
+        route: ResolvedRuntimeRoute,
         compaction: CompactionConfig,
         goal_objective: Option<String>,
         goal_token_budget: Option<u32>,
@@ -2446,6 +2564,20 @@ impl Engine {
         verbosity: Option<String>,
         provenance: UserInputProvenance,
     ) -> bool {
+        let effective_provider = route.identity.provider;
+        let provider_identity = route.identity.key.clone();
+        let model = route.model.clone();
+        let route_limits = crate::route_budget::known_route_limits(route.candidate.limits);
+        if let Err(err) = self.install_resolved_runtime_route(route) {
+            let _ = self
+                .tx_event
+                .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                    "Cannot start the turn because its provider route is not ready: {err}"
+                ))))
+                .await;
+            return false;
+        }
+
         let input_policy = effective_input_policy(
             provenance,
             mode,
@@ -2473,7 +2605,8 @@ impl Engine {
         let mut turn = TurnContext::new(self.config.max_steps);
         self.turn_counter = self.turn_counter.saturating_add(1);
         let turn_route = TurnRoute {
-            provider: provider.unwrap_or(self.api_provider),
+            provider: effective_provider,
+            provider_identity,
             model: model.clone(),
             auto_model,
         };
@@ -2524,28 +2657,6 @@ impl Engine {
         // Clone user prompt for post-turn snapshot label before `content`
         // is moved into `user_text_message_with_turn_metadata_for_route` below.
         let snapshot_prompt_post = content.clone();
-
-        // Check if we have the appropriate client
-        if let Some(provider) = provider
-            && let Err(message) = self.activate_runtime_route(provider, &model)
-        {
-            self.deepseek_client_error = Some(message.clone());
-            let _ = self
-                .tx_event
-                .send(Event::error(ErrorEnvelope::fatal_auth(message.clone())))
-                .await;
-            let _ = self
-                .tx_event
-                .send(Event::TurnComplete {
-                    usage: turn.usage.clone(),
-                    status: TurnOutcomeStatus::Failed,
-                    error: Some(message),
-                    tool_catalog: None,
-                    base_url: None,
-                })
-                .await;
-            return false;
-        }
 
         if self.model_client.is_none() {
             let message = self
@@ -2908,34 +3019,44 @@ impl Engine {
             // the prior turn. The non-Copy values were moved into
             // `self.config` / `self.session` earlier in this function, so
             // we clone them back out here.
-            let _ = self
-                .tx_op
-                .send(Op::SendMessage {
-                    content: continuation,
-                    mode,
-                    provider,
-                    model: self.session.model.clone(),
-                    route_limits: self.active_route_limits,
-                    compaction: Box::new(self.config.compaction.clone()),
-                    goal_objective: None,
-                    goal_token_budget: None,
-                    goal_status: GoalStatus::Active,
-                    reasoning_effort: self.session.reasoning_effort.clone(),
-                    reasoning_effort_auto,
-                    auto_model,
-                    allow_shell,
-                    trust_mode,
-                    auto_approve,
-                    approval_mode,
-                    translation_enabled,
-                    show_thinking,
-                    allowed_tools: self.config.allowed_tools.clone(),
-                    dynamic_tools: dynamic_tools.clone(),
-                    hook_executor: self.config.hook_executor.clone(),
-                    verbosity: self.config.verbosity.clone(),
-                    provenance: UserInputProvenance::Runtime,
-                })
-                .await;
+            match self.current_runtime_route() {
+                Ok(route) => {
+                    let _ = self
+                        .tx_op
+                        .send(Op::SendMessage {
+                            content: continuation,
+                            mode,
+                            route: Box::new(route),
+                            compaction: Box::new(self.config.compaction.clone()),
+                            goal_objective: None,
+                            goal_token_budget: None,
+                            goal_status: GoalStatus::Active,
+                            reasoning_effort: self.session.reasoning_effort.clone(),
+                            reasoning_effort_auto,
+                            auto_model,
+                            allow_shell,
+                            trust_mode,
+                            auto_approve,
+                            approval_mode,
+                            translation_enabled,
+                            show_thinking,
+                            allowed_tools: self.config.allowed_tools.clone(),
+                            dynamic_tools: dynamic_tools.clone(),
+                            hook_executor: self.config.hook_executor.clone(),
+                            verbosity: self.config.verbosity.clone(),
+                            provenance: UserInputProvenance::Runtime,
+                        })
+                        .await;
+                }
+                Err(err) => {
+                    let _ = self
+                        .tx_event
+                        .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                            "Goal continuation stopped because its provider route is no longer valid: {err}"
+                        ))))
+                        .await;
+                }
+            }
         }
         true
     }
@@ -3959,6 +4080,27 @@ pub fn spawn_engine(config: EngineConfig, api_config: &Config) -> EngineHandle {
     handle
 }
 
+/// Spawn a runtime-owned engine whose autonomous later turns resolve against
+/// the manager's atomic config snapshot. This does not mutate an active turn.
+pub(crate) fn spawn_engine_with_authoritative_route_config(
+    config: EngineConfig,
+    api_config: &Config,
+    authoritative_route_config: Arc<parking_lot::RwLock<Config>>,
+) -> EngineHandle {
+    let (mut engine, handle) = Engine::new(config, api_config);
+    engine.authoritative_route_config = Some(authoritative_route_config);
+
+    spawn_supervised(
+        "engine-event-loop",
+        std::panic::Location::caller(),
+        async move {
+            engine.run().await;
+        },
+    );
+
+    handle
+}
+
 #[cfg(test)]
 pub(crate) struct MockEngineHandle {
     pub handle: EngineHandle,
@@ -4017,6 +4159,7 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
         tx_user_input,
         tx_steer,
         shared_paused,
+        client_preflight_required: false,
     };
 
     MockEngineHandle {

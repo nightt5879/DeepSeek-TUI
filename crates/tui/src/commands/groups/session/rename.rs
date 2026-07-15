@@ -90,7 +90,9 @@ pub(crate) fn rename_with_manager(
     session.context_references = app.session_context_references.clone();
     session.artifacts = app.session_artifacts.clone();
     session.metadata.model = app.model_selection_for_persistence();
-    session.metadata.model_provider = app.provider_identity_for_persistence().to_string();
+    session
+        .metadata
+        .set_model_provider_route(app.api_provider.as_str(), app.provider_id_for_persistence());
     session.metadata.workspace.clone_from(&app.workspace);
     session.metadata.mode = Some(app.mode.as_setting().to_string());
     app.sync_cost_to_metadata(&mut session.metadata);
@@ -222,7 +224,11 @@ mod tests {
         assert_eq!(reloaded.work_state, expected_work_state);
         assert!(reloaded.system_prompt.is_none());
         assert_eq!(reloaded.metadata.model, "local-code-model");
-        assert_eq!(reloaded.metadata.model_provider, "lm-studio");
+        assert_eq!(reloaded.metadata.model_provider, "custom");
+        assert_eq!(
+            reloaded.metadata.model_provider_id.as_deref(),
+            Some("lm-studio")
+        );
         assert_eq!(reloaded.metadata.workspace, app.workspace);
         assert_eq!(reloaded.metadata.mode.as_deref(), Some("operate"));
         assert_eq!(app.session_title.as_deref(), Some("Brand New Title"));

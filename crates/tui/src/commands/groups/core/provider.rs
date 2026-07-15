@@ -152,7 +152,10 @@ fn provider_fallback(app: &mut App, subcommand: Option<&str>) -> CommandResult {
             }
 
             let mut lines = vec![
-                format!("Current provider: {}", app.api_provider.as_str()),
+                format!(
+                    "Current provider: {}",
+                    app.provider_identity_for_persistence()
+                ),
                 "Fallback chain:".to_string(),
             ];
             for (index, provider, is_current) in entries {

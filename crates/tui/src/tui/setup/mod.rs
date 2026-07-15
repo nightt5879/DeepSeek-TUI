@@ -310,7 +310,11 @@ impl SetupRuntimeFacts {
                 crate::provider_readiness::ResolvedProviderReadiness::SavedLastCheckFailed { .. }
             );
         let model = app.model_display_label();
-        let provider = app.api_provider.display_name().to_string();
+        let provider = if app.api_provider == crate::config::ApiProvider::Custom {
+            app.provider_identity_for_persistence().to_string()
+        } else {
+            app.api_provider.display_name().to_string()
+        };
         let auth = readiness.label().into_owned();
         let health = if provider_ready {
             format!("{}; route can be attempted", readiness.label())
@@ -331,7 +335,7 @@ impl SetupRuntimeFacts {
         };
         let provider_result = format!(
             "provider={}, model={}, auth={}, health={}",
-            app.api_provider.as_str(),
+            app.provider_identity_for_persistence(),
             model,
             readiness.label(),
             if provider_ready {
@@ -4564,6 +4568,45 @@ mod tests {
             content.contains("`--apply` remains unimplemented"),
             "{content}"
         );
+    }
+
+    #[test]
+    fn remote_runtime_on_ramp_never_substitutes_deepseek_for_named_custom_route() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let codewhale_home = tmp.path().join(".codewhale");
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+        let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _codewhale_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+        let mut custom = std::collections::HashMap::new();
+        custom.insert(
+            "lm-studio".to_string(),
+            crate::config::ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some("http://127.0.0.1:1234/v1".to_string()),
+                model: Some("local-code-model".to_string()),
+                ..Default::default()
+            },
+        );
+        let config = Config {
+            provider: Some("lm-studio".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom,
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let app = App::new(setup_test_options(workspace), &config);
+        let facts = SetupRuntimeFacts::from_app_config(&app, &config);
+
+        let content = remote_runtime_on_ramp_text(Locale::En, &facts);
+
+        assert!(content.contains("active route lm-studio"), "{content}");
+        assert!(content.contains("--provider lm-studio"), "{content}");
+        assert!(!content.contains("--provider deepseek"), "{content}");
     }
 
     #[test]

@@ -703,10 +703,6 @@ fn apply_exec_provider_override(config: &mut Config, provider_arg: &str) -> Resu
     if provider_arg.is_empty() {
         return Ok(());
     }
-    if let Some(provider) = crate::config::ApiProvider::parse(provider_arg) {
-        config.provider = Some(provider.as_str().to_string());
-        return Ok(());
-    }
     if config
         .providers
         .as_ref()
@@ -714,6 +710,10 @@ fn apply_exec_provider_override(config: &mut Config, provider_arg: &str) -> Resu
         .is_some()
     {
         config.provider = Some(provider_arg.to_string());
+        return Ok(());
+    }
+    if let Some(provider) = crate::config::ApiProvider::parse(provider_arg) {
+        config.provider = Some(provider.as_str().to_string());
         return Ok(());
     }
     bail!(
@@ -754,6 +754,58 @@ fn resolve_exec_resume_session_id(args: &ExecArgs, workspace: &Path) -> Result<O
         },
         |id| Ok(Some(id)),
     )
+}
+
+fn load_exec_resume_session(session_id: &str) -> Result<session_manager::SavedSession> {
+    let session_ref = exec_stream_session_ref(session_id);
+    SessionManager::default_location()
+        .context("could not open session manager for resume")?
+        .load_session_by_prefix(session_id)
+        .with_context(|| format!("could not load session {session_ref}"))
+}
+
+/// Select the route for `exec --resume` before any engine/client is built.
+///
+/// Precedence is intentionally field-aware:
+/// - no explicit `--provider` or `--model`: restore the saved provider/model;
+/// - explicit `--provider`: keep that route and use its configured/default model
+///   unless `--model` is also present;
+/// - explicit `--model` alone: restore the saved provider, then use that model.
+fn resolve_exec_resume_route(
+    config: &mut Config,
+    saved: &session_manager::SavedSession,
+    explicit_provider: bool,
+    explicit_model: Option<&str>,
+) -> Result<String> {
+    if !explicit_provider {
+        let saved_provider_identity = saved
+            .metadata
+            .model_provider_id
+            .as_deref()
+            .filter(|identity| !identity.trim().is_empty())
+            .unwrap_or(&saved.metadata.model_provider);
+        let identity = config
+            .resolve_persisted_provider_identity(
+                Some(&saved.metadata.model_provider),
+                saved.metadata.model_provider_id.as_deref(),
+            )
+            .map_err(anyhow::Error::msg)
+            .with_context(|| {
+                format!(
+                    "saved session provider '{}' is unavailable; CodeWhale will not fall back",
+                    saved_provider_identity
+                )
+            })?;
+        config.scope_to_provider_identity(&identity);
+    }
+
+    if let Some(model) = explicit_model {
+        return Ok(resolve_exec_model(config, Some(model)));
+    }
+    if explicit_provider {
+        return Ok(resolve_exec_model(config, None));
+    }
+    Ok(saved.metadata.model.clone())
 }
 
 #[derive(Args, Debug, Clone, Default)]
@@ -1387,12 +1439,12 @@ async fn run_async_main() -> Result<()> {
                 // ignored by `deepseek_base_url()`. Must precede model
                 // resolution so an `auto`/default model resolves to the
                 // overridden provider's default.
-                if let Some(provider_arg) = args
+                let explicit_provider = args
                     .provider
                     .as_deref()
                     .map(str::trim)
-                    .filter(|p| !p.is_empty())
-                {
+                    .filter(|provider| !provider.is_empty());
+                if let Some(provider_arg) = explicit_provider {
                     apply_exec_provider_override(&mut config, provider_arg)?;
                 }
                 if let Some(reasoning_arg) = args
@@ -1403,9 +1455,32 @@ async fn run_async_main() -> Result<()> {
                 {
                     config.reasoning_effort = normalize_cli_reasoning_effort(reasoning_arg)?;
                 }
-                let model = resolve_exec_model(&config, args.model.as_deref());
                 let prompt = join_prompt_parts(&args.prompt);
                 let resume_session_id = resolve_exec_resume_session_id(&args, &workspace)?;
+                let resume_session = resume_session_id
+                    .as_deref()
+                    .map(load_exec_resume_session)
+                    .transpose()?;
+                let explicit_model = args
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty());
+                let model = if let Some(saved) = resume_session.as_ref() {
+                    resolve_exec_resume_route(
+                        &mut config,
+                        saved,
+                        explicit_provider.is_some(),
+                        explicit_model,
+                    )?
+                } else {
+                    resolve_exec_model(&config, explicit_model)
+                };
+                let force_configured_route = should_force_configured_exec_route(
+                    resume_session.is_some(),
+                    explicit_provider,
+                    explicit_model,
+                );
                 // The `deepseek` launcher forwards `--yolo` to this binary via
                 // the DEEPSEEK_YOLO env var (which the config loader folds into
                 // `config.yolo`), not as a CLI flag. Honour either source.
@@ -1447,7 +1522,8 @@ async fn run_async_main() -> Result<()> {
                         args.sandbox.as_deref(),
                         auto_mode,
                         args.json,
-                        resume_session_id,
+                        resume_session,
+                        force_configured_route,
                         args.output_format,
                         max_turns,
                         allowed_tools,
@@ -1456,9 +1532,9 @@ async fn run_async_main() -> Result<()> {
                     )
                     .await
                 } else if args.json {
-                    run_one_shot_json(&config, &model, &prompt).await
+                    run_one_shot_json(&config, &model, &prompt, force_configured_route).await
                 } else {
-                    run_one_shot(&config, &model, &prompt).await
+                    run_one_shot(&config, &model, &prompt, force_configured_route).await
                 }
             }
             Commands::Fleet(args) => {
@@ -1510,7 +1586,8 @@ async fn run_async_main() -> Result<()> {
                 if args.mcp {
                     tokio::task::block_in_place(|| mcp_server::run_mcp_server(workspace))
                 } else if http_selected {
-                    let config = load_config_from_cli(&cli)?;
+                    let (config, config_profile) =
+                        load_config_from_cli_with_effective_profile(&cli)?;
                     let cors_origins = resolve_cors_origins(&config, &args.cors_origin);
                     let bind_host = resolve_serve_bind_host(args.mobile, args.host);
                     if bind_host.mobile_rebound_to_lan {
@@ -1531,6 +1608,7 @@ async fn run_async_main() -> Result<()> {
                             mobile: args.mobile,
                             show_qr: args.qr,
                             config_path: cli.config.clone(),
+                            config_profile,
                         },
                     )
                     .await
@@ -1551,7 +1629,7 @@ async fn run_async_main() -> Result<()> {
             Commands::Fork { session_id, last } => {
                 let config = load_config_from_cli(&cli)?;
                 let workspace = resolve_workspace(&cli);
-                let new_session_id = fork_session(session_id, last, &workspace)?;
+                let new_session_id = fork_session(&config, session_id, last, &workspace)?;
                 run_interactive(&cli, &config, Some(new_session_id), None).await
             }
         };
@@ -1997,7 +2075,8 @@ async fn run_fleet_command(workspace: &Path, config: &Config, args: FleetArgs) -
     let manager = FleetManager::open(workspace)?
         .with_exec_config(fleet_config.exec.clone())
         .with_fleet_config(fleet_config)
-        .with_session_model(config.default_model());
+        .with_session_model(config.default_model())
+        .with_route_config(config.clone());
     match args.command {
         FleetCommand::Init => {
             println!("fleet ledger: {}", manager.ledger_path().display());
@@ -2573,13 +2652,15 @@ fn resolve_api_key_source(config: &Config) -> ApiKeySource {
         .provider_config()
         .and_then(|entry| entry.api_key.as_ref())
         .is_some_and(|k| !k.trim().is_empty());
-    let root_deepseek_key = matches!(
+    let root_deepseek_key = (matches!(
         provider,
         crate::config::ApiProvider::Deepseek | crate::config::ApiProvider::DeepseekCN
-    ) && config
-        .api_key
-        .as_ref()
-        .is_some_and(|k| !k.trim().is_empty());
+    ) || (provider == crate::config::ApiProvider::Custom
+        && config.uses_legacy_literal_custom_route()))
+        && config
+            .api_key
+            .as_ref()
+            .is_some_and(|k| !k.trim().is_empty());
 
     if provider_config_key || root_deepseek_key {
         ApiKeySource::Config
@@ -2591,11 +2672,22 @@ fn resolve_api_key_source(config: &Config) -> ApiKeySource {
             codewhale_config::AuthSourceKind::Command => ApiKeySource::Command,
             codewhale_config::AuthSourceKind::Secret => ApiKeySource::Secret,
         }
-    } else if provider_env_key_source(provider).is_some() {
+    } else if provider_env_key_source_for_config(config).is_some() {
         ApiKeySource::Env
     } else {
         ApiKeySource::Missing
     }
+}
+
+fn provider_env_key_source_for_config(config: &Config) -> Option<String> {
+    config
+        .provider_config()
+        .and_then(|entry| entry.api_key_env.as_deref())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .filter(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+        .map(str::to_string)
+        .or_else(|| provider_env_key_source(config.api_provider()).map(str::to_string))
 }
 
 fn provider_env_key_source(provider: crate::config::ApiProvider) -> Option<&'static str> {
@@ -2662,8 +2754,7 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
             "✓".truecolor(aqua_r, aqua_g, aqua_b)
         ),
         ApiKeySource::Env => {
-            let env_vars = provider_env_key_source(config.api_provider())
-                .map(str::to_string)
+            let env_vars = provider_env_key_source_for_config(config)
                 .unwrap_or_else(|| provider_env_vars_label(config.api_provider()));
             println!(
                 "  {} api_key: set via {env_vars}",
@@ -2684,11 +2775,30 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
         ),
         ApiKeySource::Missing => {
             let provider = config.api_provider();
-            let env_var = provider_env_vars_label(provider);
-            let login_hint = provider_auth_hint(provider);
-            let table_key = provider_config_table_key(provider);
+            let provider_identity = config.provider_identity_for(provider);
+            let env_var = config
+                .provider_config()
+                .and_then(|entry| entry.api_key_env.clone())
+                .unwrap_or_else(|| provider_env_vars_label(provider));
+            let login_hint = if provider == crate::config::ApiProvider::OpenaiCodex {
+                provider_auth_hint(provider)
+            } else {
+                format!("codewhale auth set --provider {provider_identity} --api-key \"...\"")
+            };
+            let config_location = if provider == crate::config::ApiProvider::Custom
+                && config.uses_legacy_literal_custom_route()
+            {
+                "root `api_key`".to_string()
+            } else if provider == crate::config::ApiProvider::Custom {
+                format!("`[providers.{provider_identity}].api_key`")
+            } else {
+                format!(
+                    "`[providers.{}].api_key`",
+                    provider_config_table_key(provider)
+                )
+            };
             println!(
-                "  {} api_key: missing  (set {env_var} or `[providers.{table_key}].api_key` in ~/.codewhale/config.toml; or run `{login_hint}`)",
+                "  {} api_key: missing  (set {env_var} or {config_location} in ~/.codewhale/config.toml; or run `{login_hint}`)",
                 "✗".truecolor(red_r, red_g, red_b),
             );
         }
@@ -4247,7 +4357,7 @@ fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_
     json!({
         "ready": has_credentials_or_local && runtime_ready && roster_ready,
         "provider": {
-            "id": provider.as_str(),
+            "id": config.provider_identity_for(provider),
             "auth": {
                 "present_or_local": has_credentials_or_local,
                 "source": doctor_api_key_source_label(resolve_api_key_source(config)),
@@ -4293,7 +4403,7 @@ fn doctor_provider_model_report_json(config: &Config) -> serde_json::Value {
 
     json!({
         "provider": {
-            "id": provider.as_str(),
+            "id": config.provider_identity_for(provider),
             "display": provider.display_name(),
         },
         "model": {
@@ -4767,7 +4877,7 @@ fn provider_capability_report(config: &Config) -> serde_json::Value {
     let alias_deprecation = config.active_deepseek_alias_deprecation();
 
     json!({
-        "resolved_provider": provider.as_str(),
+        "resolved_provider": config.provider_identity_for(provider),
         "resolved_model": cap.resolved_model,
         "context_window": cap.context_window,
         "max_output": cap.max_output,
@@ -4788,7 +4898,7 @@ fn doctor_route_report(config: &Config) -> serde_json::Value {
     json!({
         "provider": target.provider,
         "provider_source": doctor_provider_source(config),
-        "provider_config_table": provider_config_table_key(provider),
+        "provider_config_table": doctor_provider_config_table(config, provider),
         "model": target.model,
         "wire_protocol": doctor_wire_protocol(provider),
         "base_url": {
@@ -4801,6 +4911,17 @@ fn doctor_route_report(config: &Config) -> serde_json::Value {
             "source": doctor_api_key_source_label(resolve_api_key_source(config)),
         },
     })
+}
+
+fn doctor_provider_config_table(config: &Config, provider: crate::config::ApiProvider) -> String {
+    if provider != crate::config::ApiProvider::Custom {
+        return provider_config_table_key(provider).to_string();
+    }
+    if config.uses_legacy_literal_custom_route() {
+        "root (legacy literal custom)".to_string()
+    } else {
+        format!("providers.{}", config.provider_identity_for(provider))
+    }
 }
 
 fn doctor_provider_source(config: &Config) -> &'static str {
@@ -4928,7 +5049,7 @@ fn doctor_search_provider_json(config: &Config) -> serde_json::Value {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DoctorApiTarget {
-    provider: &'static str,
+    provider: String,
     base_url: String,
     model: String,
 }
@@ -4945,7 +5066,7 @@ struct DoctorStrictToolModeStatus {
 fn doctor_api_target(config: &Config) -> DoctorApiTarget {
     let provider = config.api_provider();
     DoctorApiTarget {
-        provider: provider.as_str(),
+        provider: config.provider_identity_for(provider),
         base_url: config.deepseek_base_url(),
         model: config.default_model(),
     }
@@ -4997,24 +5118,25 @@ fn doctor_strict_tool_mode_status(config: &Config) -> DoctorStrictToolModeStatus
 struct DoctorTlsStatus {
     certificate_verification: bool,
     insecure_skip_tls_verify: bool,
-    provider: &'static str,
+    provider: String,
     message: String,
 }
 
 fn doctor_tls_status(config: &Config) -> DoctorTlsStatus {
-    let provider = config.api_provider().as_str();
+    let provider = config.provider_identity_for(config.api_provider());
     let insecure_skip_tls_verify = config.insecure_skip_tls_verify();
+    let message = if insecure_skip_tls_verify {
+        format!(
+            "TLS certificate verification cannot be disabled for provider {provider}; use SSL_CERT_FILE with a trusted custom CA bundle"
+        )
+    } else {
+        "TLS certificate verification enabled".to_string()
+    };
     DoctorTlsStatus {
         certificate_verification: true,
         insecure_skip_tls_verify,
         provider,
-        message: if insecure_skip_tls_verify {
-            format!(
-                "TLS certificate verification cannot be disabled for provider {provider}; use SSL_CERT_FILE with a trusted custom CA bundle"
-            )
-        } else {
-            "TLS certificate verification enabled".to_string()
-        },
+        message,
     }
 }
 
@@ -5497,13 +5619,20 @@ fn resolve_workspace(cli: &Cli) -> PathBuf {
 }
 
 fn load_config_from_cli(cli: &Cli) -> Result<Config> {
-    let profile = cli
-        .profile
+    load_config_from_cli_with_effective_profile(cli).map(|(config, _)| config)
+}
+
+fn effective_config_profile(cli: &Cli) -> Option<String> {
+    cli.profile
         .clone()
-        .or_else(|| std::env::var("DEEPSEEK_PROFILE").ok());
+        .or_else(|| std::env::var("DEEPSEEK_PROFILE").ok())
+}
+
+fn load_config_from_cli_with_effective_profile(cli: &Cli) -> Result<(Config, Option<String>)> {
+    let profile = effective_config_profile(cli);
     let mut config = Config::load(cli.config.clone(), profile.as_deref())?;
     cli.feature_toggles.apply(&mut config)?;
-    Ok(config)
+    Ok((config, profile))
 }
 
 fn read_api_key_from_stdin() -> Result<String> {
@@ -5569,7 +5698,12 @@ fn latest_session_id_for_workspace(workspace: &Path) -> std::io::Result<Option<S
         .map(|session| session.id))
 }
 
-fn fork_session(session_id: Option<String>, last: bool, workspace: &Path) -> Result<String> {
+fn fork_session(
+    config: &Config,
+    session_id: Option<String>,
+    last: bool,
+    workspace: &Path,
+) -> Result<String> {
     let manager = SessionManager::default_location()?;
     let saved = if last {
         let Some(meta) = manager.get_latest_session_for_workspace(workspace)? else {
@@ -5583,6 +5717,24 @@ fn fork_session(session_id: Option<String>, last: bool, workspace: &Path) -> Res
         let id = resolve_session_id(session_id, false, workspace)?;
         manager.load_session_by_prefix(&id)?
     };
+    let saved_provider_identity = saved
+        .metadata
+        .model_provider_id
+        .as_deref()
+        .filter(|identity| !identity.trim().is_empty())
+        .unwrap_or(&saved.metadata.model_provider);
+    let provider_identity = config
+        .resolve_persisted_provider_identity(
+            Some(&saved.metadata.model_provider),
+            saved.metadata.model_provider_id.as_deref(),
+        )
+        .map_err(anyhow::Error::msg)
+        .with_context(|| {
+            format!(
+                "saved session provider '{}' is unavailable; fork will not fall back",
+                saved_provider_identity
+            )
+        })?;
 
     let system_prompt = saved
         .system_prompt
@@ -5595,7 +5747,10 @@ fn fork_session(session_id: Option<String>, last: bool, workspace: &Path) -> Res
         saved.metadata.total_tokens,
         system_prompt.as_ref(),
     );
-    forked.metadata.model_provider = saved.metadata.model_provider.clone();
+    forked.metadata.set_model_provider_route(
+        provider_identity.provider.as_str(),
+        provider_identity.persisted_id(),
+    );
     forked.metadata.copy_cost_from(&saved.metadata);
     forked.metadata.mark_forked_from(&saved.metadata);
     manager.save_session(&forked)?;
@@ -5656,13 +5811,10 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
         return run_review_receipt_check(&diff, &args);
     }
 
-    let model = args
-        .model
-        .clone()
-        .or_else(|| config.default_text_model.clone())
-        .unwrap_or_else(|| config.default_model());
-    let route = resolve_cli_auto_route(config, &model, &diff).await?;
+    let model = resolve_review_model(config, args.model.as_deref());
+    let route = resolve_cli_exec_route(config, &model, &diff, args.model.is_none()).await?;
     let execution_config = config_for_cli_route(config, &route);
+    let route_provider = execution_config.provider_identity_for(route.provider);
     let model = route.model.clone();
     let reasoning_effort = route
         .reasoning_effort
@@ -5710,7 +5862,7 @@ Provide findings ordered by severity with file references, then open questions, 
         let receipt = crate::tools::review::build_review_receipt(
             review_target_label(&args),
             &diff,
-            route.provider.as_str(),
+            &route_provider,
             &model,
             &parsed_output,
             &output,
@@ -5727,6 +5879,7 @@ Provide findings ordered by severity with file references, then open questions, 
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "mode": "review",
+                "provider": route_provider,
                 "model": model,
                 "success": true,
                 "content": output,
@@ -5743,6 +5896,14 @@ Provide findings ordered by severity with file references, then open questions, 
         }
     }
     Ok(())
+}
+
+fn resolve_review_model(config: &Config, explicit_model: Option<&str>) -> String {
+    explicit_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| config.default_model())
 }
 
 fn validate_review_receipt_args(args: &ReviewArgs) -> Result<()> {
@@ -7345,7 +7506,7 @@ async fn run_interactive(
             model,
             workspace,
             config_path: cli.config.clone(),
-            config_profile: cli.profile.clone(),
+            config_profile: effective_config_profile(cli),
             allow_shell: interactive_tui_allow_shell(yolo, config),
             use_alt_screen,
             use_mouse_capture,
@@ -7406,9 +7567,7 @@ fn normalize_cli_reasoning_effort(value: &str) -> Result<Option<String>> {
 fn config_for_cli_route(config: &Config, route: &CliAutoRoute) -> Config {
     let mut execution_config = config.clone();
     execution_config.provider = Some(config.provider_identity_for(route.provider));
-    execution_config
-        .provider_config_for_mut(route.provider)
-        .model = Some(route.model.clone());
+    execution_config.set_provider_model_override(route.provider, Some(route.model.clone()));
     if matches!(
         route.provider,
         crate::config::ApiProvider::Deepseek | crate::config::ApiProvider::DeepseekCN
@@ -7416,16 +7575,6 @@ fn config_for_cli_route(config: &Config, route: &CliAutoRoute) -> Config {
         execution_config.default_text_model = Some(route.model.clone());
     }
     execution_config
-}
-
-fn resolve_cli_route_limits(
-    config: &Config,
-    provider: crate::config::ApiProvider,
-    model: &str,
-) -> Option<codewhale_config::route::RouteLimits> {
-    crate::route_runtime::resolve_runtime_route(config, provider, Some(model))
-        .ok()
-        .and_then(|route| crate::route_budget::known_route_limits(route.candidate.limits))
 }
 
 async fn resolve_cli_auto_route(
@@ -7486,11 +7635,47 @@ async fn resolve_cli_auto_route(
     }
 }
 
-async fn run_one_shot(config: &Config, model: &str, prompt: &str) -> Result<()> {
+async fn resolve_cli_exec_route(
+    config: &Config,
+    model: &str,
+    prompt: &str,
+    force_configured_route: bool,
+) -> Result<CliAutoRoute> {
+    if force_configured_route && !model.trim().eq_ignore_ascii_case("auto") {
+        return Ok(CliAutoRoute {
+            provider: config.api_provider(),
+            model: model.to_string(),
+            reasoning_effort: config
+                .reasoning_effort()
+                .map(crate::tui::app::ReasoningEffort::from_setting),
+            auto_model: false,
+        });
+    }
+    resolve_cli_auto_route(config, model, prompt).await
+}
+
+fn should_force_configured_exec_route(
+    resuming: bool,
+    explicit_provider: Option<&str>,
+    explicit_model: Option<&str>,
+) -> bool {
+    // A configured/default model belongs to the configured provider route.
+    // Cross-provider inventory inference is reserved for an explicit model
+    // override without an explicit provider. Resume remains route-authoritative
+    // even when its model is overridden because it restores the saved provider.
+    resuming || explicit_provider.is_some() || explicit_model.is_none()
+}
+
+async fn run_one_shot(
+    config: &Config,
+    model: &str,
+    prompt: &str,
+    force_configured_route: bool,
+) -> Result<()> {
     use crate::client::DeepSeekClient;
     use crate::models::{ContentBlock, Message, MessageRequest};
 
-    let route = resolve_cli_auto_route(config, model, prompt).await?;
+    let route = resolve_cli_exec_route(config, model, prompt, force_configured_route).await?;
     let execution_config = config_for_cli_route(config, &route);
     let client = DeepSeekClient::new(&execution_config)?;
     let reasoning_effort = route
@@ -7529,12 +7714,18 @@ async fn run_one_shot(config: &Config, model: &str, prompt: &str) -> Result<()> 
     Ok(())
 }
 
-async fn run_one_shot_json(config: &Config, model: &str, prompt: &str) -> Result<()> {
+async fn run_one_shot_json(
+    config: &Config,
+    model: &str,
+    prompt: &str,
+    force_configured_route: bool,
+) -> Result<()> {
     use crate::client::DeepSeekClient;
     use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt};
 
-    let route = resolve_cli_auto_route(config, model, prompt).await?;
+    let route = resolve_cli_exec_route(config, model, prompt, force_configured_route).await?;
     let execution_config = config_for_cli_route(config, &route);
+    let provider = execution_config.provider_identity_for(route.provider);
     let client = DeepSeekClient::new(&execution_config)?;
     let model = route.model.clone();
     let reasoning_effort = route
@@ -7572,14 +7763,23 @@ async fn run_one_shot_json(config: &Config, model: &str, prompt: &str) -> Result
     }
     println!(
         "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "mode": "one-shot",
-            "model": model,
-            "success": true,
-            "output": output
-        }))?
+        serde_json::to_string_pretty(&one_shot_exec_json_receipt(provider, model, output,))?
     );
     Ok(())
+}
+
+fn one_shot_exec_json_receipt(
+    provider: String,
+    model: String,
+    output: String,
+) -> serde_json::Value {
+    serde_json::json!({
+        "mode": "one-shot",
+        "provider": provider,
+        "model": model,
+        "success": true,
+        "output": output
+    })
 }
 
 #[derive(serde::Serialize)]
@@ -7809,14 +8009,15 @@ async fn run_workflow_tool_command_inner(cli: &Cli, args: WorkflowToolArgs) -> R
     }
 
     let model = resolve_exec_model(&config, None);
-    let route = resolve_cli_auto_route(
+    let route = resolve_cli_exec_route(
         &config,
         &model,
         "Run a checked-in Workflow through the host runtime",
+        true,
     )
     .await?;
     let execution_config = config_for_cli_route(&config, &route);
-    let route_provider = route.provider.as_str().to_string();
+    let route_provider = execution_config.provider_identity_for(route.provider);
     let workflow_input_sha256 = format!(
         "sha256:{}",
         crate::hashing::sha256_hex(&serde_json::to_vec(&input)?)
@@ -8325,10 +8526,16 @@ fn exec_stream_resume_hint(session_id: &str) -> String {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PersistedProviderRoute<'a> {
+    kind: &'a str,
+    id: Option<&'a str>,
+}
+
 fn persist_exec_session(
     messages: &[Message],
     model: &str,
-    model_provider: &str,
+    provider_route: PersistedProviderRoute<'_>,
     workspace: &Path,
     system_prompt: &Option<SystemPrompt>,
     session_id: Option<&str>,
@@ -8367,12 +8574,63 @@ fn persist_exec_session(
             Some("exec"),
         )
     };
-    saved.metadata.model_provider = model_provider.to_string();
+    stamp_exec_session_metadata(
+        &mut saved,
+        model,
+        provider_route.kind,
+        provider_route.id,
+        workspace,
+    );
     let id = saved.metadata.id.clone();
     manager
         .save_session(&saved)
         .context("could not save exec session")?;
     Ok(id)
+}
+
+fn stamp_exec_session_metadata(
+    saved: &mut session_manager::SavedSession,
+    model: &str,
+    model_provider_kind: &str,
+    model_provider_id: Option<&str>,
+    workspace: &Path,
+) {
+    saved.metadata.model = model.to_string();
+    saved
+        .metadata
+        .set_model_provider_route(model_provider_kind, model_provider_id);
+    saved.metadata.workspace = workspace.to_path_buf();
+    saved.metadata.mode = Some("exec".to_string());
+}
+
+#[derive(serde::Serialize)]
+struct ExecToolEntry {
+    name: String,
+    success: bool,
+    output: String,
+}
+
+#[derive(serde::Serialize)]
+struct ExecOutcome {
+    kind: String,
+    outcome: String,
+    tool_name: String,
+    reason: String,
+}
+
+#[derive(serde::Serialize, Default)]
+struct ExecSummary {
+    mode: String,
+    provider: String,
+    model: String,
+    prompt: String,
+    output: String,
+    tools: Vec<ExecToolEntry>,
+    outcomes: Vec<ExecOutcome>,
+    status: Option<String>,
+    termination_reason: Option<String>,
+    error_category: Option<String>,
+    error: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8387,7 +8645,8 @@ async fn run_exec_agent(
     explicit_sandbox: Option<&str>,
     trust_mode: bool,
     json_output: bool,
-    resume_session_id: Option<String>,
+    resume_session: Option<session_manager::SavedSession>,
+    force_configured_route: bool,
     output_format: ExecOutputFormat,
     max_turns: u32,
     allowed_tools: Option<Vec<String>>,
@@ -8402,12 +8661,21 @@ async fn run_exec_agent(
     use crate::tools::todo::new_shared_todo_list;
     use crate::tui::app::AppMode;
 
-    let route = resolve_cli_auto_route(config, model, prompt).await?;
+    let route = resolve_cli_exec_route(config, model, prompt, force_configured_route).await?;
     let execution_config = config_for_cli_route(config, &route);
     let auto_model = route.auto_model;
     let effective_provider = route.provider;
     let effective_model = route.model;
-    let effective_provider_name = execution_config.provider_identity_for(effective_provider);
+    let validated_route = crate::route_runtime::resolve_runtime_route(
+        &execution_config,
+        effective_provider,
+        Some(&effective_model),
+    )
+    .map_err(anyhow::Error::msg)?
+    .validate()
+    .map_err(anyhow::Error::msg)?;
+    let effective_provider_name = validated_route.identity.key.clone();
+    let effective_provider_id = validated_route.identity.exact_id.clone();
     let route_source = if auto_model {
         "auto_resolver"
     } else {
@@ -8420,7 +8688,7 @@ async fn run_exec_agent(
     let approval_posture = if auto_approve { "auto_tools" } else { "ask" }.to_string();
     let sandbox_posture = explicit_sandbox.unwrap_or("configured_default").to_string();
     let active_route_limits =
-        resolve_cli_route_limits(&execution_config, effective_provider, &effective_model);
+        crate::route_budget::known_route_limits(validated_route.candidate.limits);
     let max_subagents = if max_subagents == config.max_subagents_for_provider(config.api_provider())
     {
         execution_config
@@ -8574,14 +8842,9 @@ async fn run_exec_agent(
         AppMode::Agent
     };
 
+    let resuming_session = resume_session.is_some();
     let mut loaded_session_id = None;
-    if let Some(session_id) = resume_session_id.as_deref() {
-        let manager = SessionManager::default_location()
-            .context("could not open session manager for exec resume")?;
-        let session_ref = crate::utils::redacted_identifier_for_log(session_id);
-        let saved = manager
-            .load_session_by_prefix(session_id)
-            .with_context(|| format!("could not load session {session_ref}"))?;
+    if let Some(saved) = resume_session {
         let saved_id = saved.metadata.id.clone();
         if saved.metadata.workspace != workspace && output_format == ExecOutputFormat::Text {
             eprintln!(
@@ -8612,9 +8875,7 @@ async fn run_exec_agent(
         .send(Op::SendMessage {
             content: prompt.to_string(),
             mode,
-            provider: Some(effective_provider),
-            model: effective_model.clone(),
-            route_limits: active_route_limits,
+            route: Box::new(validated_route.into_resolved()),
             compaction: Box::new(compaction.clone()),
             goal_objective: None,
             goal_token_budget: None,
@@ -8644,34 +8905,9 @@ async fn run_exec_agent(
         })
         .await?;
 
-    #[derive(serde::Serialize)]
-    struct ExecToolEntry {
-        name: String,
-        success: bool,
-        output: String,
-    }
-    #[derive(serde::Serialize)]
-    struct ExecOutcome {
-        kind: String,
-        outcome: String,
-        tool_name: String,
-        reason: String,
-    }
-    #[derive(serde::Serialize, Default)]
-    struct ExecSummary {
-        mode: String,
-        model: String,
-        prompt: String,
-        output: String,
-        tools: Vec<ExecToolEntry>,
-        outcomes: Vec<ExecOutcome>,
-        status: Option<String>,
-        termination_reason: Option<String>,
-        error_category: Option<String>,
-        error: Option<String>,
-    }
     let mut summary = ExecSummary {
         mode: "agent".to_string(),
+        provider: effective_provider_name.clone(),
         model: effective_model.clone(),
         prompt: prompt.to_string(),
         ..ExecSummary::default()
@@ -8684,8 +8920,7 @@ async fn run_exec_agent(
     let mut last_error_category = None;
     let mut reported_sandbox_contract = false;
 
-    let should_persist_session =
-        resume_session_id.is_some() || output_format == ExecOutputFormat::StreamJson;
+    let should_persist_session = resuming_session || output_format == ExecOutputFormat::StreamJson;
     let mut latest_session_id = loaded_session_id;
     let mut latest_messages: Vec<Message> = Vec::new();
     let mut latest_system_prompt: Option<SystemPrompt> = None;
@@ -8971,7 +9206,10 @@ async fn run_exec_agent(
                     match persist_exec_session(
                         &latest_messages,
                         &latest_model,
-                        &effective_provider_name,
+                        PersistedProviderRoute {
+                            kind: effective_provider.as_str(),
+                            id: effective_provider_id.as_deref(),
+                        },
                         &latest_workspace,
                         &latest_system_prompt,
                         latest_session_id.as_deref(),
@@ -10130,6 +10368,81 @@ mod terminal_mode_tests {
         Cli::try_parse_from(args).expect("CLI args should parse")
     }
 
+    fn custom_exec_config(active: &str) -> Config {
+        let mut custom = std::collections::HashMap::new();
+        for (name, base_url, model) in [
+            (
+                "custom-a",
+                "http://127.0.0.1:18181/v1",
+                crate::config::ZAI_GLM_5_2_MODEL,
+            ),
+            ("custom-b", "http://127.0.0.1:18182/v1", "model-b"),
+        ] {
+            custom.insert(
+                name.to_string(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some(base_url.to_string()),
+                    model: Some(model.to_string()),
+                    api_key: Some("local-test-key".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        Config {
+            provider: Some(active.to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn doctor_json_surfaces_keep_exact_named_custom_provider() {
+        let config = custom_exec_config("custom-a");
+        let workspace = tempfile::tempdir().expect("doctor workspace");
+
+        let operate = doctor_operate_fleet_report_json(&config, workspace.path());
+        let provider_model = doctor_provider_model_report_json(&config);
+        let capability = provider_capability_report(&config);
+        let route = doctor_route_report(&config);
+
+        assert_eq!(operate["provider"]["id"], "custom-a");
+        assert_eq!(provider_model["provider"]["id"], "custom-a");
+        assert_eq!(capability["resolved_provider"], "custom-a");
+        assert_eq!(route["provider"], "custom-a");
+        assert_eq!(route["provider_config_table"], "providers.custom-a");
+        let serialized = serde_json::to_string(&serde_json::json!({
+            "operate": operate,
+            "provider_model": provider_model,
+            "capability": capability,
+            "route": route,
+        }))
+        .expect("doctor JSON");
+        assert!(!serialized.contains("local-test-key"));
+    }
+
+    fn saved_exec_session(provider: &str, model: &str) -> session_manager::SavedSession {
+        let mut saved = session_manager::create_saved_session_with_mode(
+            &[],
+            model,
+            Path::new("/tmp/exec-resume"),
+            0,
+            None,
+            Some("exec"),
+        );
+        let kind = crate::config::ApiProvider::parse(provider)
+            .unwrap_or(crate::config::ApiProvider::Custom)
+            .as_str();
+        let exact_id = (!provider
+            .eq_ignore_ascii_case(crate::config::ApiProvider::Custom.as_str()))
+        .then_some(provider);
+        saved.metadata.set_model_provider_route(kind, exact_id);
+        saved
+    }
+
     #[test]
     fn prompt_flag_accepts_split_prompt_words_for_windows_cmd_shims() {
         let cli = parse_cli(&["codewhale", "-p", "hello", "world"]);
@@ -10442,6 +10755,49 @@ mod terminal_mode_tests {
     }
 
     #[test]
+    fn cli_route_execution_config_preserves_legacy_literal_custom_root_route() {
+        let _lock = crate::test_support::lock_test_env();
+        let _source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let _cli_key = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+        let config = Config {
+            provider: Some("custom".to_string()),
+            api_key: Some("legacy-root-key".to_string()),
+            base_url: Some("http://127.0.0.1:18183/v1".to_string()),
+            default_text_model: Some("legacy-model".to_string()),
+            ..Default::default()
+        };
+        let route = CliAutoRoute {
+            provider: crate::config::ApiProvider::Custom,
+            model: "routed-legacy-model".to_string(),
+            reasoning_effort: None,
+            auto_model: false,
+        };
+
+        let execution = config_for_cli_route(&config, &route);
+
+        assert!(execution.uses_legacy_literal_custom_route());
+        assert!(
+            execution
+                .providers
+                .as_ref()
+                .is_none_or(|providers| !providers.custom.contains_key("custom"))
+        );
+        assert_eq!(execution.provider.as_deref(), Some("custom"));
+        assert_eq!(execution.default_model(), "routed-legacy-model");
+        assert_eq!(execution.deepseek_base_url(), "http://127.0.0.1:18183/v1");
+        assert_eq!(execution.deepseek_api_key().unwrap(), "legacy-root-key");
+        for _ in 0..2 {
+            let identity = execution
+                .resolve_provider_identity("custom")
+                .expect("legacy identity remains repeatedly resolvable");
+            assert_eq!(identity.key, "custom");
+        }
+        let client =
+            crate::client::DeepSeekClient::new(&execution).expect("legacy execution client");
+        assert_eq!(client.base_url(), "http://127.0.0.1:18183/v1");
+    }
+
+    #[test]
     fn exec_accepts_split_prompt_words_for_windows_cmd_shims() {
         let cli = parse_cli(&["codewhale", "exec", "hello", "world"]);
         let Some(Commands::Exec(args)) = cli.command else {
@@ -10531,6 +10887,46 @@ mod terminal_mode_tests {
     }
 
     #[test]
+    fn exec_provider_override_prefers_exact_case_colliding_custom_key() {
+        let mut config = Config {
+            provider: Some("deepseek".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom: std::collections::HashMap::from([(
+                    "CUSTOM".to_string(),
+                    crate::config::ProviderConfig {
+                        kind: Some("openai-compatible".to_string()),
+                        base_url: Some("http://127.0.0.1:5678/v1".to_string()),
+                        model: Some("case-model".to_string()),
+                        api_key: Some("case-key".to_string()),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        apply_exec_provider_override(&mut config, "CUSTOM")
+            .expect("exact case-colliding custom provider");
+        assert_eq!(config.provider.as_deref(), Some("CUSTOM"));
+        assert_eq!(config.api_provider(), crate::config::ApiProvider::Custom);
+        assert_eq!(
+            config.provider_identity_for(crate::config::ApiProvider::Custom),
+            "CUSTOM"
+        );
+        let route = crate::route_runtime::resolve_runtime_route(
+            &config,
+            crate::config::ApiProvider::Custom,
+            Some("case-model"),
+        )
+        .expect("resolve exact case-colliding route")
+        .validate()
+        .expect("preflight exact case-colliding route");
+        assert_eq!(route.identity.key, "CUSTOM");
+        assert_eq!(route.client.base_url(), "http://127.0.0.1:5678/v1");
+    }
+
+    #[test]
     fn exec_provider_override_rejects_unknown_provider() {
         let mut config = Config {
             provider: Some("deepseek".to_string()),
@@ -10544,6 +10940,243 @@ mod terminal_mode_tests {
         assert!(message.contains("Unrecognized --provider"));
         assert!(message.contains("[providers.<name>] custom provider"));
         assert_eq!(config.provider.as_deref(), Some("deepseek"));
+    }
+
+    #[test]
+    fn exec_resume_route_matrix_preserves_or_overrides_exact_provider_deliberately() {
+        let saved = saved_exec_session("custom-a", crate::config::ZAI_GLM_5_2_MODEL);
+
+        let mut restored = custom_exec_config("custom-b");
+        let model = resolve_exec_resume_route(&mut restored, &saved, false, None)
+            .expect("plain resume restores saved route");
+        assert_eq!(restored.provider.as_deref(), Some("custom-a"));
+        assert_eq!(model, crate::config::ZAI_GLM_5_2_MODEL);
+
+        let mut explicit_provider = custom_exec_config("custom-a");
+        apply_exec_provider_override(&mut explicit_provider, "custom-b").expect("custom B");
+        let model = resolve_exec_resume_route(&mut explicit_provider, &saved, true, None)
+            .expect("explicit provider wins");
+        assert_eq!(explicit_provider.provider.as_deref(), Some("custom-b"));
+        assert_eq!(model, "model-b");
+
+        let mut explicit_model = custom_exec_config("custom-b");
+        let model =
+            resolve_exec_resume_route(&mut explicit_model, &saved, false, Some("override-model"))
+                .expect("explicit model keeps saved provider");
+        assert_eq!(explicit_model.provider.as_deref(), Some("custom-a"));
+        assert_eq!(model, "override-model");
+
+        let mut missing = custom_exec_config("custom-b");
+        missing
+            .providers
+            .as_mut()
+            .expect("providers")
+            .custom
+            .remove("custom-a");
+        let before = missing.provider.clone();
+        let err = resolve_exec_resume_route(&mut missing, &saved, false, None)
+            .expect_err("removed saved provider must fail closed");
+        assert!(err.to_string().contains("will not fall back"), "{err}");
+        assert_eq!(missing.provider, before);
+    }
+
+    #[tokio::test]
+    async fn forced_exec_route_keeps_custom_provider_when_model_matches_builtin_catalog() {
+        let config = custom_exec_config("custom-a");
+
+        let route =
+            resolve_cli_exec_route(&config, crate::config::ZAI_GLM_5_2_MODEL, "audit", true)
+                .await
+                .expect("forced route");
+        let execution = config_for_cli_route(&config, &route);
+
+        assert_eq!(route.provider, crate::config::ApiProvider::Custom);
+        assert_eq!(route.model, crate::config::ZAI_GLM_5_2_MODEL);
+        assert_eq!(execution.provider.as_deref(), Some("custom-a"));
+    }
+
+    #[tokio::test]
+    async fn no_flag_exec_keeps_configured_named_custom_route_for_matching_builtin_model() {
+        let mut config = custom_exec_config("custom-a");
+        config
+            .providers
+            .as_mut()
+            .expect("providers")
+            .custom
+            .get_mut("custom-a")
+            .expect("custom A")
+            .model = Some(crate::config::ZAI_GLM_5_2_MODEL.to_string());
+        let model = resolve_exec_model(&config, None);
+        let force = should_force_configured_exec_route(false, None, None);
+
+        assert!(force, "configured/default exec route must be authoritative");
+        assert!(!should_force_configured_exec_route(
+            false,
+            None,
+            Some(crate::config::ZAI_GLM_5_2_MODEL)
+        ));
+        assert!(should_force_configured_exec_route(
+            false,
+            Some("custom-a"),
+            Some(crate::config::ZAI_GLM_5_2_MODEL)
+        ));
+        assert!(should_force_configured_exec_route(
+            true,
+            None,
+            Some("override-model")
+        ));
+
+        let route = resolve_cli_exec_route(&config, &model, "audit", force)
+            .await
+            .expect("no-flag configured route");
+        let execution = config_for_cli_route(&config, &route);
+        assert_eq!(route.provider, crate::config::ApiProvider::Custom);
+        assert_eq!(route.model, crate::config::ZAI_GLM_5_2_MODEL);
+        assert_eq!(execution.provider.as_deref(), Some("custom-a"));
+    }
+
+    #[tokio::test]
+    async fn configured_review_default_keeps_named_custom_route_and_exact_receipt() {
+        let mut config = custom_exec_config("custom-a");
+        config
+            .providers
+            .as_mut()
+            .expect("providers")
+            .custom
+            .get_mut("custom-a")
+            .expect("custom A")
+            .model = Some("model-a".to_string());
+        config.default_text_model = Some("stale-root-deepseek-model".to_string());
+        let model = resolve_review_model(&config, None);
+        assert_eq!(model, "model-a");
+        assert_eq!(
+            resolve_review_model(&config, Some("explicit-review-model")),
+            "explicit-review-model"
+        );
+
+        let route = resolve_cli_exec_route(&config, &model, "review diff", true)
+            .await
+            .expect("configured review route");
+        let execution = config_for_cli_route(&config, &route);
+        let provider = execution.provider_identity_for(route.provider);
+
+        assert_eq!(route.provider, crate::config::ApiProvider::Custom);
+        assert_eq!(provider, "custom-a");
+        assert_eq!(execution.deepseek_base_url(), "http://127.0.0.1:18181/v1");
+        let output = crate::tools::review::ReviewOutput::from_str("{}");
+        let receipt = crate::tools::review::build_review_receipt(
+            "working tree",
+            "diff --git a/a b/a",
+            provider,
+            &route.model,
+            &output,
+            "{}",
+            Vec::new(),
+        );
+        assert_eq!(receipt.provider, "custom-a");
+        let serialized = serde_json::to_string(&receipt).expect("review receipt");
+        assert!(!serialized.contains("127.0.0.1"));
+        assert!(!serialized.contains("local-test-key"));
+    }
+
+    #[tokio::test]
+    async fn configured_workflow_default_keeps_named_custom_route() {
+        let config = custom_exec_config("custom-a");
+        let model = config.default_model();
+
+        let route = resolve_cli_exec_route(
+            &config,
+            &model,
+            "Run a checked-in Workflow through the host runtime",
+            true,
+        )
+        .await
+        .expect("configured workflow route");
+        let execution = config_for_cli_route(&config, &route);
+
+        assert_eq!(route.provider, crate::config::ApiProvider::Custom);
+        assert_eq!(execution.provider_identity_for(route.provider), "custom-a");
+        assert_eq!(execution.deepseek_base_url(), "http://127.0.0.1:18181/v1");
+        let client = crate::client::DeepSeekClient::new(&execution).expect("workflow client");
+        assert_eq!(client.base_url(), "http://127.0.0.1:18181/v1");
+    }
+
+    #[test]
+    fn exec_json_receipts_keep_exact_named_custom_provider() {
+        let config = custom_exec_config("custom-a");
+        let provider = config.provider_identity_for(crate::config::ApiProvider::Custom);
+        let one_shot =
+            one_shot_exec_json_receipt(provider.clone(), "model-a".to_string(), "done".to_string());
+        assert_eq!(one_shot["provider"], "custom-a");
+
+        let agent = serde_json::to_value(ExecSummary {
+            mode: "agent".to_string(),
+            provider,
+            model: "model-a".to_string(),
+            ..ExecSummary::default()
+        })
+        .expect("agent exec JSON receipt");
+        assert_eq!(agent["provider"], "custom-a");
+        let serialized = serde_json::to_string(&agent).expect("serialize receipt");
+        assert!(!serialized.contains("127.0.0.1"));
+        assert!(!serialized.contains("local-test-key"));
+    }
+
+    #[test]
+    fn resumed_exec_persistence_updates_provider_and_model_as_one_route() {
+        let saved_a = saved_exec_session("custom-a", crate::config::ZAI_GLM_5_2_MODEL);
+        let mut config = custom_exec_config("custom-a");
+        apply_exec_provider_override(&mut config, "custom-b").expect("custom B");
+        let model = resolve_exec_resume_route(&mut config, &saved_a, true, None)
+            .expect("explicit provider route");
+        let mut persisted = saved_a;
+        stamp_exec_session_metadata(
+            &mut persisted,
+            &model,
+            crate::config::ApiProvider::Custom.as_str(),
+            Some("custom-b"),
+            Path::new("/tmp/exec-resume"),
+        );
+
+        let mut next_config = custom_exec_config("custom-a");
+        let resumed_model = resolve_exec_resume_route(&mut next_config, &persisted, false, None)
+            .expect("next plain resume");
+
+        assert_eq!(persisted.metadata.model_provider, "custom");
+        assert_eq!(
+            persisted.metadata.model_provider_id.as_deref(),
+            Some("custom-b")
+        );
+        assert_eq!(persisted.metadata.model, "model-b");
+        assert_eq!(next_config.provider.as_deref(), Some("custom-b"));
+        assert_eq!(resumed_model, "model-b");
+    }
+
+    #[test]
+    fn exec_persistence_omits_id_for_legacy_root_custom_route() {
+        let mut saved = session_manager::create_saved_session_with_mode(
+            &[],
+            "legacy-root-model",
+            Path::new("/tmp/exec-root"),
+            0,
+            None,
+            Some("exec"),
+        );
+        stamp_exec_session_metadata(
+            &mut saved,
+            "legacy-root-model",
+            crate::config::ApiProvider::Custom.as_str(),
+            None,
+            Path::new("/tmp/exec-root"),
+        );
+
+        assert_eq!(saved.metadata.model_provider, "custom");
+        assert_eq!(saved.metadata.model_provider_id, None);
+        assert!(
+            !serde_json::to_string(&saved)
+                .expect("serialize exec session")
+                .contains("model_provider_id")
+        );
     }
 
     #[test]

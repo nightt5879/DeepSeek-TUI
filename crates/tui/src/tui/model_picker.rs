@@ -561,12 +561,14 @@ impl ModelPickerView {
     }
 
     fn build_event(&self) -> ViewEvent {
-        let provider = self
-            .resolved_provider()
-            .filter(|provider| *provider != self.initial_provider);
+        let resolved_provider = self.resolved_provider().unwrap_or(self.initial_provider);
+        let provider = (resolved_provider != self.initial_provider).then_some(resolved_provider);
+        let provider_id = (resolved_provider == ApiProvider::Custom)
+            .then(|| self.route_config.provider_identity_for(resolved_provider));
         ViewEvent::ModelPickerApplied {
             model: self.resolved_model(),
             provider,
+            provider_id,
             effort: self.resolved_effort(),
             previous_model: self.previous_model.clone(),
             previous_effort: self.initial_effort,
@@ -3244,6 +3246,56 @@ mod tests {
             view.resolved_provider(),
             Some(crate::config::ApiProvider::Custom)
         );
+    }
+
+    #[test]
+    fn named_custom_picker_event_keeps_exact_target_identity() {
+        let (mut app, mut config, _lock) = create_test_app();
+        app.set_provider_identity(crate::config::ApiProvider::Custom, "custom-a");
+        app.model_ids_passthrough = true;
+        app.model = "model-a".to_string();
+        app.auto_model = false;
+        let mut custom = std::collections::HashMap::new();
+        for (name, base_url, model) in [
+            ("custom-a", "http://127.0.0.1:18181/v1", "model-a"),
+            ("custom-b", "http://127.0.0.1:18182/v1", "model-b"),
+        ] {
+            custom.insert(
+                name.to_string(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some(base_url.to_string()),
+                    model: Some(model.to_string()),
+                    api_key: Some("local-test-key".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        config.provider = Some("custom-b".to_string());
+        config.providers = Some(crate::config::ProvidersConfig {
+            custom,
+            ..Default::default()
+        });
+        let mut view = ModelPickerView::new(&app, &config);
+        view.selected_model_idx = view
+            .visible_model_rows()
+            .iter()
+            .position(|row| row.provider == Some(ApiProvider::Custom) && row.id == "model-b")
+            .expect("custom B row");
+
+        match view.build_event() {
+            ViewEvent::ModelPickerApplied {
+                model,
+                provider,
+                provider_id,
+                ..
+            } => {
+                assert_eq!(model, "model-b");
+                assert_eq!(provider, None, "both routes share the Custom enum");
+                assert_eq!(provider_id.as_deref(), Some("custom-b"));
+            }
+            other => panic!("expected model picker apply event, got {other:?}"),
+        }
     }
 
     #[test]

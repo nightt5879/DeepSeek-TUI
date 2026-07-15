@@ -624,8 +624,8 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
         .style(Style::default().bg(app.ui_theme.header_bg))
         .render(area, buf);
 
-    let (effective_provider, effective_model) = app.effective_route_display();
-    let route_label = format!("{} · {effective_model}", effective_provider.display_name());
+    let (effective_provider, effective_model) = app.effective_route_identity_display();
+    let route_label = format!("{effective_provider} · {effective_model}");
     let mut left = vec![
         Span::styled(
             "cw",
@@ -942,6 +942,21 @@ mod tests {
             header.contains("Full Access"),
             "permission posture missing: {header:?}"
         );
+    }
+
+    #[test]
+    fn header_shows_exact_named_custom_provider() {
+        let mut app = test_app();
+        app.set_provider_identity(crate::config::ApiProvider::Custom, "lm-studio");
+        app.model = "local-code-model".to_string();
+
+        let header = header_text(&app, 100);
+
+        assert!(
+            header.contains("lm-studio · local-code-model"),
+            "{header:?}"
+        );
+        assert!(!header.contains("Custom ·"), "{header:?}");
     }
 
     /// The footer consumes the toast system, not the legacy status sink: an

@@ -26,6 +26,7 @@ impl Default for SetupOperateFacts {
 
 impl SetupOperateFacts {
     pub(super) fn from_app_config(app: &App, config: &Config, provider_ready: bool) -> Self {
+        let provider_identity = app.provider_identity_for_persistence();
         let subagents_enabled = config.subagents_enabled_for_provider(app.api_provider);
         let max_subagents = config.max_subagents_for_provider(app.api_provider);
         let launch_concurrency = config.launch_concurrency_for_provider(app.api_provider);
@@ -51,29 +52,17 @@ impl SetupOperateFacts {
         } else if runtime_ready {
             format!(
                 "worker runtime ready for {}; max_subagents={}, launch_concurrency={}, admission={}, max_spawn_depth={}; background dispatch and completion receipts are available",
-                app.api_provider.as_str(),
-                max_subagents,
-                launch_concurrency,
-                max_admitted,
-                max_spawn_depth
+                provider_identity, max_subagents, launch_concurrency, max_admitted, max_spawn_depth
             )
         } else if runtime_configured {
             format!(
                 "worker runtime configured for {}, but the active provider route is not ready; max_subagents={}, launch_concurrency={}, admission={}, max_spawn_depth={}",
-                app.api_provider.as_str(),
-                max_subagents,
-                launch_concurrency,
-                max_admitted,
-                max_spawn_depth
+                provider_identity, max_subagents, launch_concurrency, max_admitted, max_spawn_depth
             )
         } else {
             format!(
                 "worker runtime has no launch capacity for {}; max_subagents={}, launch_concurrency={}, admission={}, max_spawn_depth={}",
-                app.api_provider.as_str(),
-                max_subagents,
-                launch_concurrency,
-                max_admitted,
-                max_spawn_depth
+                provider_identity, max_subagents, launch_concurrency, max_admitted, max_spawn_depth
             )
         };
 

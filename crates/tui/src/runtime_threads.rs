@@ -27,8 +27,12 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::compaction::CompactionConfig;
-use crate::config::{ApiProvider, Config, DEFAULT_TEXT_MODEL, MAX_SUBAGENTS, ProviderIdentity};
-use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
+#[cfg(test)]
+use crate::config::DEFAULT_TEXT_MODEL;
+use crate::config::{ApiProvider, Config, MAX_SUBAGENTS, ProviderIdentity};
+use crate::core::engine::{
+    EngineConfig, EngineHandle, spawn_engine_with_authoritative_route_config,
+};
 use crate::core::events::{Event as EngineEvent, TurnOutcomeStatus};
 use crate::core::ops::Op;
 use crate::models::{ContentBlock, Message, SystemPrompt, Usage};
@@ -36,7 +40,9 @@ use crate::route_budget::{
     auto_compact_default_for_route, compaction_threshold_for_route_at_percent, known_route_limits,
     route_context_window_tokens,
 };
-use crate::route_runtime::resolve_runtime_route;
+use crate::route_runtime::{
+    ResolvedRuntimeRoute, resolve_runtime_route, resolve_runtime_route_for_identity,
+};
 use crate::tools::plan::new_shared_plan_state;
 use crate::tools::subagent::SubAgentStatus;
 use crate::tools::todo::new_shared_todo_list;
@@ -200,11 +206,13 @@ pub struct ThreadRecord {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub model: String,
-    /// Exact non-secret provider key for this thread's model route. Built-ins
-    /// use canonical slugs; named custom routes retain `[providers.<name>]`.
-    /// Legacy runtime records omit this and continue using the live default.
+    /// Generic provider kind for this thread's model route. Named custom
+    /// routes remain `custom` for compatibility with enum-only consumers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_provider: Option<String>,
+    /// Exact non-secret configured provider key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider_id: Option<String>,
     pub workspace: PathBuf,
     pub mode: String,
     pub allow_shell: bool,
@@ -251,10 +259,12 @@ pub struct TurnRecord {
     pub duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
-    /// Concrete provider selected for this turn. Additive so legacy records
-    /// deserialize without inventing provider provenance.
+    /// Concrete generic provider kind selected for this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_provider: Option<String>,
+    /// Exact non-secret configured provider key selected for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_provider_id: Option<String>,
     /// Non-secret discriminator for routes whose provider/model pair spans
     /// different billing systems (for example StepFun PAYG vs Step Plan).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -269,6 +279,19 @@ pub struct TurnRecord {
     pub item_ids: Vec<String>,
     #[serde(default)]
     pub steer_count: usize,
+}
+
+impl TurnRecord {
+    pub(crate) fn effective_provider_label(&self) -> Option<&str> {
+        self.effective_provider_id
+            .as_deref()
+            .filter(|identity| !identity.trim().is_empty())
+            .or_else(|| {
+                self.effective_provider
+                    .as_deref()
+                    .filter(|provider| !provider.trim().is_empty())
+            })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -724,8 +747,12 @@ pub enum ThreadListFilter {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CreateThreadRequest {
     pub model: Option<String>,
+    /// Generic provider kind or, for legacy clients, an exact provider id.
     #[serde(default)]
     pub model_provider: Option<String>,
+    /// Exact configured provider key. Takes precedence over `model_provider`.
+    #[serde(default)]
+    pub model_provider_id: Option<String>,
     pub workspace: Option<PathBuf>,
     pub mode: Option<String>,
     pub allow_shell: Option<bool>,
@@ -835,29 +862,22 @@ pub struct UsageAggregation {
     pub buckets: Vec<UsageBucket>,
 }
 
-#[derive(Debug, Clone)]
-struct RuntimeThreadRoute {
-    provider: ApiProvider,
-    provider_identity: String,
-    model: String,
-    config: Config,
-    limits: Option<codewhale_config::route::RouteLimits>,
-}
-
 fn resolve_runtime_thread_route(
     config: &Config,
     provider: ApiProvider,
     model_selector: Option<&str>,
-) -> Result<RuntimeThreadRoute> {
-    let route = resolve_runtime_route(config, provider, model_selector)
-        .map_err(|reason| anyhow!("Failed to resolve runtime thread route: {reason}"))?;
-    Ok(RuntimeThreadRoute {
-        provider,
-        provider_identity: route.config.provider_identity_for(provider),
-        model: route.model,
-        config: route.config,
-        limits: known_route_limits(route.candidate.limits),
-    })
+) -> Result<ResolvedRuntimeRoute> {
+    resolve_runtime_route(config, provider, model_selector)
+        .map_err(|reason| anyhow!("Failed to resolve runtime thread route: {reason}"))
+}
+
+fn resolve_runtime_thread_route_for_identity(
+    config: &Config,
+    identity: &ProviderIdentity,
+    model_selector: Option<&str>,
+) -> Result<ResolvedRuntimeRoute> {
+    resolve_runtime_route_for_identity(config, identity, model_selector)
+        .map_err(|reason| anyhow!("Failed to resolve runtime thread route: {reason}"))
 }
 
 fn runtime_compaction_config(
@@ -898,8 +918,11 @@ struct ActiveTurnState {
 struct ActiveThreadState {
     engine: EngineHandle,
     active_turn: Option<ActiveTurnState>,
-    route_provider: ApiProvider,
+    route_identity: ProviderIdentity,
     route_model: String,
+    /// Real engines client-preflight before an in-progress record is written.
+    /// Explicitly injected test engines own their client seam.
+    client_preflight_required: bool,
 }
 
 #[derive(Default)]
@@ -983,7 +1006,7 @@ pub enum ExternalApprovalDecision {
 
 impl RuntimeThreadManager {
     /// Helper to read the current config under RwLock.
-    fn read_config(&self) -> parking_lot::RwLockReadGuard<'_, Config> {
+    pub(crate) fn read_config(&self) -> parking_lot::RwLockReadGuard<'_, Config> {
         self.config.read()
     }
 
@@ -991,17 +1014,18 @@ impl RuntimeThreadManager {
         &self,
         config: &Config,
         thread: &ThreadRecord,
-    ) -> Result<RuntimeThreadRoute> {
+    ) -> Result<ResolvedRuntimeRoute> {
         let provider_identity = self.provider_identity_for_thread(config, thread)?;
-        let mut thread_config = config.clone();
-        thread_config.provider = Some(provider_identity.key.clone());
         if !thread.model.trim().eq_ignore_ascii_case("auto") {
-            return resolve_runtime_thread_route(
-                &thread_config,
-                provider_identity.provider,
+            return resolve_runtime_thread_route_for_identity(
+                config,
+                &provider_identity,
                 Some(&thread.model),
             );
         }
+
+        let mut thread_config = config.clone();
+        thread_config.scope_to_provider_identity(&provider_identity);
 
         let restored = self
             .store
@@ -1009,16 +1033,27 @@ impl RuntimeThreadManager {
             .into_iter()
             .rev()
             .find_map(|turn| {
-                let provider = turn
-                    .effective_provider
-                    .as_deref()
-                    .and_then(ApiProvider::parse)?;
                 let model = turn.effective_model?.trim().to_string();
-                (!model.is_empty()).then_some((provider, model))
+                let provider_kind = turn
+                    .effective_provider
+                    .filter(|provider| !provider.trim().is_empty());
+                let provider_id = turn
+                    .effective_provider_id
+                    .filter(|provider| !provider.trim().is_empty());
+                ((provider_kind.is_some() || provider_id.is_some()) && !model.is_empty())
+                    .then_some((provider_kind, provider_id, model))
             });
         match restored {
-            Some((provider, model)) => resolve_runtime_thread_route(config, provider, Some(&model)),
-            None => resolve_runtime_thread_route(&thread_config, provider_identity.provider, None),
+            Some((restored_kind, restored_id, model)) => {
+                let identity = thread_config
+                    .resolve_persisted_provider_identity(
+                        restored_kind.as_deref(),
+                        restored_id.as_deref(),
+                    )
+                    .map_err(|reason| anyhow!(reason))?;
+                resolve_runtime_thread_route_for_identity(config, &identity, Some(&model))
+            }
+            None => resolve_runtime_thread_route_for_identity(config, &provider_identity, None),
         }
     }
 
@@ -1027,52 +1062,30 @@ impl RuntimeThreadManager {
         config: &Config,
         thread: &ThreadRecord,
     ) -> Result<ProviderIdentity> {
-        let key = thread.model_provider.as_deref().unwrap_or_else(|| {
-            config
-                .provider
+        let has_persisted_route = thread
+            .model_provider
+            .as_deref()
+            .is_some_and(|provider| !provider.trim().is_empty())
+            || thread
+                .model_provider_id
                 .as_deref()
-                .unwrap_or(ApiProvider::Deepseek.as_str())
-        });
-        config
-            .resolve_provider_identity(key)
-            .map_err(|reason| anyhow!(reason))
-    }
-
-    /// Reload config from an updated Config instance (called after /v1/config/reload).
-    pub fn reload_config(&self, new_config: Config) {
-        let mut guard = self.config.write();
-        *guard = new_config;
-    }
-
-    /// Propagate the current config to all active engines by sending
-    /// `Op::SetModel`, `Op::SetCompaction`, `Op::SetStreamChunkTimeout`, and
-    /// `Op::SetSubagentRuntimeConfig`. This mirrors what the TUI does via
-    /// `apply_model_and_compaction_update` after a config change, ensuring
-    /// running engines pick up the new settings without a restart.
-    pub async fn sync_engines_with_config(&self) {
-        let (
-            config,
-            auto_compact,
-            auto_compact_explicit,
-            auto_compact_threshold_percent,
-            stream_chunk_timeout_secs,
-        ) = {
-            let cfg = self.read_config();
-            let settings = crate::settings::Settings::load().unwrap_or_default();
-            (
-                cfg.clone(),
-                settings.auto_compact,
-                crate::settings::Settings::auto_compact_explicitly_configured(),
-                settings.auto_compact_threshold_percent,
-                cfg.stream_chunk_timeout_secs(),
+                .is_some_and(|provider| !provider.trim().is_empty());
+        let identity = if has_persisted_route {
+            config.resolve_persisted_provider_identity(
+                thread.model_provider.as_deref(),
+                thread.model_provider_id.as_deref(),
             )
+        } else {
+            config.active_provider_identity(config.api_provider())
         };
+        identity.map_err(|reason| anyhow!(reason))
+    }
 
-        // Keep each already-loaded engine on its actual provider/model route.
-        // `SetModel` cannot swap the provider client; the next `SendMessage`
-        // performs provider activation if a turn explicitly selects another
-        // route.
-        let entries: Vec<(String, EngineHandle, ApiProvider, String)> = {
+    /// Atomically replace the authoritative runtime config after preflighting
+    /// every loaded thread's exact route. Active turns retain their immutable
+    /// descriptor; the next `start_turn` resolves and installs the new route.
+    pub async fn reload_config(&self, new_config: Config) -> Result<()> {
+        let entries: Vec<(String, EngineHandle, ProviderIdentity, String)> = {
             let active = self.active.lock().await;
             active
                 .engines
@@ -1081,44 +1094,51 @@ impl RuntimeThreadManager {
                     (
                         id.clone(),
                         state.engine.clone(),
-                        state.route_provider,
+                        state.route_identity.clone(),
                         state.route_model.clone(),
                     )
                 })
                 .collect()
         };
 
-        for (thread_id, engine, provider, engine_model) in entries {
-            let route = match resolve_runtime_thread_route(&config, provider, Some(&engine_model)) {
-                Ok(route) => route,
-                Err(err) => {
-                    tracing::warn!(
-                        thread_id = %thread_id,
-                        provider = provider.as_str(),
-                        model = %engine_model,
-                        error = %err,
-                        "Skipped runtime engine route sync"
-                    );
-                    continue;
-                }
-            };
-            let route_limits = route.limits;
+        let mut validated = Vec::with_capacity(entries.len());
+        let mut failures = Vec::new();
+        for (thread_id, engine, provider_identity, engine_model) in entries {
+            match resolve_runtime_thread_route_for_identity(
+                &new_config,
+                &provider_identity,
+                Some(&engine_model),
+            ) {
+                Ok(route) => validated.push((thread_id, engine, route)),
+                Err(err) => failures.push(format!("{thread_id}: {err}")),
+            }
+        }
+        if !failures.is_empty() {
+            bail!(
+                "Config reload rejected because active thread routes are invalid: {}",
+                failures.join("; ")
+            );
+        }
+
+        {
+            let mut guard = self.config.write();
+            *guard = new_config;
+        }
+
+        let settings = crate::settings::Settings::load().unwrap_or_default();
+        let stream_chunk_timeout_secs = self.read_config().stream_chunk_timeout_secs();
+        for (thread_id, engine, route) in validated {
+            let provider = route.identity.provider;
+            let route_limits = known_route_limits(route.candidate.limits);
             let engine_compaction = runtime_compaction_config(
                 provider,
                 &route.model,
                 route_limits,
-                auto_compact,
-                auto_compact_explicit,
-                auto_compact_threshold_percent,
+                settings.auto_compact,
+                crate::settings::Settings::auto_compact_explicitly_configured(),
+                settings.auto_compact_threshold_percent,
             );
-
-            let _ = engine
-                .send(Op::SetModel {
-                    model: route.model.clone(),
-                    mode: crate::tui::app::AppMode::Agent,
-                    route_limits,
-                })
-                .await;
+            let route_config = route.config;
             let _ = engine
                 .send(Op::SetCompaction {
                     config: engine_compaction,
@@ -1131,24 +1151,23 @@ impl RuntimeThreadManager {
                 .await;
             let _ = engine
                 .send(Op::SetSubagentRuntimeConfig {
-                    enabled: config.subagents_enabled_for_provider(provider),
-                    max_subagents: config
+                    enabled: route_config.subagents_enabled_for_provider(provider),
+                    max_subagents: route_config
                         .max_subagents_for_provider(provider)
                         .clamp(1, crate::config::MAX_SUBAGENTS),
-                    launch_concurrency: config.launch_concurrency_for_provider(provider),
-                    max_spawn_depth: config.subagent_max_spawn_depth_for_provider(provider),
-                    api_timeout_secs: config.subagent_api_timeout_secs_for_provider(provider),
-                    heartbeat_timeout_secs: config
+                    launch_concurrency: route_config.launch_concurrency_for_provider(provider),
+                    max_spawn_depth: route_config.subagent_max_spawn_depth_for_provider(provider),
+                    api_timeout_secs: route_config.subagent_api_timeout_secs_for_provider(provider),
+                    heartbeat_timeout_secs: route_config
                         .subagent_heartbeat_timeout_secs_for_provider(provider),
                 })
                 .await;
-
-            if let Some(state) = self.active.lock().await.engines.get_mut(&thread_id) {
-                state.route_model = route.model;
-            }
-
-            tracing::info!(thread_id = %thread_id, "Synced engine with reloaded config");
+            tracing::info!(
+                thread_id = %thread_id,
+                "Reloaded runtime controls; provider route will apply on the next turn"
+            );
         }
+        Ok(())
     }
 
     pub fn open(
@@ -1360,24 +1379,39 @@ impl RuntimeThreadManager {
 
     pub async fn create_thread(&self, req: CreateThreadRequest) -> Result<ThreadRecord> {
         let now = Utc::now();
-        let model_provider = {
-            let config = self.read_config();
-            let requested = req.model_provider.as_deref().unwrap_or_else(|| {
-                config
+        let (model_provider, model_provider_id, default_model) = {
+            let config = self.read_config().clone();
+            let requested_kind = req
+                .model_provider
+                .as_deref()
+                .filter(|provider| !provider.trim().is_empty());
+            let requested_id = req
+                .model_provider_id
+                .as_deref()
+                .filter(|provider| !provider.trim().is_empty());
+            let identity = if requested_kind.is_some() || requested_id.is_some() {
+                config.resolve_persisted_provider_identity(requested_kind, requested_id)
+            } else {
+                let selected = config
                     .provider
                     .as_deref()
-                    .unwrap_or(ApiProvider::Deepseek.as_str())
-            });
-            config
-                .resolve_provider_identity(requested)
+                    .unwrap_or(ApiProvider::Deepseek.as_str());
+                config.resolve_provider_identity(selected)
+            }
+            .map_err(|reason| anyhow!(reason))?;
+            let default_model = resolve_runtime_route_for_identity(&config, &identity, None)
                 .map_err(|reason| anyhow!(reason))?
-                .key
+                .model;
+            (
+                identity.provider.as_str().to_string(),
+                identity.exact_id,
+                default_model,
+            )
         };
         let model = req
             .model
             .filter(|m| !m.trim().is_empty())
-            .or_else(|| self.read_config().default_text_model.clone())
-            .unwrap_or_else(|| DEFAULT_TEXT_MODEL.to_string());
+            .unwrap_or(default_model);
         let workspace = req.workspace.unwrap_or_else(|| self.workspace.clone());
         let mode = req
             .mode
@@ -1396,6 +1430,7 @@ impl RuntimeThreadManager {
             updated_at: now,
             model,
             model_provider: Some(model_provider),
+            model_provider_id,
             workspace,
             mode,
             allow_shell,
@@ -1482,12 +1517,13 @@ impl RuntimeThreadManager {
                     .as_deref()
                     .filter(|model| !model.trim().is_empty())
                     .unwrap_or(&thread.model);
-                let provider_label = turn
+                let provider_kind = turn
                     .effective_provider
                     .as_deref()
                     .filter(|provider| !provider.trim().is_empty())
                     .unwrap_or("unknown");
-                let provider = ApiProvider::parse(provider_label);
+                let provider_label = turn.effective_provider_label().unwrap_or(provider_kind);
+                let provider = ApiProvider::parse(provider_kind);
                 let cost = provider
                     .and_then(|provider| {
                         crate::pricing::calculate_turn_cost_estimate_for_route_at(
@@ -2220,6 +2256,7 @@ impl RuntimeThreadManager {
                     duration_ms: Some(0),
                     usage: None,
                     effective_provider: None,
+                    effective_provider_id: None,
                     effective_billing_surface: None,
                     effective_model: None,
                     error: None,
@@ -2253,14 +2290,18 @@ impl RuntimeThreadManager {
         let mut thread = self.get_thread(thread_id).await?;
         let engine = self.ensure_engine_loaded(&thread).await?;
 
-        {
+        let client_preflight_required = {
             let active = self.active.lock().await;
             if let Some(active_thread) = active.engines.get(thread_id)
                 && active_thread.active_turn.is_some()
             {
                 bail!("Thread already has an active turn");
             }
-        }
+            active
+                .engines
+                .get(thread_id)
+                .is_none_or(|state| state.client_preflight_required)
+        };
 
         // Resolve the concrete provider/model before persisting a turn. Auto
         // routing can fail, and such a failure must not leave a zombie
@@ -2273,10 +2314,13 @@ impl RuntimeThreadManager {
         let requested_model = req.model.as_deref().unwrap_or(&thread.model).to_string();
         let auto_model = requested_model.trim().eq_ignore_ascii_case("auto");
         let cfg_snapshot = self.config.read().clone();
-        let verbosity = cfg_snapshot.verbosity.clone();
+        let identity = self.provider_identity_for_thread(&cfg_snapshot, &thread)?;
+        let mut thread_config = cfg_snapshot.clone();
+        thread_config.scope_to_provider_identity(&identity);
+        let verbosity = thread_config.verbosity.clone();
         let (route, reasoning_effort) = if auto_model {
             let selection = crate::model_routing::resolve_auto_route_with_inventory(
-                &cfg_snapshot,
+                &thread_config,
                 &prompt,
                 "",
                 "auto",
@@ -2284,7 +2328,7 @@ impl RuntimeThreadManager {
             )
             .await?;
             let route = resolve_runtime_thread_route(
-                &cfg_snapshot,
+                &thread_config,
                 selection.provider,
                 Some(&selection.model),
             )?;
@@ -2295,22 +2339,26 @@ impl RuntimeThreadManager {
                     .map(|effort| effort.as_setting().to_string()),
             )
         } else {
-            let identity = self.provider_identity_for_thread(&cfg_snapshot, &thread)?;
-            let mut thread_config = cfg_snapshot.clone();
-            thread_config.provider = Some(identity.key);
             (
-                resolve_runtime_thread_route(
-                    &thread_config,
-                    identity.provider,
+                resolve_runtime_thread_route_for_identity(
+                    &cfg_snapshot,
+                    &identity,
                     Some(&requested_model),
                 )?,
                 None,
             )
         };
-        let provider = route.provider;
-        let provider_identity = route.provider_identity.clone();
-        let model = route.model;
-        let route_limits = route.limits;
+        let route = if client_preflight_required {
+            route
+                .preflight()
+                .map_err(|reason| anyhow!("Failed to validate runtime thread route: {reason}"))?
+        } else {
+            route
+        };
+        let provider = route.identity.provider;
+        let provider_identity = route.identity.clone();
+        let model = route.model.clone();
+        let route_limits = known_route_limits(route.candidate.limits);
         let settings = crate::settings::Settings::load().unwrap_or_default();
         let compaction = runtime_compaction_config(
             provider,
@@ -2337,7 +2385,8 @@ impl RuntimeThreadManager {
             ended_at: None,
             duration_ms: None,
             usage: None,
-            effective_provider: Some(provider_identity),
+            effective_provider: Some(provider.as_str().to_string()),
+            effective_provider_id: provider_identity.exact_id.clone(),
             effective_billing_surface: None,
             effective_model: Some(model.clone()),
             error: None,
@@ -2404,7 +2453,7 @@ impl RuntimeThreadManager {
                 auto_approve: req.auto_approve.unwrap_or(thread.auto_approve),
                 trust_mode: req.trust_mode.unwrap_or(thread.trust_mode),
             });
-            state.route_provider = provider;
+            state.route_identity = provider_identity;
             state.route_model.clone_from(&model);
             touch_lru(&mut active.lru, thread_id);
         }
@@ -2416,9 +2465,7 @@ impl RuntimeThreadManager {
             .send(Op::SendMessage {
                 content: prompt,
                 mode,
-                provider: Some(provider),
-                model: model.clone(),
-                route_limits,
+                route: Box::new(route),
                 compaction: Box::new(compaction),
                 goal_objective: None,
                 goal_token_budget: None,
@@ -2601,7 +2648,7 @@ impl RuntimeThreadManager {
         let mut thread = self.get_thread(thread_id).await?;
         let engine = self.ensure_engine_loaded(&thread).await?;
 
-        let (route_provider, route_model) = {
+        let client_preflight_required = {
             let active = self.active.lock().await;
             let Some(active_thread) = active.engines.get(thread_id) else {
                 bail!("Thread engine not loaded");
@@ -2609,11 +2656,29 @@ impl RuntimeThreadManager {
             if active_thread.active_turn.is_some() {
                 bail!("Thread already has an active turn");
             }
-            (
-                active_thread.route_provider,
-                active_thread.route_model.clone(),
-            )
+            active_thread.client_preflight_required
         };
+        let route = self.resolved_route_for_thread(&self.read_config(), &thread)?;
+        let route = if client_preflight_required {
+            route
+                .preflight()
+                .map_err(|reason| anyhow!("Failed to validate runtime thread route: {reason}"))?
+        } else {
+            route
+        };
+        let route_provider = route.identity.provider;
+        let route_identity = route.identity.clone();
+        let route_model = route.model.clone();
+        let route_limits = known_route_limits(route.candidate.limits);
+        let settings = crate::settings::Settings::load().unwrap_or_default();
+        let compaction = runtime_compaction_config(
+            route_provider,
+            &route_model,
+            route_limits,
+            settings.auto_compact,
+            crate::settings::Settings::auto_compact_explicitly_configured(),
+            settings.auto_compact_threshold_percent,
+        );
 
         let now = Utc::now();
         let turn_id = format!("turn_{}", &Uuid::new_v4().to_string()[..8]);
@@ -2633,8 +2698,9 @@ impl RuntimeThreadManager {
             duration_ms: None,
             usage: None,
             effective_provider: Some(route_provider.as_str().to_string()),
+            effective_provider_id: route_identity.exact_id.clone(),
             effective_billing_surface: None,
-            effective_model: Some(route_model),
+            effective_model: Some(route_model.clone()),
             error: None,
             item_ids: Vec::new(),
             steer_count: 0,
@@ -2656,6 +2722,8 @@ impl RuntimeThreadManager {
                 auto_approve: thread.auto_approve,
                 trust_mode: thread.trust_mode,
             });
+            state.route_identity = route_identity;
+            state.route_model = route_model;
             touch_lru(&mut active.lru, thread_id);
         }
 
@@ -2669,7 +2737,10 @@ impl RuntimeThreadManager {
         .await?;
 
         engine
-            .send(Op::CompactContext)
+            .send(Op::CompactContext {
+                route: Box::new(route),
+                compaction: Box::new(compaction),
+            })
             .await
             .map_err(|e| anyhow!("Failed to trigger compaction: {e}"))?;
 
@@ -2737,9 +2808,10 @@ impl RuntimeThreadManager {
         // route limits, compaction budget, and restored session all agree.
         let base_config = self.read_config().clone();
         let route = self.resolved_route_for_thread(&base_config, thread)?;
-        let provider = route.provider;
+        let provider = route.identity.provider;
+        let route_identity = route.identity;
         let route_model = route.model;
-        let route_limits = route.limits;
+        let route_limits = known_route_limits(route.candidate.limits);
         let cfg = route.config;
 
         // Resolve the provider-route-aware auto-compaction default unless the
@@ -2855,7 +2927,11 @@ impl RuntimeThreadManager {
             terminal_chrome_enabled: false,
         };
 
-        let engine = spawn_engine(engine_cfg, &cfg);
+        let engine = spawn_engine_with_authoritative_route_config(
+            engine_cfg,
+            &cfg,
+            Arc::clone(&self.config),
+        );
 
         // When the thread has an associated session, load the full message history
         // (including thinking/tool blocks) from the session file. This preserves
@@ -2923,8 +2999,9 @@ impl RuntimeThreadManager {
             ActiveThreadState {
                 engine: engine.clone(),
                 active_turn: None,
-                route_provider: provider,
+                route_identity,
                 route_model,
+                client_preflight_required: true,
             },
         );
         touch_lru(&mut active.lru, &thread.id);
@@ -4076,8 +4153,9 @@ impl RuntimeThreadManager {
             ActiveThreadState {
                 engine,
                 active_turn: None,
-                route_provider: route.provider,
+                route_identity: route.identity,
                 route_model: route.model,
+                client_preflight_required: false,
             },
         );
         touch_lru(&mut active.lru, thread_id);

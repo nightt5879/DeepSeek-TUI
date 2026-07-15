@@ -347,7 +347,14 @@ impl ProviderDashboardRow {
         config: &Config,
         runtime_status: Option<&ProviderRuntimeStatus>,
     ) -> Self {
-        Self::from_config_with_provider_id(provider, active, config, None, runtime_status)
+        Self::from_config_with_provider_id(
+            provider,
+            active,
+            config,
+            None,
+            config.provider.as_deref(),
+            runtime_status,
+        )
     }
 
     fn from_custom_config_with_runtime_status(
@@ -363,6 +370,7 @@ impl ProviderDashboardRow {
             active,
             &scoped,
             Some(provider_id),
+            config.provider.as_deref(),
             runtime_status,
         )
     }
@@ -372,6 +380,7 @@ impl ProviderDashboardRow {
         active: ApiProvider,
         config: &Config,
         provider_id_override: Option<&str>,
+        active_provider_id: Option<&str>,
         runtime_status: Option<&ProviderRuntimeStatus>,
     ) -> Self {
         let configured = config.provider_config_for(provider);
@@ -403,7 +412,7 @@ impl ProviderDashboardRow {
         let is_active = if provider == ApiProvider::Custom {
             active == ApiProvider::Custom
                 && match provider_id_override {
-                    Some(id) => config.provider.as_deref() == Some(id),
+                    Some(id) => active_provider_id == Some(id),
                     None => true,
                 }
         } else {
@@ -3745,6 +3754,49 @@ mod tests {
             row.messages
         );
         assert_eq!(picker.rows[picker.selected_idx].provider_id, "my_thing");
+    }
+
+    #[test]
+    fn provider_picker_marks_only_exact_active_custom_row() {
+        let custom = std::collections::HashMap::from([
+            (
+                "custom-a".to_string(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+                    model: Some("model-a".to_string()),
+                    api_key: Some("test-key-a".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "custom-b".to_string(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some("http://127.0.0.1:18182/v1".to_string()),
+                    model: Some("model-b".to_string()),
+                    api_key: Some("test-key-b".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let config = Config {
+            provider: Some("custom-a".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom,
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+
+        let rows = custom_provider_dashboard_rows(ApiProvider::Custom, &config, None);
+        let active_ids: Vec<_> = rows
+            .iter()
+            .filter(|row| row.is_active)
+            .map(|row| row.provider_id.as_str())
+            .collect();
+
+        assert_eq!(active_ids, vec!["custom-a"]);
     }
 
     #[test]

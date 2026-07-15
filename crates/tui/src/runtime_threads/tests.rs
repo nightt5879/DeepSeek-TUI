@@ -51,6 +51,7 @@ fn sample_thread(thread_id: &str) -> ThreadRecord {
         updated_at: now,
         model: DEFAULT_TEXT_MODEL.to_string(),
         model_provider: None,
+        model_provider_id: None,
         workspace: PathBuf::from("."),
         mode: AppMode::Agent.as_setting().to_string(),
         allow_shell: false,
@@ -80,6 +81,7 @@ fn sample_turn(thread_id: &str, turn_id: &str, status: RuntimeTurnStatus) -> Tur
         duration_ms: None,
         usage: None,
         effective_provider: None,
+        effective_provider_id: None,
         effective_billing_surface: None,
         effective_model: None,
         error: None,
@@ -117,6 +119,7 @@ fn legacy_turn_record_has_no_invented_route_provenance() {
     let mut value = serde_json::to_value(turn).expect("serialize turn");
     let object = value.as_object_mut().expect("turn object");
     object.remove("effective_provider");
+    object.remove("effective_provider_id");
     object.remove("effective_billing_surface");
     object.remove("effective_model");
 
@@ -160,14 +163,16 @@ async fn named_custom_thread_identity_round_trips_and_fails_closed_when_removed(
         })
         .await?;
     let persisted = manager.get_thread(&thread.id).await?;
-    assert_eq!(persisted.model_provider.as_deref(), Some("lm-studio"));
+    assert_eq!(persisted.model_provider.as_deref(), Some("custom"));
+    assert_eq!(persisted.model_provider_id.as_deref(), Some("lm-studio"));
     let serialized = serde_json::to_string(&persisted)?;
-    assert!(serialized.contains("\"model_provider\":\"lm-studio\""));
+    assert!(serialized.contains("\"model_provider\":\"custom\""));
+    assert!(serialized.contains("\"model_provider_id\":\"lm-studio\""));
     assert!(!serialized.contains("127.0.0.1:1234"));
 
     let route = manager.resolved_route_for_thread(&config, &persisted)?;
-    assert_eq!(route.provider, ApiProvider::Custom);
-    assert_eq!(route.provider_identity, "lm-studio");
+    assert_eq!(route.identity.provider, ApiProvider::Custom);
+    assert_eq!(route.identity.key, "lm-studio");
     assert_eq!(route.model, "local-code-model");
     assert_eq!(route.config.deepseek_base_url(), "http://127.0.0.1:1234/v1");
 
@@ -183,8 +188,678 @@ async fn named_custom_thread_identity_round_trips_and_fails_closed_when_removed(
         .as_object_mut()
         .expect("thread object")
         .remove("model_provider");
+    legacy_value
+        .as_object_mut()
+        .expect("thread object")
+        .remove("model_provider_id");
     let legacy: ThreadRecord = serde_json::from_value(legacy_value)?;
     assert_eq!(legacy.model_provider, None);
+    Ok(())
+}
+
+#[test]
+fn legacy_literal_custom_thread_resume_requires_and_keeps_root_route() -> Result<()> {
+    let config = Config {
+        provider: Some("custom".to_string()),
+        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
+        default_text_model: Some("legacy-default-model".to_string()),
+        ..Config::default()
+    };
+    let manager = RuntimeThreadManager::open(
+        config.clone(),
+        PathBuf::from("."),
+        test_manager_config(test_runtime_dir()),
+    )?;
+    let mut persisted = sample_thread("thr_legacy_custom");
+    persisted.model = "legacy-saved-model".to_string();
+    persisted.model_provider = Some("custom".to_string());
+    let restored: ThreadRecord = serde_json::from_str(&serde_json::to_string(&persisted)?)?;
+
+    let route = manager.resolved_route_for_thread(&config, &restored)?;
+    assert_eq!(route.identity.provider, ApiProvider::Custom);
+    assert_eq!(route.identity.key, "custom");
+    assert_eq!(route.model, "legacy-saved-model");
+    assert_eq!(
+        route.config.deepseek_base_url(),
+        "http://127.0.0.1:18180/v1"
+    );
+    assert!(
+        route
+            .config
+            .providers
+            .as_ref()
+            .is_none_or(|providers| !providers.custom.contains_key("custom")),
+        "route resolution must not synthesize an ambiguous [providers.custom] table"
+    );
+    assert_eq!(
+        route
+            .config
+            .resolve_provider_identity("custom")
+            .map_err(anyhow::Error::msg)?,
+        crate::config::ProviderIdentity {
+            provider: ApiProvider::Custom,
+            key: "custom".to_string(),
+            exact_id: None,
+        }
+    );
+    let repeated = manager.resolved_route_for_thread(&route.config, &restored)?;
+    assert_eq!(repeated.identity.key, "custom");
+    assert_eq!(repeated.model, "legacy-saved-model");
+    assert_eq!(
+        repeated.config.deepseek_base_url(),
+        "http://127.0.0.1:18180/v1"
+    );
+
+    let named_config = {
+        let mut custom = std::collections::HashMap::new();
+        custom.insert(
+            "lm-studio".to_string(),
+            crate::config::ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+                model: Some("named-model".to_string()),
+                ..crate::config::ProviderConfig::default()
+            },
+        );
+        Config {
+            provider: Some("lm-studio".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom,
+                ..crate::config::ProvidersConfig::default()
+            }),
+            ..Config::default()
+        }
+    };
+    let error = manager
+        .resolved_route_for_thread(&named_config, &restored)
+        .expect_err("id-less root record must not migrate to a named table")
+        .to_string();
+    assert!(error.contains("root-level"), "{error}");
+    assert!(error.contains("will not guess or fall back"), "{error}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn root_custom_thread_and_turn_writers_omit_exact_id() -> Result<()> {
+    let config = Config {
+        provider: Some("custom".to_string()),
+        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
+        default_text_model: Some("legacy-root-model".to_string()),
+        ..Config::default()
+    };
+    let manager = RuntimeThreadManager::open(
+        config,
+        PathBuf::from("."),
+        test_manager_config(test_runtime_dir()),
+    )?;
+    let thread = manager
+        .create_thread(CreateThreadRequest {
+            model: Some("legacy-root-model".to_string()),
+            ..CreateThreadRequest::default()
+        })
+        .await?;
+    assert_eq!(thread.model_provider.as_deref(), Some("custom"));
+    assert_eq!(thread.model_provider_id, None);
+    assert!(!serde_json::to_string(&thread)?.contains("model_provider_id"));
+
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "keep the root route".to_string(),
+                ..StartTurnRequest::default()
+            },
+        )
+        .await?;
+    assert_eq!(turn.effective_provider.as_deref(), Some("custom"));
+    assert_eq!(turn.effective_provider_id, None);
+    assert!(!serde_json::to_string(&turn)?.contains("effective_provider_id"));
+    match harness.rx_op.recv().await {
+        Some(Op::SendMessage { route, .. }) => {
+            assert_eq!(route.identity.key, "custom");
+            assert_eq!(route.identity.exact_id, None);
+            assert_eq!(
+                route.config.deepseek_base_url(),
+                "http://127.0.0.1:18180/v1"
+            );
+        }
+        other => panic!("expected root custom send, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn real_turn_client_preflight_failure_writes_no_in_progress_record() -> Result<()> {
+    let mut custom = std::collections::HashMap::new();
+    custom.insert(
+        "preflight-failure".to_string(),
+        crate::config::ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("https://preflight.invalid/v1".to_string()),
+            model: Some("preflight-model".to_string()),
+            api_key: Some("test-key".to_string()),
+            // Client construction rejects this independently of ambient auth,
+            // keeping the async regression hermetic without a global env lock.
+            insecure_skip_tls_verify: Some(true),
+            ..crate::config::ProviderConfig::default()
+        },
+    );
+    let manager = RuntimeThreadManager::open(
+        Config {
+            provider: Some("preflight-failure".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom,
+                ..crate::config::ProvidersConfig::default()
+            }),
+            ..Config::default()
+        },
+        PathBuf::from("."),
+        test_manager_config(test_runtime_dir()),
+    )?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+
+    let error = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "must not become a zombie turn".to_string(),
+                ..StartTurnRequest::default()
+            },
+        )
+        .await
+        .expect_err("missing credentials must fail before turn persistence")
+        .to_string();
+
+    assert!(
+        error.contains("TLS certificate verification cannot be disabled"),
+        "{error}"
+    );
+    assert!(manager.store.list_turns_for_thread(&thread.id)?.is_empty());
+    assert_eq!(manager.get_thread(&thread.id).await?.latest_turn_id, None);
+    Ok(())
+}
+
+#[test]
+fn legacy_custom_thread_stays_on_root_when_literal_table_coexists() -> Result<()> {
+    let mut custom = std::collections::HashMap::new();
+    custom.insert(
+        "custom".to_string(),
+        crate::config::ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("http://127.0.0.1:18182/v1".to_string()),
+            model: Some("table-model".to_string()),
+            ..crate::config::ProviderConfig::default()
+        },
+    );
+    let config = Config {
+        provider: Some("custom".to_string()),
+        base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+        default_text_model: Some("legacy-root-model".to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom,
+            ..crate::config::ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+    let manager = RuntimeThreadManager::open(
+        config.clone(),
+        PathBuf::from("."),
+        test_manager_config(test_runtime_dir()),
+    )?;
+    let mut legacy = sample_thread("thr_ambiguous_legacy_custom");
+    legacy.model = "legacy-saved-model".to_string();
+    legacy.model_provider = Some("custom".to_string());
+    legacy.model_provider_id = None;
+
+    let root = manager.resolved_route_for_thread(&config, &legacy)?;
+    assert_eq!(root.identity.provider, ApiProvider::Custom);
+    assert_eq!(root.identity.key, "custom");
+    assert_eq!(root.identity.exact_id, None);
+    assert_eq!(root.config.deepseek_base_url(), "http://127.0.0.1:18181/v1");
+
+    legacy.model_provider_id = Some("custom".to_string());
+    let exact = manager.resolved_route_for_thread(&config, &legacy)?;
+    assert_eq!(exact.identity.provider, ApiProvider::Custom);
+    assert_eq!(exact.identity.key, "custom");
+    assert_eq!(exact.identity.exact_id.as_deref(), Some("custom"));
+    assert_eq!(
+        exact.config.deepseek_base_url(),
+        "http://127.0.0.1:18182/v1"
+    );
+    let root_only = Config {
+        provider: Some("custom".to_string()),
+        base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+        default_text_model: Some("legacy-root-model".to_string()),
+        ..Config::default()
+    };
+    let error = manager
+        .resolved_route_for_thread(&root_only, &legacy)
+        .expect_err("exact literal table thread must not fall back to root")
+        .to_string();
+    assert!(error.contains("[providers.custom]"), "{error}");
+    assert!(error.contains("will not fall back"), "{error}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_records_and_create_requests_preserve_provider_kind_id_pairing() -> Result<()> {
+    let mut custom = std::collections::HashMap::new();
+    custom.insert(
+        "openai".to_string(),
+        crate::config::ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("http://127.0.0.1:18183/v1".to_string()),
+            model: Some("custom-openai-model".to_string()),
+            ..crate::config::ProviderConfig::default()
+        },
+    );
+    let config = Config {
+        provider: Some("openai".to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom,
+            ..crate::config::ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+    let manager = RuntimeThreadManager::open(
+        config.clone(),
+        PathBuf::from("."),
+        test_manager_config(test_runtime_dir()),
+    )?;
+
+    for provider_id in [None, Some("openai".to_string())] {
+        let mut built_in = sample_thread("thr_builtin_openai_collision");
+        built_in.model_provider = Some("openai".to_string());
+        built_in.model_provider_id = provider_id;
+        let error = manager
+            .resolved_route_for_thread(&config, &built_in)
+            .expect_err("built-in thread must not route through same-key custom endpoint")
+            .to_string();
+        assert!(error.contains("requires built-in 'openai'"), "{error}");
+        assert!(error.contains("shadows"), "{error}");
+    }
+
+    let mut exact_custom = sample_thread("thr_custom_openai_collision");
+    exact_custom.model = "custom-openai-model".to_string();
+    exact_custom.model_provider = Some("custom".to_string());
+    exact_custom.model_provider_id = Some("openai".to_string());
+    let route = manager.resolved_route_for_thread(&config, &exact_custom)?;
+    assert_eq!(route.identity.provider, ApiProvider::Custom);
+    assert_eq!(route.identity.key, "openai");
+    assert_eq!(
+        route.config.deepseek_base_url(),
+        "http://127.0.0.1:18183/v1"
+    );
+
+    let mut auto_thread = exact_custom.clone();
+    auto_thread.id = "thr_auto_openai_collision".to_string();
+    auto_thread.model = "auto".to_string();
+    manager.store.save_thread(&auto_thread)?;
+    let mut restored_turn = sample_turn(
+        &auto_thread.id,
+        "turn_openai_collision",
+        RuntimeTurnStatus::Completed,
+    );
+    restored_turn.effective_provider = Some("openai".to_string());
+    restored_turn.effective_provider_id = None;
+    restored_turn.effective_model = Some("custom-openai-model".to_string());
+    manager.store.save_turn(&restored_turn)?;
+    let turn_error = manager
+        .resolved_route_for_thread(&config, &auto_thread)
+        .expect_err("restored built-in turn must not be captured by custom endpoint")
+        .to_string();
+    assert!(
+        turn_error.contains("requires built-in 'openai'"),
+        "{turn_error}"
+    );
+
+    restored_turn.effective_provider = Some("custom".to_string());
+    restored_turn.effective_provider_id = Some("openai".to_string());
+    manager.store.save_turn(&restored_turn)?;
+    let restored_custom = manager.resolved_route_for_thread(&config, &auto_thread)?;
+    assert_eq!(restored_custom.identity.provider, ApiProvider::Custom);
+    assert_eq!(restored_custom.identity.key, "openai");
+    assert_eq!(restored_custom.model, "custom-openai-model");
+
+    let request_error = manager
+        .create_thread(CreateThreadRequest {
+            model_provider: Some("openai".to_string()),
+            model_provider_id: Some("openai".to_string()),
+            ..CreateThreadRequest::default()
+        })
+        .await
+        .expect_err("built-in request must fail closed under exact custom shadow")
+        .to_string();
+    assert!(
+        request_error.contains("requires built-in 'openai'"),
+        "{request_error}"
+    );
+
+    let created = manager
+        .create_thread(CreateThreadRequest {
+            model_provider: Some("custom".to_string()),
+            model_provider_id: Some("openai".to_string()),
+            ..CreateThreadRequest::default()
+        })
+        .await?;
+    assert_eq!(created.model_provider.as_deref(), Some("custom"));
+    assert_eq!(created.model_provider_id.as_deref(), Some("openai"));
+    assert_eq!(created.model, "custom-openai-model");
+    Ok(())
+}
+
+#[tokio::test]
+async fn config_reload_updates_next_turn_route_without_mutating_engine_route() -> Result<()> {
+    let mut custom = std::collections::HashMap::new();
+    custom.insert(
+        "lm-studio".to_string(),
+        crate::config::ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+            model: Some("local-model".to_string()),
+            api_key: Some("old-local-test-key".to_string()),
+            ..crate::config::ProviderConfig::default()
+        },
+    );
+    let config = Config {
+        provider: Some("lm-studio".to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom,
+            ..crate::config::ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+    let manager = RuntimeThreadManager::open(
+        config.clone(),
+        PathBuf::from("."),
+        test_manager_config(test_runtime_dir()),
+    )?;
+    let thread = manager
+        .create_thread(CreateThreadRequest {
+            model: Some("local-model".to_string()),
+            model_provider: Some("lm-studio".to_string()),
+            ..CreateThreadRequest::default()
+        })
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+
+    let mut reloaded = config;
+    let provider = reloaded
+        .providers
+        .as_mut()
+        .and_then(|providers| providers.custom.get_mut("lm-studio"))
+        .expect("named custom provider");
+    provider.base_url = Some("http://127.0.0.1:18182/v1".to_string());
+    provider.api_key = Some("new-local-test-key".to_string());
+    manager.reload_config(reloaded).await?;
+
+    let refreshed = manager.resolved_route_for_thread(&manager.read_config(), &thread)?;
+    assert_eq!(refreshed.identity.key, "lm-studio");
+    assert_eq!(
+        refreshed.config.deepseek_base_url(),
+        "http://127.0.0.1:18182/v1"
+    );
+    for _ in 0..3 {
+        let op = harness.rx_op.recv().await.expect("runtime control op");
+        assert!(
+            matches!(
+                op,
+                Op::SetCompaction { .. }
+                    | Op::SetStreamChunkTimeout { .. }
+                    | Op::SetSubagentRuntimeConfig { .. }
+            ),
+            "reload must not mutate an engine provider route: {op:?}"
+        );
+    }
+    let compact_turn = manager
+        .compact_thread(
+            &thread.id,
+            CompactThreadRequest {
+                reason: Some("verify refreshed route".to_string()),
+            },
+        )
+        .await?;
+    assert_eq!(compact_turn.effective_provider.as_deref(), Some("custom"));
+    assert_eq!(
+        compact_turn.effective_provider_id.as_deref(),
+        Some("lm-studio")
+    );
+    assert_eq!(compact_turn.effective_model.as_deref(), Some("local-model"));
+    match harness.rx_op.recv().await {
+        Some(Op::CompactContext { route, compaction }) => {
+            assert_eq!(route.identity.key, "lm-studio");
+            assert_eq!(
+                route.config.deepseek_base_url(),
+                "http://127.0.0.1:18182/v1"
+            );
+            assert_eq!(compaction.model, "local-model");
+            assert_eq!(
+                compaction.effective_context_window,
+                Some(crate::route_budget::route_context_window_tokens(
+                    ApiProvider::Custom,
+                    "local-model",
+                    crate::route_budget::known_route_limits(route.candidate.limits),
+                ))
+            );
+        }
+        other => panic!("expected typed compact route, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn config_sync_reports_removed_named_custom_route_and_keeps_mailbox_clean() -> Result<()> {
+    let mut custom = std::collections::HashMap::new();
+    custom.insert(
+        "lm-studio".to_string(),
+        crate::config::ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+            model: Some("local-model".to_string()),
+            api_key: Some("local-test-key".to_string()),
+            ..crate::config::ProviderConfig::default()
+        },
+    );
+    let config = Config {
+        provider: Some("lm-studio".to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom,
+            ..crate::config::ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+    let manager = RuntimeThreadManager::open(
+        config,
+        PathBuf::from("."),
+        test_manager_config(test_runtime_dir()),
+    )?;
+    let thread = manager
+        .create_thread(CreateThreadRequest {
+            model: Some("local-model".to_string()),
+            model_provider: Some("lm-studio".to_string()),
+            ..CreateThreadRequest::default()
+        })
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+
+    let err = manager
+        .reload_config(Config::default())
+        .await
+        .expect_err("removed named custom route must fail config reload");
+
+    let message = err.to_string();
+    assert!(message.contains(&thread.id), "{message}");
+    assert!(message.contains("lm-studio"), "{message}");
+    assert!(harness.rx_op.try_recv().is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_thread_uses_requested_named_custom_provider_default_model() -> Result<()> {
+    let mut custom = std::collections::HashMap::new();
+    for (name, base_url, model) in [
+        ("custom-a", "http://127.0.0.1:18181/v1", "model-a"),
+        ("custom-b", "http://127.0.0.1:18182/v1", "model-b"),
+    ] {
+        custom.insert(
+            name.to_string(),
+            crate::config::ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some(base_url.to_string()),
+                model: Some(model.to_string()),
+                ..Default::default()
+            },
+        );
+    }
+    let config = Config {
+        provider: Some("custom-b".to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let manager = RuntimeThreadManager::open(
+        config.clone(),
+        PathBuf::from("."),
+        test_manager_config(test_runtime_dir()),
+    )?;
+
+    let thread = manager
+        .create_thread(CreateThreadRequest {
+            model_provider: Some("custom-a".to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+    assert_eq!(thread.model_provider.as_deref(), Some("custom"));
+    assert_eq!(thread.model_provider_id.as_deref(), Some("custom-a"));
+    assert_eq!(thread.model, "model-a");
+    let route = manager.resolved_route_for_thread(&config, &thread)?;
+    assert_eq!(route.identity.key, "custom-a");
+    assert_eq!(
+        route.config.deepseek_base_url(),
+        "http://127.0.0.1:18181/v1"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_thread_uses_requested_non_current_builtin_default_model() -> Result<()> {
+    let config = Config {
+        provider: Some("openrouter".to_string()),
+        default_text_model: Some(DEFAULT_TEXT_MODEL.to_string()),
+        ..Default::default()
+    };
+    let manager = RuntimeThreadManager::open(
+        config,
+        PathBuf::from("."),
+        test_manager_config(test_runtime_dir()),
+    )?;
+
+    let thread = manager
+        .create_thread(CreateThreadRequest {
+            model_provider: Some("zai".to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+    assert_eq!(thread.model_provider.as_deref(), Some("zai"));
+    assert_eq!(thread.model, crate::config::DEFAULT_ZAI_MODEL);
+    Ok(())
+}
+
+#[tokio::test]
+async fn simultaneous_named_custom_auto_threads_keep_exact_routes() -> Result<()> {
+    let mut custom = std::collections::HashMap::new();
+    for (name, base_url, model) in [
+        ("custom-a", "http://127.0.0.1:18181/v1", "model-a"),
+        ("custom-b", "http://127.0.0.1:18182/v1", "model-b"),
+    ] {
+        custom.insert(
+            name.to_string(),
+            crate::config::ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some(base_url.to_string()),
+                model: Some(model.to_string()),
+                ..Default::default()
+            },
+        );
+    }
+    let manager = RuntimeThreadManager::open(
+        Config {
+            provider: Some("custom-b".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        PathBuf::from("."),
+        test_manager_config(test_runtime_dir()),
+    )?;
+    let thread_a = manager
+        .create_thread(CreateThreadRequest {
+            model: Some("auto".to_string()),
+            model_provider: Some("custom-a".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let thread_b = manager
+        .create_thread(CreateThreadRequest {
+            model: Some("auto".to_string()),
+            model_provider: Some("custom-b".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let mut harness_a = install_mock_engine(&manager, &thread_a.id).await;
+    let mut harness_b = install_mock_engine(&manager, &thread_b.id).await;
+
+    let request_a = manager.start_turn(
+        &thread_a.id,
+        StartTurnRequest {
+            prompt: "route A".to_string(),
+            ..Default::default()
+        },
+    );
+    let request_b = manager.start_turn(
+        &thread_b.id,
+        StartTurnRequest {
+            prompt: "route B".to_string(),
+            ..Default::default()
+        },
+    );
+    let (turn_a, turn_b) = tokio::join!(request_a, request_b);
+    let turn_a = turn_a?;
+    let turn_b = turn_b?;
+
+    assert_eq!(turn_a.effective_provider.as_deref(), Some("custom"));
+    assert_eq!(turn_a.effective_provider_id.as_deref(), Some("custom-a"));
+    assert_eq!(turn_a.effective_model.as_deref(), Some("model-a"));
+    assert_eq!(turn_b.effective_provider.as_deref(), Some("custom"));
+    assert_eq!(turn_b.effective_provider_id.as_deref(), Some("custom-b"));
+    assert_eq!(turn_b.effective_model.as_deref(), Some("model-b"));
+    match harness_a.rx_op.recv().await {
+        Some(Op::SendMessage { route, .. }) => {
+            assert_eq!(route.identity.provider, ApiProvider::Custom);
+            assert_eq!(route.identity.key, "custom-a");
+            assert_eq!(route.model, "model-a");
+        }
+        other => panic!("expected custom A send, got {other:?}"),
+    }
+    match harness_b.rx_op.recv().await {
+        Some(Op::SendMessage { route, .. }) => {
+            assert_eq!(route.identity.provider, ApiProvider::Custom);
+            assert_eq!(route.identity.key, "custom-b");
+            assert_eq!(route.model, "model-b");
+        }
+        other => panic!("expected custom B send, got {other:?}"),
+    }
     Ok(())
 }
 
@@ -347,17 +1022,10 @@ async fn install_mock_engine(
     thread_id: &str,
 ) -> crate::core::engine::MockEngineHandle {
     let harness = mock_engine_handle();
-    let mut active = manager.active.lock().await;
-    active.engines.insert(
-        thread_id.to_string(),
-        ActiveThreadState {
-            engine: harness.handle.clone(),
-            active_turn: None,
-            route_provider: ApiProvider::Deepseek,
-            route_model: DEFAULT_TEXT_MODEL.to_string(),
-        },
-    );
-    touch_lru(&mut active.lru, thread_id);
+    manager
+        .install_test_engine(thread_id, harness.handle.clone())
+        .await
+        .expect("install mock engine");
     harness
 }
 
@@ -746,8 +1414,13 @@ fn enforce_lru_capacity_does_not_loop_when_all_threads_are_active() {
                 auto_approve: true,
                 trust_mode: false,
             }),
-            route_provider: ApiProvider::Deepseek,
+            route_identity: crate::config::ProviderIdentity {
+                provider: ApiProvider::Deepseek,
+                key: "deepseek".to_string(),
+                exact_id: Some("deepseek".to_string()),
+            },
             route_model: DEFAULT_TEXT_MODEL.to_string(),
+            client_preflight_required: false,
         },
     );
     active.engines.insert(
@@ -760,8 +1433,13 @@ fn enforce_lru_capacity_does_not_loop_when_all_threads_are_active() {
                 auto_approve: true,
                 trust_mode: false,
             }),
-            route_provider: ApiProvider::Deepseek,
+            route_identity: crate::config::ProviderIdentity {
+                provider: ApiProvider::Deepseek,
+                key: "deepseek".to_string(),
+                exact_id: Some("deepseek".to_string()),
+            },
             route_model: DEFAULT_TEXT_MODEL.to_string(),
+            client_preflight_required: false,
         },
     );
     active.lru.push_back("thr_a".to_string());
@@ -1357,7 +2035,10 @@ async fn compact_thread_preserves_thread_auto_approve_policy() -> Result<()> {
         .compact_thread(&thread.id, CompactThreadRequest::default())
         .await?;
 
-    assert!(matches!(rx_op.recv().await, Some(Op::CompactContext)));
+    assert!(matches!(
+        rx_op.recv().await,
+        Some(Op::CompactContext { .. })
+    ));
     assert_eq!(
         manager.active_turn_flags(&thread.id, &turn.id).await,
         Some((false, false))
@@ -1367,8 +2048,62 @@ async fn compact_thread_preserves_thread_auto_approve_policy() -> Result<()> {
 }
 
 #[tokio::test]
+async fn compact_thread_receipt_keeps_exact_named_custom_identity() -> Result<()> {
+    let mut custom = std::collections::HashMap::new();
+    custom.insert(
+        "lm-studio".to_string(),
+        crate::config::ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("http://127.0.0.1:1234/v1".to_string()),
+            model: Some("local-code-model".to_string()),
+            ..Default::default()
+        },
+    );
+    let manager = RuntimeThreadManager::open(
+        Config {
+            provider: Some("lm-studio".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        PathBuf::from("."),
+        test_manager_config(test_runtime_dir()),
+    )?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let harness = install_mock_engine(&manager, &thread.id).await;
+    let mut rx_op = harness.rx_op;
+
+    let turn = manager
+        .compact_thread(&thread.id, CompactThreadRequest::default())
+        .await?;
+
+    assert!(matches!(
+        rx_op.recv().await,
+        Some(Op::CompactContext { .. })
+    ));
+    assert_eq!(turn.effective_provider.as_deref(), Some("custom"));
+    assert_eq!(turn.effective_provider_id.as_deref(), Some("lm-studio"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn compact_thread_with_real_engine_reaches_terminal_status() -> Result<()> {
-    let manager = test_manager(test_runtime_dir())?;
+    let manager = RuntimeThreadManager::open(
+        Config {
+            // This test intentionally crosses the real-engine boundary. Give
+            // client preflight a hermetic credential and closed-loopback URL;
+            // the assertion permits the resulting terminal failure.
+            api_key: Some("runtime-thread-test-key".to_string()),
+            base_url: Some("http://127.0.0.1:1/v1".to_string()),
+            ..Config::default()
+        },
+        PathBuf::from("."),
+        test_manager_config(test_runtime_dir()),
+    )?;
     let thread = manager
         .create_thread(CreateThreadRequest {
             model: None,
@@ -2576,7 +3311,7 @@ async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Resu
                         })
                         .await;
                 }
-                Op::CompactContext => {
+                Op::CompactContext { .. } => {
                     op_count = op_count.saturating_add(1);
                     let _ = tx_event
                         .send(EngineEvent::CompactionStarted {
@@ -2742,6 +3477,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         updated_at: created_at,
         model: DEFAULT_TEXT_MODEL.to_string(),
         model_provider: None,
+        model_provider_id: None,
         workspace: PathBuf::from("."),
         mode: "agent".to_string(),
         allow_shell: false,
@@ -2812,6 +3548,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         duration_ms: None,
         usage: None,
         effective_provider: None,
+        effective_provider_id: None,
         effective_billing_surface: None,
         effective_model: None,
         error: None,
@@ -2830,6 +3567,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         duration_ms: None,
         usage: None,
         effective_provider: None,
+        effective_provider_id: None,
         effective_billing_surface: None,
         effective_model: None,
         error: None,
@@ -3078,6 +3816,7 @@ fn seed_turns_with_user_messages(
             duration_ms: Some(0),
             usage: None,
             effective_provider: None,
+            effective_provider_id: None,
             effective_billing_surface: None,
             effective_model: None,
             error: None,

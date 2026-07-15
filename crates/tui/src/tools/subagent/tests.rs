@@ -5278,6 +5278,24 @@ fn cross_provider_config() -> crate::config::Config {
             ..Default::default()
         },
     );
+    for (name, base_url, model) in [
+        ("custom-a", "http://127.0.0.1:18181/v1", "model-a"),
+        ("custom-b", "http://127.0.0.1:18182/v1", "model-b"),
+        ("CUSTOM", "http://127.0.0.1:18183/v1", "model-upper"),
+        ("custom", "http://127.0.0.1:18184/v1", "model-literal"),
+        ("OPENAI", "http://127.0.0.1:18185/v1", "model-openai"),
+    ] {
+        custom.insert(
+            name.to_string(),
+            crate::config::ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                api_key: Some("local-test-key".to_string()),
+                base_url: Some(base_url.to_string()),
+                model: Some(model.to_string()),
+                ..Default::default()
+            },
+        );
+    }
     let providers = crate::config::ProvidersConfig {
         deepseek: crate::config::ProviderConfig {
             api_key: Some("session-key".to_string()),
@@ -5383,6 +5401,117 @@ fn spawn_child_client_targets_custom_profile_provider() {
         crate::config::ApiProvider::Custom
     );
     assert_eq!(child_client.base_url(), "http://127.0.0.1:1234/v1");
+}
+
+#[test]
+fn spawn_child_client_switches_between_exact_named_custom_endpoints() {
+    let mut config = cross_provider_config();
+    config.provider = Some("custom-a".to_string());
+    let client = DeepSeekClient::new(&config).expect("custom A session client");
+    assert_eq!(client.base_url(), "http://127.0.0.1:18181/v1");
+    let mut runtime = stub_runtime().with_api_config(config);
+    runtime.client = client;
+
+    let member = member_pinning_provider("custom-b", "model-b");
+    let child_client =
+        child_client_for_member(&runtime, Some(&member)).expect("custom B child client builds");
+
+    assert_eq!(
+        child_client.api_provider(),
+        crate::config::ApiProvider::Custom
+    );
+    assert_eq!(child_client.base_url(), "http://127.0.0.1:18182/v1");
+}
+
+#[test]
+fn cross_custom_child_rebinds_config_receipts_and_grandchild_route_atomically() {
+    let mut config = cross_provider_config();
+    config.provider = Some("custom-a".to_string());
+    let client = DeepSeekClient::new(&config).expect("custom A session client");
+    let mut runtime = stub_runtime().with_api_config(config);
+    runtime.client = client;
+
+    let member_b = member_pinning_provider("custom-b", "model-b");
+    let binding_b =
+        child_provider_binding(&runtime, Some(&member_b)).expect("custom B child provider binding");
+    let mut child_runtime = runtime.background_runtime();
+    child_runtime.client = binding_b.client;
+    child_runtime.api_config = binding_b.api_config;
+
+    assert_eq!(child_runtime.client.base_url(), "http://127.0.0.1:18182/v1");
+    assert_eq!(
+        child_runtime
+            .api_config
+            .as_ref()
+            .and_then(|config| config.provider.as_deref()),
+        Some("custom-b")
+    );
+    let worker_profile = worker_profile_for_spawn(
+        &child_runtime,
+        &SubAgentType::Implementer,
+        &AgentWorkerToolProfile::Inherited,
+        "model-b",
+        None,
+    );
+    assert_eq!(worker_profile.provider.as_deref(), Some("custom-b"));
+
+    assert!(!provider_pin_matches_session(&child_runtime, "custom-a"));
+    let member_a = member_pinning_provider("custom-a", "model-a");
+    let binding_a = child_provider_binding(&child_runtime, Some(&member_a))
+        .expect("grandchild rebinds to custom A");
+    assert_eq!(binding_a.client.base_url(), "http://127.0.0.1:18181/v1");
+    assert_eq!(
+        binding_a
+            .api_config
+            .as_ref()
+            .and_then(|config| config.provider.as_deref()),
+        Some("custom-a")
+    );
+}
+
+#[test]
+fn spawn_child_client_does_not_collapse_case_colliding_custom_pins() {
+    let mut config = cross_provider_config();
+    config.provider = Some("custom-a".to_string());
+    let client = DeepSeekClient::new(&config).expect("custom A session client");
+    let mut runtime = stub_runtime().with_api_config(config);
+    runtime.client = client;
+
+    for (provider_id, model, endpoint) in [
+        ("CUSTOM", "model-upper", "http://127.0.0.1:18183/v1"),
+        ("custom", "model-literal", "http://127.0.0.1:18184/v1"),
+        ("OPENAI", "model-openai", "http://127.0.0.1:18185/v1"),
+    ] {
+        assert!(!provider_pin_matches_session(&runtime, provider_id));
+        let member = member_pinning_provider(provider_id, model);
+        let child = child_client_for_member(&runtime, Some(&member))
+            .expect("case-colliding custom client builds from exact table");
+        assert_eq!(child.api_provider(), crate::config::ApiProvider::Custom);
+        assert_eq!(child.base_url(), endpoint);
+    }
+}
+
+#[test]
+fn removed_case_colliding_custom_pin_fails_closed() {
+    let mut config = cross_provider_config();
+    config.provider = Some("custom-a".to_string());
+    config
+        .providers
+        .as_mut()
+        .expect("providers")
+        .custom
+        .remove("CUSTOM");
+    let client = DeepSeekClient::new(&config).expect("custom A session client");
+    let mut runtime = stub_runtime().with_api_config(config);
+    runtime.client = client;
+
+    assert!(!provider_pin_matches_session(&runtime, "CUSTOM"));
+    let member = member_pinning_provider("CUSTOM", "model-upper");
+    let err = match child_client_for_member(&runtime, Some(&member)) {
+        Ok(_) => panic!("removed custom pin must not inherit active custom client"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("CUSTOM"), "{err}");
 }
 
 #[test]

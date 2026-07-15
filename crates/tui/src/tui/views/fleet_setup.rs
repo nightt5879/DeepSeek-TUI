@@ -188,20 +188,19 @@ pub struct FleetSetupSnapshot {
     /// config / project), so the wizard can say when a chosen role would
     /// override an existing roster member.
     roster_members: Vec<(String, String)>,
-    /// `(canonical provider id, model id, readiness label, selectable)` routes for a worker,
+    /// `(exact provider id, model id, readiness label, selectable)` routes for a worker,
     /// drawn from ALL configured providers — not only the active one (#4093).
     /// Shown after `inherit` in the Model step so a Fleet worker can be pinned
     /// to a route independent of the parent/current provider. The provider id
-    /// is the canonical [`crate::config::ApiProvider::as_str`] identifier
-    /// (e.g. `"deepseek"`), not a display label — see
-    /// [`cross_provider_model_routes`].
+    /// is a canonical built-in id or the exact named custom table key, not a
+    /// display label — see [`cross_provider_model_routes`].
     available_models: Vec<(String, String, String, bool)>,
 }
 
 impl FleetSetupSnapshot {
     #[must_use]
     pub fn from_app(app: &App, config: &Config) -> Self {
-        let provider = app.api_provider.display_name().to_string();
+        let provider = app.effective_route_identity_display().0;
         let model = if app.auto_model {
             app.last_effective_model
                 .as_deref()
@@ -261,10 +260,9 @@ impl FleetSetupSnapshot {
 /// so the Model step must offer the same cross-provider catalog the model
 /// picker does, instead of the active provider's models alone.
 ///
-/// The provider id here is the canonical [`crate::config::ApiProvider::as_str`]
-/// identifier (e.g. `"deepseek"`), not a display label — this is the exact
-/// value persisted into the saved profile's `provider` field and read back by
-/// the loader (#4093), so it must round-trip through `ApiProvider::parse`.
+/// The provider id here is the exact non-secret configured route key. Built-ins
+/// use their canonical id; named custom routes keep their table key so saved
+/// Fleet profiles can rebuild the same child client.
 /// Callers derive a human-readable label from it for UI text.
 fn cross_provider_model_routes(
     config: &Config,
@@ -272,40 +270,93 @@ fn cross_provider_model_routes(
     health: &crate::provider_readiness::ProviderReadinessSnapshot,
 ) -> Vec<(String, String, String, bool)> {
     let mut routes = Vec::new();
-    for provider in crate::provider_lake::configured_providers(config, active) {
-        // The bundled lake is only the baseline. A user may pin a valid
-        // provider-specific preview or private deployment outside that
-        // catalog, and Fleet must offer the same saved route that `/model`
-        // preserves. Keep saved/active models first, then append the lake.
-        let mut models = Vec::new();
-        if let Some(model) = config
-            .provider_config_for(provider)
-            .and_then(|entry| entry.model.as_deref())
-        {
-            push_unique_model(&mut models, model);
-        }
-        if provider == active {
-            let active_model = config.default_model();
-            if !active_model.trim().eq_ignore_ascii_case("auto") {
-                push_unique_model(&mut models, &active_model);
-            }
-        }
-        for model in crate::provider_lake::models_for_provider(config, active, provider) {
-            push_unique_model(&mut models, &model);
-        }
+    let configured = crate::provider_lake::configured_providers(config, active);
+    let legacy_custom_configured = configured.contains(&crate::config::ApiProvider::Custom);
+    for provider in configured
+        .into_iter()
+        .filter(|provider| *provider != crate::config::ApiProvider::Custom)
+    {
+        append_provider_model_routes(
+            &mut routes,
+            config,
+            active,
+            provider,
+            provider.as_str(),
+            health,
+        );
+    }
 
-        for model in models {
-            let readiness =
-                crate::provider_readiness::resolve_for_model(config, provider, &model, health);
-            routes.push((
-                provider.as_str().to_string(),
-                model,
-                readiness.label().into_owned(),
-                readiness.can_attempt(),
-            ));
-        }
+    // `ApiProvider::Custom` is an enum class, not a route identity. Enumerate
+    // every named custom table so a Fleet on custom A can still pin a worker
+    // to custom B and persist B's exact client route.
+    let mut custom_names = config
+        .providers
+        .as_ref()
+        .map(|providers| providers.custom.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    custom_names.sort();
+    if custom_names.is_empty() && legacy_custom_configured {
+        append_provider_model_routes(
+            &mut routes,
+            config,
+            active,
+            crate::config::ApiProvider::Custom,
+            crate::config::ApiProvider::Custom.as_str(),
+            health,
+        );
+    }
+    for name in custom_names {
+        let mut named_config = config.clone();
+        named_config.provider = Some(name.clone());
+        append_provider_model_routes(
+            &mut routes,
+            &named_config,
+            active,
+            crate::config::ApiProvider::Custom,
+            &name,
+            health,
+        );
     }
     routes
+}
+
+fn append_provider_model_routes(
+    routes: &mut Vec<(String, String, String, bool)>,
+    config: &Config,
+    active: crate::config::ApiProvider,
+    provider: crate::config::ApiProvider,
+    provider_id: &str,
+    health: &crate::provider_readiness::ProviderReadinessSnapshot,
+) {
+    // The bundled lake is only the baseline. A user may pin a valid
+    // provider-specific preview or private deployment outside that catalog.
+    let mut models = Vec::new();
+    if let Some(model) = config
+        .provider_config_for(provider)
+        .and_then(|entry| entry.model.as_deref())
+    {
+        push_unique_model(&mut models, model);
+    }
+    if provider == active {
+        let active_model = config.default_model();
+        if !active_model.trim().eq_ignore_ascii_case("auto") {
+            push_unique_model(&mut models, &active_model);
+        }
+    }
+    for model in crate::provider_lake::models_for_provider(config, active, provider) {
+        push_unique_model(&mut models, &model);
+    }
+
+    for model in models {
+        let readiness =
+            crate::provider_readiness::resolve_for_model(config, provider, &model, health);
+        routes.push((
+            provider_id.to_string(),
+            model,
+            readiness.label().into_owned(),
+            readiness.can_attempt(),
+        ));
+    }
 }
 
 fn push_unique_model(models: &mut Vec<String>, model: &str) {
@@ -319,12 +370,11 @@ fn push_unique_model(models: &mut Vec<String>, model: &str) {
     }
 }
 
-/// Human-readable label for a canonical provider id, falling back to the raw
-/// id verbatim when it doesn't parse (defensive — every id this module hands
-/// out itself comes from [`crate::config::ApiProvider::as_str`], so this only
-/// matters for a foreign/stale id read back from an old snapshot).
+/// Human-readable label for a built-in provider id, falling back to an exact
+/// named custom id verbatim.
 fn provider_display_label(provider_id: &str) -> String {
     crate::config::ApiProvider::parse(provider_id)
+        .filter(|provider| provider.as_str() == provider_id)
         .map(|provider| provider.display_name().to_string())
         .unwrap_or_else(|| provider_id.to_string())
 }
@@ -1364,6 +1414,13 @@ mod tests {
         draft
     }
 
+    #[test]
+    fn provider_display_label_preserves_case_colliding_custom_ids() {
+        assert_eq!(provider_display_label("deepseek"), "DeepSeek");
+        assert_eq!(provider_display_label("CUSTOM"), "CUSTOM");
+        assert_eq!(provider_display_label("OPENAI"), "OPENAI");
+    }
+
     fn to_review(view: &mut FleetSetupView) {
         view.handle_key(key(KeyCode::Enter)); // Role -> Model
         view.handle_key(key(KeyCode::Enter)); // Model -> Review
@@ -1906,6 +1963,100 @@ mod tests {
                 .count(),
             1,
             "saved models must not be duplicated when the catalog later learns them"
+        );
+    }
+
+    #[test]
+    fn fleet_routes_and_saved_draft_keep_exact_named_custom_provider() {
+        let mut custom = std::collections::HashMap::new();
+        for (name, base_url, model) in [
+            ("custom-a", "http://127.0.0.1:18181/v1", "model-a"),
+            ("custom-b", "http://127.0.0.1:18182/v1", "model-b"),
+        ] {
+            custom.insert(
+                name.to_string(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some(base_url.to_string()),
+                    model: Some(model.to_string()),
+                    api_key: Some("local-test-key".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        let config = Config {
+            provider: Some("custom-a".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let routes = cross_provider_model_routes(
+            &config,
+            crate::config::ApiProvider::Custom,
+            &crate::provider_readiness::ProviderReadinessSnapshot::default(),
+        );
+        assert!(
+            routes
+                .iter()
+                .any(|(provider, model, _, _)| { provider == "custom-a" && model == "model-a" })
+        );
+        assert!(
+            routes
+                .iter()
+                .any(|(provider, model, _, _)| { provider == "custom-b" && model == "model-b" })
+        );
+        assert!(
+            !routes
+                .iter()
+                .any(|(provider, _, _, _)| provider == "custom")
+        );
+
+        let mut view = FleetSetupView::from_snapshot(FleetSetupSnapshot {
+            available_models: routes,
+            provider: "custom-a".to_string(),
+            model: "model-a".to_string(),
+            ..snapshot()
+        });
+        let route = view
+            .model_routes
+            .iter()
+            .find(|(provider, model)| provider == "custom-b" && model == "model-b")
+            .cloned()
+            .expect("custom B route selectable while A is active");
+        let draft = sample_draft();
+        let (_, rendered) =
+            view.install_model_draft(draft, "model-b".to_string(), Some(route), None);
+        assert!(rendered.contains("provider = \"custom-b\""), "{rendered}");
+    }
+
+    #[test]
+    fn fleet_routes_keep_legacy_literal_custom_without_named_tables() {
+        let config = Config {
+            provider: Some("custom".to_string()),
+            base_url: Some("http://127.0.0.1:18080/v1".to_string()),
+            api_key: Some("local-test-key".to_string()),
+            default_text_model: Some("legacy-custom-model".to_string()),
+            ..Default::default()
+        };
+
+        let routes = cross_provider_model_routes(
+            &config,
+            crate::config::ApiProvider::Custom,
+            &crate::provider_readiness::ProviderReadinessSnapshot::default(),
+        );
+
+        assert!(
+            routes
+                .iter()
+                .any(|(provider, model, readiness, selectable)| {
+                    provider == "custom"
+                        && model == "legacy-custom-model"
+                        && readiness == "local · not checked"
+                        && *selectable
+                }),
+            "{routes:?}"
         );
     }
 

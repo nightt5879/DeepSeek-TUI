@@ -27,6 +27,7 @@ use super::task_spec::{
     record_verification_receipt, validate_task_spec_document, verify_task_result,
 };
 use super::worker_runtime;
+use crate::config::Config;
 use crate::tools::subagent::SharedSubAgentManager;
 
 const DEFAULT_STALE_AFTER_SECONDS: u64 = 300;
@@ -50,6 +51,9 @@ pub struct FleetManager {
     /// (matching the `/fleet roster` operator row). `None` keeps the legacy
     /// `"auto"` fallback for headless callers with no session.
     session_model: Option<String>,
+    /// Live provider-route authority used to mint truthful Fleet receipts.
+    /// Kept out of Debug because it may contain credentials.
+    route_config: Option<Config>,
 }
 
 impl std::fmt::Debug for FleetManager {
@@ -186,6 +190,7 @@ impl FleetManager {
             fleet_config: codewhale_config::FleetConfigToml::default(),
             sub_agent_manager: None,
             session_model: None,
+            route_config: None,
         })
     }
 
@@ -199,6 +204,11 @@ impl FleetManager {
         if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("auto") {
             self.session_model = Some(trimmed.to_string());
         }
+        self
+    }
+
+    pub fn with_route_config(mut self, config: Config) -> Self {
+        self.route_config = Some(config);
         self
     }
 
@@ -1008,7 +1018,12 @@ impl FleetManager {
     /// when resolution is unavailable.
     fn resolve_task_route(&self, task_spec: &FleetTaskSpec) -> Option<FleetResolvedRoute> {
         let roster = self.agent_roster();
-        worker_runtime::resolve_fleet_route(task_spec, roster.members(), self.session_model())
+        worker_runtime::resolve_fleet_route_with_config(
+            task_spec,
+            roster.members(),
+            self.session_model(),
+            self.route_config.as_ref(),
+        )
     }
 
     /// The adopted session route, if any — the operator's model.

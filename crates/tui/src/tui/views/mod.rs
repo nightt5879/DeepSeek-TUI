@@ -663,6 +663,9 @@ pub enum ViewEvent {
     ModelPickerApplied {
         model: String,
         provider: Option<crate::config::ApiProvider>,
+        /// Exact named custom route key when the selected provider enum is
+        /// `Custom`; built-in routes leave this unset.
+        provider_id: Option<String>,
         effort: crate::tui::app::ReasoningEffort,
         previous_model: String,
         previous_effort: crate::tui::app::ReasoningEffort,
@@ -2143,8 +2146,13 @@ fn config_base_url_row_key(provider: ApiProvider) -> &'static str {
     }
 }
 
-fn config_provider_row_value(app: &App, _config: &Config) -> String {
-    app.provider_identity_for_persistence().to_string()
+fn config_provider_row_value(app: &App, config: &Config) -> String {
+    config
+        .provider
+        .as_deref()
+        .filter(|provider| !provider.trim().is_empty())
+        .unwrap_or_else(|| app.provider_identity_for_persistence())
+        .to_string()
 }
 
 fn config_base_url_row_value(app: &App) -> String {
@@ -2152,7 +2160,13 @@ fn config_base_url_row_value(app: &App) -> String {
         .map(|mut config| {
             // A named custom provider is represented at runtime as `Custom`,
             // but its table lookup still needs the original provider ID.
-            config.provider = Some(app.provider_identity_for_persistence().to_string());
+            if config
+                .provider
+                .as_deref()
+                .is_none_or(|provider| provider.trim().is_empty())
+            {
+                config.provider = Some(app.provider_identity_for_persistence().to_string());
+            }
             config.deepseek_base_url()
         })
         .unwrap_or_else(|_| tr(app.ui_locale, MessageId::ConfigUnavailable).to_string())

@@ -15,6 +15,15 @@ use uuid::Uuid;
 struct MockExecutor;
 
 #[test]
+fn thread_route_credential_error_is_bad_request_not_not_found() {
+    let credential = map_thread_err(anyhow::anyhow!("DeepSeek API key not found"));
+    assert_eq!(credential.status, StatusCode::BAD_REQUEST);
+
+    let missing = map_thread_err(anyhow::anyhow!("thread 'thr_missing' not found"));
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+}
+
+#[test]
 fn runtime_tui_settings_reject_legacy_modes_and_do_not_save_env_overlays() -> Result<()> {
     let _lock = lock_test_env();
     let tmp = tempfile::tempdir()?;
@@ -91,6 +100,7 @@ fn saved_session_with_blocks(blocks: Vec<crate::models::ContentBlock>) -> SavedS
             total_tokens: 0,
             model: "test-model".to_string(),
             model_provider: "deepseek".to_string(),
+            model_provider_id: None,
             workspace: PathBuf::from("."),
             mode: None,
             cost: Default::default(),
@@ -214,6 +224,7 @@ fn messages_from_thread_detail_batches_tool_results() {
         updated_at: now,
         model: DEFAULT_TEXT_MODEL.to_string(),
         model_provider: None,
+        model_provider_id: None,
         workspace: PathBuf::from("."),
         mode: "agent".to_string(),
         allow_shell: false,
@@ -239,6 +250,7 @@ fn messages_from_thread_detail_batches_tool_results() {
         duration_ms: Some(0),
         usage: None,
         effective_provider: None,
+        effective_provider_id: None,
         effective_billing_surface: None,
         effective_model: None,
         error: None,
@@ -374,6 +386,71 @@ fn messages_from_thread_detail_batches_tool_results() {
         }
         other => panic!("expected second tool result, got {other:?}"),
     }
+}
+
+#[test]
+fn legacy_exact_thread_export_normalizes_provider_kind_and_id() {
+    let now = Utc::now();
+    let detail = ThreadDetail {
+        thread: ThreadRecord {
+            schema_version: 2,
+            id: "thr_legacy_custom".to_string(),
+            created_at: now,
+            updated_at: now,
+            model: "local-model".to_string(),
+            // Pre-additive records overloaded this legacy field with the exact id.
+            model_provider: Some("lm-studio".to_string()),
+            model_provider_id: None,
+            workspace: PathBuf::from("."),
+            mode: "agent".to_string(),
+            allow_shell: false,
+            trust_mode: false,
+            auto_approve: false,
+            latest_turn_id: None,
+            latest_response_bookmark: None,
+            archived: false,
+            system_prompt: None,
+            task_id: None,
+            title: None,
+            session_id: None,
+        },
+        turns: Vec::new(),
+        items: Vec::new(),
+        latest_seq: 0,
+    };
+    let config = Config {
+        provider: Some("lm-studio".to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom: std::collections::HashMap::from([(
+                "lm-studio".to_string(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some("http://127.0.0.1:1234/v1".to_string()),
+                    model: Some("local-model".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut session = crate::session_manager::create_saved_session_with_mode(
+        &[],
+        "local-model",
+        std::path::Path::new("."),
+        0,
+        None,
+        Some("agent"),
+    );
+
+    sessions::stamp_session_provider_from_thread(&config, &detail, &mut session.metadata)
+        .expect("normalize legacy exact provider");
+
+    assert_eq!(session.metadata.model_provider, "custom");
+    assert_eq!(
+        session.metadata.model_provider_id.as_deref(),
+        Some("lm-studio")
+    );
 }
 
 #[test]
@@ -548,7 +625,7 @@ async fn spawn_test_server_with_root_token_mobile_workspace_and_subagents(
         mobile_enabled,
         workspace,
         sub_agent_manager,
-        None,
+        (None, None),
     )
     .await
 }
@@ -560,7 +637,7 @@ async fn spawn_test_server_with_root_token_mobile_workspace_subagents_and_config
     mobile_enabled: bool,
     workspace: PathBuf,
     sub_agent_manager: Option<SharedSubAgentManager>,
-    config_path: Option<PathBuf>,
+    config_source: (Option<PathBuf>, Option<String>),
 ) -> Result<
     Option<(
         SocketAddr,
@@ -568,10 +645,16 @@ async fn spawn_test_server_with_root_token_mobile_workspace_subagents_and_config
         tokio::task::JoinHandle<()>,
     )>,
 > {
+    let (config_path, config_profile) = config_source;
     let _ = rustls::crypto::ring::default_provider().install_default();
     fs::create_dir_all(&sessions_dir)?;
     fs::create_dir_all(&workspace)?;
     let config = Config {
+        // Runtime-API tests that exercise a real turn boundary must pass the
+        // same synchronous client preflight as production. Keep the client
+        // hermetic; any later request fails fast against loopback.
+        api_key: Some("runtime-api-test-key".to_string()),
+        base_url: Some("http://127.0.0.1:1/v1".to_string()),
         mcp_config_path: Some(root.join("mcp.json").to_string_lossy().to_string()),
         ..Config::default()
     };
@@ -610,6 +693,7 @@ async fn spawn_test_server_with_root_token_mobile_workspace_subagents_and_config
         cors_origins: Vec::new(),
         sessions_dir,
         config_path: config_path.clone(),
+        config_profile,
         mcp_pool: Arc::new(Mutex::new(None)),
         automations,
         sub_agent_manager,
@@ -667,7 +751,33 @@ async fn spawn_test_server_with_config_path(
         false,
         workspace,
         None,
-        Some(config_path),
+        (Some(config_path), None),
+    )
+    .await
+}
+
+async fn spawn_test_server_with_config_path_and_profile(
+    config_path: PathBuf,
+    config_profile: String,
+) -> Result<
+    Option<(
+        SocketAddr,
+        SharedRuntimeThreadManager,
+        tokio::task::JoinHandle<()>,
+    )>,
+> {
+    let root = std::env::temp_dir().join(format!("codewhale-config-api-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&root)?;
+    spawn_test_server_with_root_token_mobile_workspace_subagents_and_config_path(
+        root,
+        sessions_dir,
+        None,
+        false,
+        workspace,
+        None,
+        (Some(config_path), Some(config_profile)),
     )
     .await
 }
@@ -1737,7 +1847,7 @@ async fn thread_endpoints_expose_lifecycle_contract() -> Result<()> {
                         })
                         .await;
                 }
-                Op::CompactContext => {
+                Op::CompactContext { .. } => {
                     let _ = tx_event
                         .send(EngineEvent::TurnComplete {
                             usage: Usage {
@@ -2370,6 +2480,63 @@ async fn session_resume_thread_returns_404_for_missing_session() -> Result<()> {
         .send()
         .await?;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_resume_thread_returns_400_when_saved_custom_provider_was_removed() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "codewhale-session-removed-provider-{}",
+        Uuid::new_v4()
+    ));
+    let sessions_dir = root.join("sessions");
+    fs::create_dir_all(&sessions_dir)?;
+    let session = json!({
+        "schema_version": 1,
+        "metadata": {
+            "id": "sess_removed_custom_provider",
+            "title": "Removed custom provider",
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:10:00Z",
+            "message_count": 1,
+            "total_tokens": 10,
+            "model": "local-code-model",
+            "model_provider": "lm-studio",
+            "workspace": "/tmp/test",
+            "mode": "agent"
+        },
+        "messages": [{
+            "role": "user",
+            "content": [{ "type": "text", "text": "Resume me" }]
+        }],
+        "system_prompt": null
+    });
+    fs::write(
+        sessions_dir.join("sess_removed_custom_provider.json"),
+        serde_json::to_string_pretty(&session)?,
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root(root, sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let resp = client
+        .post(format!(
+            "http://{addr}/v1/sessions/sess_removed_custom_provider/resume-thread"
+        ))
+        .json(&json!({}))
+        .send()
+        .await?;
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await?;
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("[providers.lm-studio]"), "{message}");
+    assert!(message.contains("will not fall back"), "{message}");
 
     handle.abort();
     Ok(())
@@ -4205,6 +4372,52 @@ async fn reload_config_reads_from_config_path_and_updates_in_memory_state() -> R
         Some(5),
         "after reload, subagents_max_depth should be 5"
     );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn reload_config_preserves_profile_selected_named_custom_route() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "codewhale-config-reload-profile-{}",
+        Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(
+        &config_file,
+        r#"provider = "deepseek"
+default_text_model = "deepseek-v4-pro"
+
+[profiles.local]
+provider = "lm-studio"
+
+[profiles.local.providers.lm-studio]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:18190/v1"
+model = "profile-local-model"
+api_key = "profile-test-key"
+"#,
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path_and_profile(config_file, "local".to_string()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let response = client
+        .post(format!("http://{addr}/v1/config/reload"))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let config = get_config(&client, &addr).await;
+    assert_eq!(config["provider"], "lm-studio");
+    assert_eq!(config["model"], "profile-local-model");
+    assert_eq!(config["base_url"], "http://127.0.0.1:18190/v1");
 
     handle.abort();
     Ok(())

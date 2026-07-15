@@ -14,6 +14,14 @@ use super::approval::{ApprovalDecision, UserInputDecision};
 use super::{CancelReason, EngineHandle, Op, UserInputResponse};
 
 impl EngineHandle {
+    /// True when the caller must preflight a concrete provider client before
+    /// committing UI/runtime turn state. Test and embedding handles with an
+    /// injected model client return false because that client owns model I/O.
+    #[must_use]
+    pub(crate) fn client_preflight_required(&self) -> bool {
+        self.client_preflight_required
+    }
+
     /// Send an operation to the engine
     pub async fn send(&self, op: Op) -> Result<()> {
         self.tx_op.send(op).await?;

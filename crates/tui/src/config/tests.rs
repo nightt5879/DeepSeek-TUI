@@ -2929,6 +2929,131 @@ base_url = "https://openrouter.ai/api/v1"
     Ok(())
 }
 
+#[test]
+fn clear_active_provider_api_key_clears_deepseek_cn_root_scope() -> Result<()> {
+    let _lock = lock_test_env();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_root = env::temp_dir().join(format!(
+        "codewhale-tui-clear-deepseek-cn-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    fs::create_dir_all(&temp_root)?;
+    let _guard = EnvGuard::new(&temp_root);
+    let config_path = temp_root.join(".deepseek").join("config.toml");
+    fs::create_dir_all(config_path.parent().unwrap())?;
+    fs::write(
+        &config_path,
+        r#"provider = "deepseek-cn"
+api_key = "deepseek-cn-root-key"
+
+[providers.deepseek-cn]
+api_key = "deepseek-cn-table-key"
+
+[providers.openrouter]
+api_key = "unrelated-key"
+"#,
+    )?;
+
+    clear_active_provider_api_key("deepseek-cn")?;
+
+    let after = fs::read_to_string(&config_path)?;
+    assert!(!after.contains("deepseek-cn-root-key"), "{after}");
+    assert!(!after.contains("deepseek-cn-table-key"), "{after}");
+    assert!(after.contains("unrelated-key"), "{after}");
+    Ok(())
+}
+
+#[test]
+fn clear_active_provider_api_key_distinguishes_literal_and_named_custom_routes() -> Result<()> {
+    let _lock = lock_test_env();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_root = env::temp_dir().join(format!(
+        "codewhale-tui-clear-custom-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    fs::create_dir_all(&temp_root)?;
+    let _guard = EnvGuard::new(&temp_root);
+    let config_path = temp_root.join(".deepseek").join("config.toml");
+    fs::create_dir_all(config_path.parent().unwrap())?;
+    let contents = r#"provider = "custom"
+api_key = "legacy-root-key"
+base_url = "http://127.0.0.1:1234/v1"
+default_text_model = "legacy-model"
+
+[providers.lm-studio]
+kind = "openai-compatible"
+api_key = "named-route-key"
+base_url = "http://127.0.0.1:5678/v1"
+model = "named-model"
+"#;
+    fs::write(&config_path, contents)?;
+
+    clear_active_provider_api_key("custom")?;
+
+    let after_literal = fs::read_to_string(&config_path)?;
+    assert!(
+        !after_literal.contains("legacy-root-key"),
+        "{after_literal}"
+    );
+    assert!(after_literal.contains("named-route-key"), "{after_literal}");
+
+    fs::write(&config_path, contents)?;
+    clear_active_provider_api_key("lm-studio")?;
+
+    let after_named = fs::read_to_string(&config_path)?;
+    assert!(after_named.contains("legacy-root-key"), "{after_named}");
+    assert!(!after_named.contains("named-route-key"), "{after_named}");
+    Ok(())
+}
+
+#[test]
+fn clear_active_provider_api_key_prefers_exact_custom_table_over_legacy_root() -> Result<()> {
+    let _lock = lock_test_env();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_root = env::temp_dir().join(format!(
+        "codewhale-tui-clear-exact-custom-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    fs::create_dir_all(&temp_root)?;
+    let _guard = EnvGuard::new(&temp_root);
+    let config_path = temp_root.join(".deepseek").join("config.toml");
+    fs::create_dir_all(config_path.parent().unwrap())?;
+    fs::write(
+        &config_path,
+        r#"provider = "custom"
+api_key = "legacy-root-key"
+base_url = "http://127.0.0.1:1234/v1"
+default_text_model = "legacy-model"
+
+[providers.custom]
+kind = "openai-compatible"
+api_key = "exact-table-key"
+base_url = "http://127.0.0.1:5678/v1"
+model = "exact-model"
+"#,
+    )?;
+
+    clear_active_provider_api_key("custom")?;
+
+    let after = fs::read_to_string(&config_path)?;
+    assert!(after.contains("legacy-root-key"), "{after}");
+    assert!(!after.contains("exact-table-key"), "{after}");
+    assert!(after.contains("[providers.custom]"), "{after}");
+    Ok(())
+}
+
 /// Finding #19: workspace-trust saves used to round-trip through
 /// `toml::to_string_pretty`, destroying comments in the whole file.
 #[test]
@@ -8029,6 +8154,7 @@ fn session_provider_identity_preserves_exact_named_custom_key() {
         ProviderIdentity {
             provider: ApiProvider::Custom,
             key: "lm-studio".to_string(),
+            exact_id: Some("lm-studio".to_string()),
         }
     );
     assert_eq!(
@@ -8038,15 +8164,351 @@ fn session_provider_identity_preserves_exact_named_custom_key() {
         ProviderIdentity {
             provider: ApiProvider::Openrouter,
             key: "openrouter".to_string(),
+            exact_id: Some("openrouter".to_string()),
         }
     );
+    let migrated = config
+        .resolve_provider_identity("custom")
+        .expect("released generic custom record migrates to sole live named route");
+    assert_eq!(
+        migrated,
+        ProviderIdentity {
+            provider: ApiProvider::Custom,
+            key: "lm-studio".to_string(),
+            exact_id: Some("lm-studio".to_string()),
+        }
+    );
+}
+
+#[test]
+fn literal_custom_table_round_trips_as_exact_historical_route() {
+    let config =
+        session_custom_provider_config("custom", "openai-compatible", "http://127.0.0.1:1234/v1");
+
+    assert_eq!(config.api_provider(), ApiProvider::Custom);
+    assert!(!config.uses_legacy_literal_custom_route());
+    let identity = config
+        .resolve_provider_identity("custom")
+        .expect("exact [providers.custom] identity");
+    assert_eq!(identity.key, "custom");
+    let route = crate::route_runtime::resolve_runtime_route(
+        &config,
+        identity.provider,
+        Some("local-model"),
+    )
+    .expect("resolve exact literal table")
+    .validate()
+    .expect("preflight exact literal table");
+    assert_eq!(route.identity.key, "custom");
+    assert_eq!(route.client.base_url(), "http://127.0.0.1:1234/v1");
+    assert_eq!(
+        route
+            .config
+            .resolve_provider_identity(&route.identity.key)
+            .expect("repeat exact literal table resolution"),
+        identity
+    );
+}
+
+#[test]
+fn persisted_custom_fields_distinguish_legacy_root_from_exact_literal_table() {
+    let table_only =
+        session_custom_provider_config("custom", "openai-compatible", "http://127.0.0.1:1234/v1");
+    let table_only_error = table_only
+        .resolve_persisted_provider_identity(Some("custom"), None)
+        .expect_err("id-less custom records authorize only the legacy root route");
+    assert!(
+        table_only_error.contains("root-level"),
+        "{table_only_error}"
+    );
+    assert!(table_only_error.contains("fall back"), "{table_only_error}");
+
+    let mut coexist = table_only.clone();
+    coexist.base_url = Some("http://127.0.0.1:18180/v1".to_string());
+    coexist.default_text_model = Some("legacy-root-model".to_string());
+    let root = coexist
+        .resolve_persisted_provider_identity(Some("custom"), None)
+        .expect("id-less record remains bound to the root route");
+    assert_eq!(root.provider, ApiProvider::Custom);
+    assert_eq!(root.key, "custom");
+    assert_eq!(root.exact_id, None);
+    let root_route = crate::route_runtime::resolve_runtime_route_for_identity(
+        &coexist,
+        &root,
+        Some("legacy-root-model"),
+    )
+    .expect("scope root identity")
+    .validate()
+    .expect("validate root identity");
+    assert_eq!(root_route.client.base_url(), "http://127.0.0.1:18180/v1");
+    assert_eq!(root_route.identity.exact_id, None);
+
+    let exact_table = coexist
+        .resolve_persisted_provider_identity(Some("custom"), Some("custom"))
+        .expect("additive exact id intentionally selects the table");
+    assert_eq!(exact_table.provider, ApiProvider::Custom);
+    assert_eq!(exact_table.key, "custom");
+    assert_eq!(exact_table.exact_id.as_deref(), Some("custom"));
+
+    let root_only = Config {
+        provider: Some("custom".to_string()),
+        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
+        default_text_model: Some("legacy-root-model".to_string()),
+        ..Config::default()
+    };
+    let exact_error = root_only
+        .resolve_persisted_provider_identity(Some("custom"), Some("custom"))
+        .expect_err("exact table record cannot fall back to a legacy root route");
+    assert!(exact_error.contains("[providers.custom]"), "{exact_error}");
+    assert!(exact_error.contains("will not fall back"), "{exact_error}");
+    let exact_route_error = crate::route_runtime::resolve_runtime_route_for_identity(
+        &root_only,
+        &exact_table,
+        Some("table-model"),
+    )
+    .expect_err("runtime route must revalidate exact table provenance");
+    assert!(
+        exact_route_error.contains("[providers.custom]"),
+        "{exact_route_error}"
+    );
+}
+
+#[test]
+fn persisted_provider_pair_never_collapses_builtin_into_same_key_custom_route() {
+    let config =
+        session_custom_provider_config("openai", "openai-compatible", "http://127.0.0.1:1234/v1");
     assert_eq!(
         config
-            .resolve_provider_identity("custom")
-            .expect("legacy generic custom identity uses active exact table")
-            .key,
-        "lm-studio"
+            .resolve_provider_identity("openai")
+            .expect("raw exact identity intentionally prefers custom"),
+        ProviderIdentity {
+            provider: ApiProvider::Custom,
+            key: "openai".to_string(),
+            exact_id: Some("openai".to_string()),
+        }
     );
+
+    for provider_id in [None, Some("openai")] {
+        let error = config
+            .resolve_persisted_provider_identity(Some("openai"), provider_id)
+            .expect_err("built-in record must not be captured by the custom table");
+        assert!(error.contains("requires built-in 'openai'"), "{error}");
+        assert!(error.contains("shadows"), "{error}");
+        assert!(error.contains("will not guess or fall back"), "{error}");
+    }
+
+    let exact_custom = config
+        .resolve_persisted_provider_identity(Some("custom"), Some("openai"))
+        .expect("custom kind plus exact id intentionally selects the table");
+    assert_eq!(exact_custom.provider, ApiProvider::Custom);
+    assert_eq!(exact_custom.key, "openai");
+
+    let mismatch = config
+        .resolve_persisted_provider_identity(Some("openrouter"), Some("openai"))
+        .expect_err("mismatched built-in kind/id pair must fail closed");
+    assert!(mismatch.contains("mismatched fields"), "{mismatch}");
+}
+
+#[test]
+fn case_colliding_custom_table_preserves_exact_spelling_across_receipts() {
+    let config =
+        session_custom_provider_config("CUSTOM", "openai-compatible", "http://127.0.0.1:5678/v1");
+
+    assert_eq!(config.api_provider(), ApiProvider::Custom);
+    assert_eq!(config.provider_identity_for(ApiProvider::Custom), "CUSTOM");
+    let identity = config
+        .resolve_provider_identity("CUSTOM")
+        .expect("exact case-colliding custom identity");
+    assert_eq!(identity.key, "CUSTOM");
+    let route = crate::route_runtime::resolve_runtime_route(
+        &config,
+        identity.provider,
+        Some("local-model"),
+    )
+    .expect("resolve case-colliding custom table")
+    .validate()
+    .expect("preflight case-colliding custom table");
+    assert_eq!(route.identity.key, "CUSTOM");
+    assert_eq!(route.client.base_url(), "http://127.0.0.1:5678/v1");
+}
+
+#[test]
+fn legacy_literal_custom_identity_requires_one_valid_root_route() {
+    let _lock = lock_test_env();
+    let _source = EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+    let _cli_key = EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+    let legacy = Config {
+        provider: Some("custom".to_string()),
+        api_key: Some("legacy-root-key".to_string()),
+        base_url: Some("http://127.0.0.1:1234/v1".to_string()),
+        default_text_model: Some("local-legacy-model".to_string()),
+        ..Config::default()
+    };
+
+    assert_eq!(
+        legacy
+            .resolve_provider_identity("custom")
+            .expect("unchanged legacy root route"),
+        ProviderIdentity {
+            provider: ApiProvider::Custom,
+            key: "custom".to_string(),
+            exact_id: None,
+        }
+    );
+    assert_eq!(legacy.deepseek_base_url(), "http://127.0.0.1:1234/v1");
+    assert_eq!(legacy.default_model(), "local-legacy-model");
+    assert_eq!(legacy.deepseek_api_key().unwrap(), "legacy-root-key");
+
+    let mut named = session_custom_provider_config(
+        "lm-studio",
+        "openai-compatible",
+        "https://api.example.com/v1",
+    );
+    named.api_key = Some("must-not-leak-to-named-route".to_string());
+    let named_key_error = named
+        .deepseek_api_key()
+        .expect_err("root legacy key must never authorize a named custom route")
+        .to_string();
+    assert!(named_key_error.contains("lm-studio"), "{named_key_error}");
+    assert!(!named_key_error.contains("must-not-leak"));
+
+    let mut ambiguous_named = named.clone();
+    ambiguous_named
+        .providers
+        .as_mut()
+        .expect("providers")
+        .custom
+        .insert(
+            "vllm-local".to_string(),
+            ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some("http://127.0.0.1:8000/v1".to_string()),
+                model: Some("other-local-model".to_string()),
+                ..ProviderConfig::default()
+            },
+        );
+    let ambiguous_named_error = ambiguous_named
+        .resolve_provider_identity("custom")
+        .expect_err("generic released record cannot choose between named routes");
+    assert!(
+        ambiguous_named_error.contains("valid named routes: 2"),
+        "{ambiguous_named_error}"
+    );
+    assert!(ambiguous_named_error.contains("will not guess or fall back"));
+
+    let mut missing_model = legacy.clone();
+    missing_model.default_text_model = None;
+    let model_error = missing_model
+        .resolve_provider_identity("custom")
+        .expect_err("legacy root route needs an explicit model");
+    assert!(model_error.contains("default_text_model"), "{model_error}");
+
+    let mut auto_model = legacy.clone();
+    auto_model.default_text_model = Some("auto".to_string());
+    let auto_error = auto_model
+        .resolve_provider_identity("custom")
+        .expect_err("legacy root route cannot guess an auto model");
+    assert!(auto_error.contains("not `auto`"), "{auto_error}");
+
+    let mut invalid_url = legacy.clone();
+    invalid_url.base_url = Some("not a provider URL".to_string());
+    let url_error = invalid_url
+        .resolve_provider_identity("custom")
+        .expect_err("legacy root route needs a valid endpoint");
+    assert!(url_error.contains("base_url"), "{url_error}");
+    assert!(url_error.contains("will not fall back"), "{url_error}");
+
+    let mut ambiguous = legacy.clone();
+    ambiguous.providers = Some(ProvidersConfig {
+        custom: HashMap::from([(
+            "CUSTOM".to_string(),
+            ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some("http://127.0.0.1:5678/v1".to_string()),
+                model: Some("table-model".to_string()),
+                ..ProviderConfig::default()
+            },
+        )]),
+        ..ProvidersConfig::default()
+    });
+    let ambiguous_error = ambiguous
+        .resolve_provider_identity("custom")
+        .expect_err("root and table routes cannot share the generic identity");
+    assert!(
+        ambiguous_error.contains("[providers.custom]") && ambiguous_error.contains("ambiguous"),
+        "{ambiguous_error}"
+    );
+
+    let removed_named = legacy
+        .resolve_provider_identity("lm-studio")
+        .expect_err("a removed named route must not fall back to legacy custom");
+    assert!(removed_named.contains("[providers.lm-studio]"));
+    assert!(removed_named.contains("will not fall back"));
+}
+
+#[test]
+fn legacy_literal_custom_env_overrides_preserve_root_route_shape() -> Result<()> {
+    let _lock = lock_test_env();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_root = env::temp_dir().join(format!(
+        "codewhale-tui-legacy-custom-env-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    fs::create_dir_all(&temp_root)?;
+    let _guard = EnvGuard::new(&temp_root);
+    let _source = EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+    let _cli_key = EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+
+    let config_path = temp_root.join(".deepseek").join("config.toml");
+    ensure_parent_dir(&config_path)?;
+    fs::write(
+        &config_path,
+        r#"provider = "custom"
+api_key = "legacy-root-key"
+base_url = "http://127.0.0.1:18184/v1"
+default_text_model = "legacy-model"
+"#,
+    )?;
+    // Safety: test-only env mutation guarded by lock_test_env().
+    unsafe {
+        env::set_var("CODEWHALE_BASE_URL", "http://127.0.0.1:18185/v1");
+        env::set_var("CODEWHALE_MODEL", "env-legacy-model");
+        env::set_var("DEEPSEEK_HTTP_HEADERS", "X-Legacy-Route=kept");
+    }
+
+    let config = Config::load(None, None)?;
+
+    assert!(config.uses_legacy_literal_custom_route());
+    assert!(
+        config
+            .providers
+            .as_ref()
+            .is_none_or(|providers| !providers.custom.contains_key("custom"))
+    );
+    assert_eq!(config.deepseek_base_url(), "http://127.0.0.1:18185/v1");
+    assert_eq!(config.default_model(), "env-legacy-model");
+    assert_eq!(config.deepseek_api_key()?, "legacy-root-key");
+    assert_eq!(
+        config
+            .http_headers()
+            .get("X-Legacy-Route")
+            .map(String::as_str),
+        Some("kept")
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            config
+                .resolve_provider_identity("custom")
+                .expect("legacy route remains repeatedly resolvable")
+                .key,
+            "custom"
+        );
+    }
+    Ok(())
 }
 
 #[test]

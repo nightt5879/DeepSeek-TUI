@@ -2003,6 +2003,11 @@ fn create_test_app() -> App {
     app.last_effective_model = None;
     app.active_route_limits = None;
     app.active_context_window_override = None;
+    // UI fixtures replace `app.workspace` freely. Do not retain App::new's
+    // real process cwd as a second discovery root: parallel tests and a large
+    // developer checkout can otherwise consume the bounded mention index
+    // before the fixture workspace is scanned.
+    app.composer.mention_cwd = None;
     app
 }
 
@@ -2826,6 +2831,7 @@ fn saved_session_with_messages(messages: Vec<Message>) -> SavedSession {
             total_tokens: 0,
             model: "deepseek-v4-pro".to_string(),
             model_provider: "deepseek".to_string(),
+            model_provider_id: None,
             workspace: PathBuf::from("/tmp/resume-recovery"),
             mode: Some("yolo".to_string()),
             cost: crate::session_manager::SessionCostSnapshot::default(),
@@ -2932,6 +2938,7 @@ fn apply_loaded_session_resets_unpersisted_telemetry() {
     app.session.last_reasoning_replay_tokens = Some(12);
     app.push_turn_cache_record(crate::tui::app::TurnCacheRecord {
         provider: None,
+        provider_identity: None,
         model: None,
         auto_model: false,
         input_tokens: 120,
@@ -3581,6 +3588,7 @@ async fn provider_switch_clears_turn_cache_history() {
     let mut app = create_test_app();
     app.push_turn_cache_record(crate::tui::app::TurnCacheRecord {
         provider: None,
+        provider_identity: None,
         model: None,
         auto_model: false,
         input_tokens: 100,
@@ -4106,6 +4114,323 @@ async fn dispatch_user_message_failed_send_clears_loading_state() {
     );
 }
 
+#[tokio::test]
+async fn real_engine_client_preflight_failure_leaves_dispatch_state_atomic() {
+    let mut config =
+        named_custom_session_config("lm-studio", "http://127.0.0.1:1234/v1", "local-model");
+    config
+        .providers
+        .as_mut()
+        .expect("providers")
+        .custom
+        .get_mut("lm-studio")
+        .expect("lm-studio")
+        .insecure_skip_tls_verify = Some(true);
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_model_selection("local-model".to_string());
+    let (_engine, handle) = crate::core::engine::Engine::new(EngineConfig::default(), &config);
+
+    let err = dispatch_user_message(
+        &mut app,
+        &config,
+        &handle,
+        QueuedMessage::new("keep this retryable".to_string(), None),
+    )
+    .await
+    .expect_err("real engine routes must preflight their concrete client");
+
+    assert!(
+        err.to_string()
+            .contains("Failed to configure provider route")
+    );
+    assert!(!app.is_loading);
+    assert!(app.dispatch_started_at.is_none());
+    assert!(app.last_send_at.is_none());
+    assert!(app.last_submitted_prompt.is_none());
+    assert!(app.api_messages.is_empty());
+    assert!(app.history.is_empty());
+    assert!(app.pending_turn_route.is_none());
+}
+
+#[tokio::test]
+async fn dispatch_uses_app_owned_exact_custom_identity_when_config_selector_drifts() {
+    let mut custom = HashMap::new();
+    for (name, base_url, model) in [
+        ("custom-a", "http://127.0.0.1:18181/v1", "model-a"),
+        ("custom-b", "http://127.0.0.1:18182/v1", "model-b"),
+    ] {
+        custom.insert(
+            name.to_string(),
+            ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some(base_url.to_string()),
+                model: Some(model.to_string()),
+                api_key: Some(format!("{name}-test-key")),
+                ..Default::default()
+            },
+        );
+    }
+    let config = Config {
+        // Simulate a picker/config overlay that has moved ahead to B while
+        // App and the active engine still own A.
+        provider: Some("custom-b".to_string()),
+        providers: Some(ProvidersConfig {
+            custom,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_model_selection("model-a".to_string());
+    let mut engine = mock_engine_handle();
+
+    dispatch_user_message(
+        &mut app,
+        &config,
+        &engine.handle,
+        QueuedMessage::new("stay on A".to_string(), None),
+    )
+    .await
+    .expect("dispatch exact App-owned route");
+
+    match engine.rx_op.recv().await.expect("send message op") {
+        Op::SendMessage { route, .. } => {
+            assert_eq!(route.identity.provider, ApiProvider::Custom);
+            assert_eq!(route.identity.key, "custom-a");
+            assert_eq!(route.identity.exact_id.as_deref(), Some("custom-a"));
+            assert_eq!(route.model, "model-a");
+            assert_eq!(
+                route.config.deepseek_base_url(),
+                "http://127.0.0.1:18181/v1"
+            );
+        }
+        other => panic!("expected SendMessage, got {other:?}"),
+    }
+    assert_eq!(config.provider.as_deref(), Some("custom-b"));
+}
+
+#[tokio::test]
+async fn dispatch_idless_custom_identity_keeps_legacy_root_over_literal_table() {
+    let config = Config {
+        provider: Some("custom".to_string()),
+        api_key: Some("legacy-root-test-key".to_string()),
+        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
+        default_text_model: Some("legacy-root-model".to_string()),
+        providers: Some(ProvidersConfig {
+            custom: HashMap::from([(
+                "custom".to_string(),
+                ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    api_key: Some("literal-table-test-key".to_string()),
+                    base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+                    model: Some("literal-table-model".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Custom, "custom");
+    app.set_model_selection("legacy-root-model".to_string());
+    let mut engine = mock_engine_handle();
+
+    dispatch_user_message(
+        &mut app,
+        &config,
+        &engine.handle,
+        QueuedMessage::new("keep the released root route".to_string(), None),
+    )
+    .await
+    .expect("dispatch idless legacy root route");
+
+    match engine.rx_op.recv().await.expect("send message op") {
+        Op::SendMessage { route, .. } => {
+            assert_eq!(route.identity.provider, ApiProvider::Custom);
+            assert_eq!(route.identity.key, "custom");
+            assert_eq!(route.identity.exact_id, None);
+            assert_eq!(route.model, "legacy-root-model");
+            assert_eq!(
+                route.config.deepseek_base_url(),
+                "http://127.0.0.1:18180/v1"
+            );
+            assert!(
+                route
+                    .config
+                    .providers
+                    .as_ref()
+                    .is_none_or(|providers| !providers.custom.contains_key("custom"))
+            );
+        }
+        other => panic!("expected SendMessage, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn failed_real_preflight_preserves_paused_command_state_and_engine_gate() {
+    let mut config =
+        named_custom_session_config("lm-studio", "http://127.0.0.1:1234/v1", "local-model");
+    config
+        .providers
+        .as_mut()
+        .expect("providers")
+        .custom
+        .get_mut("lm-studio")
+        .expect("lm-studio")
+        .insecure_skip_tls_verify = Some(true);
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_model_selection("local-model".to_string());
+    app.paused = true;
+    app.pausable = true;
+    app.paused_quarry = Some("finish the paused audit".to_string());
+    app.hunt.quarry = None;
+    app.hunt.tokens_used = 7;
+    app.hunt.time_used_seconds = 11;
+    app.hunt.continuation_count = 2;
+    let (_engine, handle) = crate::core::engine::Engine::new(EngineConfig::default(), &config);
+    handle.set_paused(true);
+
+    dispatch_user_message(
+        &mut app,
+        &config,
+        &handle,
+        QueuedMessage::new("please continue".to_string(), None),
+    )
+    .await
+    .expect_err("invalid client must fail before changing pause state");
+
+    assert!(app.paused);
+    assert!(app.pausable);
+    assert_eq!(
+        app.paused_quarry.as_deref(),
+        Some("finish the paused audit")
+    );
+    assert!(app.hunt.quarry.is_none());
+    assert_eq!(app.hunt.tokens_used, 7);
+    assert_eq!(app.hunt.time_used_seconds, 11);
+    assert_eq!(app.hunt.continuation_count, 2);
+    assert!(handle.is_paused());
+    assert!(app.api_messages.is_empty());
+    assert!(app.history.is_empty());
+}
+
+#[test]
+fn logout_memory_clear_respects_named_and_legacy_custom_scopes() {
+    let mut named_app = create_test_app();
+    named_app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    let mut named_config = Config {
+        provider: Some("lm-studio".to_string()),
+        api_key: Some("deepseek-root-key".to_string()),
+        providers: Some(ProvidersConfig {
+            custom: HashMap::from([(
+                "lm-studio".to_string(),
+                ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    api_key: Some("named-key".to_string()),
+                    base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+                    model: Some("local-model".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    clear_active_provider_api_key_from_memory(&named_app, &mut named_config);
+
+    assert_eq!(named_config.api_key.as_deref(), Some("deepseek-root-key"));
+    assert_eq!(
+        named_config
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.custom.get("lm-studio"))
+            .and_then(|provider| provider.api_key.as_deref()),
+        None
+    );
+
+    let mut legacy_app = create_test_app();
+    legacy_app.set_provider_identity(ApiProvider::Custom, "custom");
+    let mut legacy_config = Config {
+        provider: Some("custom".to_string()),
+        api_key: Some("legacy-key".to_string()),
+        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
+        default_text_model: Some("legacy-model".to_string()),
+        ..Default::default()
+    };
+
+    clear_active_provider_api_key_from_memory(&legacy_app, &mut legacy_config);
+
+    assert_eq!(legacy_config.api_key, None);
+    assert!(legacy_config.providers.is_none());
+}
+
+#[test]
+fn auto_routed_turn_compaction_uses_selected_route_not_stale_app_route() {
+    let mut app = create_test_app();
+    app.auto_model = true;
+    app.model = "auto".to_string();
+    app.api_provider = ApiProvider::Deepseek;
+    app.active_route_limits = Some(codewhale_config::route::RouteLimits {
+        context_tokens: Some(32_000),
+        ..Default::default()
+    });
+    app.auto_compact_threshold_percent = 75.0;
+
+    let config = Config {
+        provider: Some("openrouter".to_string()),
+        providers: Some(ProvidersConfig {
+            openrouter: ProviderConfig {
+                api_key: Some("test-openrouter-key".to_string()),
+                model: Some("vendor/model-b".to_string()),
+                context_window: Some(196_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let route = resolve_runtime_route(&config, ApiProvider::Openrouter, Some("vendor/model-b"))
+        .expect("resolve auto-selected route")
+        .validate()
+        .expect("preflight auto-selected route");
+    let route_limits = crate::route_budget::known_route_limits(route.candidate.limits);
+
+    let compaction =
+        app.compaction_config_for_route(route.identity.provider, &route.model, route_limits);
+
+    assert_eq!(compaction.model, "vendor/model-b");
+    assert_eq!(compaction.effective_context_window, Some(196_000));
+    assert_eq!(
+        compaction.token_threshold,
+        crate::route_budget::compaction_threshold_for_route_at_percent(
+            ApiProvider::Openrouter,
+            "vendor/model-b",
+            route_limits,
+            75.0,
+        )
+    );
+    assert_ne!(compaction, app.compaction_config());
+
+    let pre_send_compact = crate::core::ops::Op::CompactContext {
+        route: Box::new(route.into_resolved()),
+        compaction: Box::new(compaction.clone()),
+    };
+    match pre_send_compact {
+        crate::core::ops::Op::CompactContext { route, compaction } => {
+            assert_eq!(route.identity.provider, ApiProvider::Openrouter);
+            assert_eq!(route.model, "vendor/model-b");
+            assert_eq!(compaction.model, "vendor/model-b");
+            assert_eq!(compaction.effective_context_window, Some(196_000));
+        }
+        other => panic!("expected route-bound compact op, got {other:?}"),
+    }
+}
+
 #[cfg(not(windows))]
 fn write_message_submit_hook(dir: &TempDir, name: &str, body: &str) -> String {
     let path = dir.path().join(name);
@@ -4232,6 +4557,59 @@ printf '%s\n' '{"text":"after soft failure"}'
         }
         other => panic!("expected SendMessage, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn dispatch_route_failure_leaves_loading_and_transcript_unchanged() {
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_model_selection("local-model".to_string());
+    app.api_messages
+        .push(text_message("assistant", "existing conversation"));
+    app.add_message(HistoryCell::System {
+        content: "existing receipt".to_string(),
+    });
+    let mut custom = HashMap::new();
+    custom.insert(
+        "lm-studio".to_string(),
+        ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("ftp://invalid.example/v1".to_string()),
+            model: Some("local-model".to_string()),
+            api_key: Some("local-test-key".to_string()),
+            ..ProviderConfig::default()
+        },
+    );
+    let config = Config {
+        provider: Some("lm-studio".to_string()),
+        providers: Some(ProvidersConfig {
+            custom,
+            ..ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+    let mut engine = mock_engine_handle();
+
+    let err = dispatch_user_message(
+        &mut app,
+        &config,
+        &engine.handle,
+        QueuedMessage::new("do not duplicate me".to_string(), None),
+    )
+    .await
+    .expect_err("malformed named custom route must fail closed");
+
+    assert!(err.to_string().contains("http"), "{err}");
+    assert!(!app.is_loading);
+    assert!(app.dispatch_started_at.is_none());
+    assert!(app.last_send_at.is_none());
+    assert_eq!(app.api_messages.len(), 1);
+    assert_eq!(app.history.len(), 1);
+    assert!(matches!(
+        &app.history[0],
+        HistoryCell::System { content } if content == "existing receipt"
+    ));
+    assert!(engine.rx_op.try_recv().is_err());
 }
 
 #[cfg(not(windows))]
@@ -4888,6 +5266,7 @@ fn turn_liveness_recovers_stalled_in_progress_turn() {
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
             provider: ApiProvider::Openai,
+            provider_identity: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             auto_model: false,
         }),
@@ -4927,6 +5306,7 @@ fn engine_event_disconnect_recovers_live_turn_immediately() {
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
             provider: ApiProvider::Openai,
+            provider_identity: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             auto_model: false,
         }),
@@ -4990,6 +5370,7 @@ fn engine_event_disconnect_cleans_cancelled_turn_metadata() {
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
             provider: ApiProvider::Openai,
+            provider_identity: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             auto_model: false,
         }),
@@ -7233,6 +7614,7 @@ fn turn_started_route_is_captured_before_cancel_suppression() {
         created_at,
         route: Some(crate::core::events::TurnRoute {
             provider: ApiProvider::Openai,
+            provider_identity: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             auto_model: true,
         }),
@@ -7266,6 +7648,7 @@ fn engine_error_health_accounting_uses_active_turn_route() {
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
             provider: ApiProvider::Openai,
+            provider_identity: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             auto_model: true,
         }),
@@ -9971,10 +10354,37 @@ fn automatic_session_snapshot_keeps_named_custom_identity_secret_free() {
     let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
     let serialized = serde_json::to_string(&snapshot).expect("serialize session");
 
-    assert_eq!(snapshot.metadata.model_provider, "lm-studio");
-    assert!(serialized.contains("lm-studio"));
+    assert_eq!(snapshot.metadata.model_provider, "custom");
+    assert_eq!(
+        snapshot.metadata.model_provider_id.as_deref(),
+        Some("lm-studio")
+    );
+    assert!(serialized.contains("\"model_provider\":\"custom\""));
+    assert!(serialized.contains("\"model_provider_id\":\"lm-studio\""));
     assert!(!serialized.contains("super-secret-local-key"));
     assert!(!serialized.contains("127.0.0.1:1234"));
+}
+
+#[test]
+fn automatic_session_snapshot_omits_id_for_legacy_root_custom_route() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager =
+        crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
+    let config = Config {
+        provider: Some("custom".to_string()),
+        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
+        default_text_model: Some("legacy-root-model".to_string()),
+        ..Config::default()
+    };
+    let mut app = App::new(create_test_options(), &config);
+    app.api_messages.push(text_message("user", "persist root"));
+
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
+    let serialized = serde_json::to_string(&snapshot).expect("serialize session");
+
+    assert_eq!(snapshot.metadata.model_provider, "custom");
+    assert_eq!(snapshot.metadata.model_provider_id, None);
+    assert!(!serialized.contains("model_provider_id"));
 }
 
 #[test]
@@ -10222,6 +10632,10 @@ fn missing_named_custom_provider_resume_leaves_current_session_wholly_unchanged(
     app.workspace = PathBuf::from("/tmp/current-workspace");
     app.set_model_selection("deepseek-v4-pro".to_string());
     app.set_provider_identity(ApiProvider::Deepseek, "deepseek");
+    app.add_message(HistoryCell::System {
+        content: "existing receipt".to_string(),
+    });
+    app.status_message = Some("existing status".to_string());
     let mut config = Config {
         provider: Some("deepseek".to_string()),
         ..Config::default()
@@ -10231,8 +10645,14 @@ fn missing_named_custom_provider_resume_leaves_current_session_wholly_unchanged(
     session.metadata.model = "local-code-model".to_string();
     session.metadata.workspace = PathBuf::from("/tmp/other-workspace");
 
-    let err = apply_loaded_session(&mut app, &mut config, &session)
-        .expect_err("removed custom provider must fail closed");
+    let err = apply_loaded_session_config_snapshot(
+        &mut app,
+        &mut config,
+        &session,
+        Config::default(),
+        true,
+    )
+    .expect_err("removed custom provider must fail closed");
 
     assert!(err.contains("[providers.lm-studio]"), "{err}");
     assert!(err.contains("will not fall back"), "{err}");
@@ -10243,6 +10663,63 @@ fn missing_named_custom_provider_resume_leaves_current_session_wholly_unchanged(
     assert_eq!(app.provider_identity_for_persistence(), "deepseek");
     assert_eq!(app.model_selection_for_persistence(), "deepseek-v4-pro");
     assert_eq!(config.provider.as_deref(), Some("deepseek"));
+    assert_eq!(app.history.len(), 1);
+    assert!(matches!(
+        &app.history[0],
+        HistoryCell::System { content } if content == "existing receipt"
+    ));
+    assert_eq!(app.status_message.as_deref(), Some("existing status"));
+}
+
+#[test]
+fn custom_session_resume_requires_structural_route_not_client_construction() {
+    let mut app = create_test_app();
+    app.api_messages
+        .push(text_message("user", "keep the current conversation"));
+    app.current_session_id = Some("current-session".to_string());
+    app.workspace = PathBuf::from("/tmp/current-workspace");
+    app.set_model_selection("deepseek-v4-pro".to_string());
+    app.set_provider_identity(ApiProvider::Deepseek, "deepseek");
+    app.add_message(HistoryCell::System {
+        content: "existing receipt".to_string(),
+    });
+    app.status_message = Some("existing status".to_string());
+    let mut config =
+        named_custom_session_config("lm-studio", "http://127.0.0.1:1234/v1", "local-code-model");
+    config
+        .providers
+        .as_mut()
+        .expect("providers")
+        .custom
+        .get_mut("lm-studio")
+        .expect("lm-studio")
+        .insecure_skip_tls_verify = Some(true);
+    let mut session = saved_session_with_messages(vec![text_message("user", "replacement")]);
+    session.metadata.model_provider = "lm-studio".to_string();
+    session.metadata.model = "local-code-model".to_string();
+    session.metadata.workspace = PathBuf::from("/tmp/other-workspace");
+
+    let recovered = apply_loaded_session(&mut app, &mut config, &session)
+        .expect("session restore should not require provider credentials or TLS client setup");
+
+    assert!(recovered);
+    assert_eq!(
+        app.current_session_id.as_deref(),
+        Some("resume-recovery-session")
+    );
+    assert!(app.api_messages.is_empty());
+    assert_eq!(app.input, "replacement");
+    assert_eq!(app.workspace, PathBuf::from("/tmp/other-workspace"));
+    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.provider_identity_for_persistence(), "lm-studio");
+    assert_eq!(app.model_selection_for_persistence(), "local-code-model");
+    assert!(app.history.is_empty());
+    assert!(
+        app.status_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Recovered interrupted prompt"))
+    );
+    assert_eq!(config.provider.as_deref(), Some("lm-studio"));
 }
 
 #[test]
@@ -10276,6 +10753,271 @@ fn named_custom_provider_resume_uses_exact_live_endpoint_model_and_workspace() {
         "http://127.0.0.1:1234/v1"
     );
     assert_eq!(route.model, "local-code-model");
+}
+
+#[test]
+fn same_workspace_named_custom_switch_requires_engine_respawn() {
+    let mut config =
+        named_custom_session_config("custom-a", "http://127.0.0.1:18181/v1", "model-a");
+    config.providers.as_mut().expect("providers").custom.insert(
+        "custom-b".to_string(),
+        crate::config::ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("http://127.0.0.1:18182/v1".to_string()),
+            model: Some("model-b".to_string()),
+            ..Default::default()
+        },
+    );
+    let workspace = PathBuf::from("/tmp/same-workspace-custom-switch");
+    let mut app = create_test_app();
+    app.workspace.clone_from(&workspace);
+    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_model_selection("model-a".to_string());
+    let previous_provider = app.api_provider;
+    let previous_identity = app.provider_identity_for_persistence().to_string();
+    let previous_workspace = app.workspace.clone();
+
+    let mut session = saved_session_with_messages(vec![text_message("user", "switch route")]);
+    session.metadata.model_provider = "custom-b".to_string();
+    session.metadata.model = "model-b".to_string();
+    session.metadata.workspace = workspace;
+    apply_loaded_session(&mut app, &mut config, &session).expect("restore custom B");
+
+    assert_eq!(previous_provider, ApiProvider::Custom);
+    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.provider_identity_for_persistence(), "custom-b");
+    assert!(loaded_session_requires_engine_respawn(
+        &app,
+        previous_provider,
+        &previous_identity,
+        &previous_workspace,
+    ));
+}
+
+#[test]
+fn file_load_uses_one_fresh_config_snapshot_for_custom_route_and_app_state() {
+    let workspace = PathBuf::from("/tmp/atomic-file-load");
+    let mut stale_config =
+        named_custom_session_config("custom-a", "http://127.0.0.1:18181/v1", "model-a");
+    let fresh_config =
+        named_custom_session_config("custom-b", "http://127.0.0.1:18182/v1", "model-b");
+    let mut app = create_test_app();
+    app.workspace.clone_from(&workspace);
+    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_model_selection("model-a".to_string());
+    app.api_messages
+        .push(text_message("user", "old conversation"));
+    let mut session = saved_session_with_messages(vec![
+        text_message("user", "new conversation"),
+        text_message("assistant", "loaded reply"),
+    ]);
+    session.metadata.model_provider = "custom-b".to_string();
+    session.metadata.model = "model-b".to_string();
+    session.metadata.workspace = workspace;
+
+    let (recovered, respawn) = apply_loaded_session_config_snapshot(
+        &mut app,
+        &mut stale_config,
+        &session,
+        fresh_config,
+        true,
+    )
+    .expect("fresh disk config should atomically restore custom B");
+
+    assert!(!recovered);
+    assert!(respawn);
+    assert_eq!(app.provider_identity_for_persistence(), "custom-b");
+    assert_eq!(app.model_selection_for_persistence(), "model-b");
+    assert_eq!(app.api_messages, session.messages);
+    assert_eq!(stale_config.provider.as_deref(), Some("custom-b"));
+    assert_eq!(
+        stale_config.deepseek_base_url(),
+        "http://127.0.0.1:18182/v1"
+    );
+}
+
+#[test]
+fn session_load_keeps_idless_custom_record_on_root_when_table_coexists() {
+    let mut config =
+        named_custom_session_config("custom", "http://127.0.0.1:18182/v1", "table-model");
+    config.base_url = Some("http://127.0.0.1:18181/v1".to_string());
+    config.default_text_model = Some("legacy-root-model".to_string());
+    let mut app = create_test_app();
+    app.api_messages
+        .push(text_message("user", "current conversation"));
+    let mut session = saved_session_with_messages(vec![
+        text_message("user", "legacy custom conversation"),
+        text_message("assistant", "legacy reply"),
+    ]);
+    session.metadata.model_provider = "custom".to_string();
+    session.metadata.model_provider_id = None;
+    session.metadata.model = "legacy-saved-model".to_string();
+
+    let recovered = apply_loaded_session(&mut app, &mut config, &session)
+        .expect("id-less custom record must retain root provenance");
+    assert!(!recovered);
+    assert_eq!(app.api_messages, session.messages);
+    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.provider_identity_for_persistence(), "custom");
+    assert_eq!(app.provider_id_for_persistence(), None);
+    assert_eq!(config.deepseek_base_url(), "http://127.0.0.1:18181/v1");
+    assert!(
+        config
+            .providers
+            .as_ref()
+            .is_none_or(|providers| !providers.custom.contains_key("custom"))
+    );
+}
+
+#[test]
+fn session_load_rejects_exact_custom_table_record_when_only_root_remains() {
+    let mut config = Config {
+        provider: Some("custom".to_string()),
+        base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+        default_text_model: Some("legacy-root-model".to_string()),
+        ..Config::default()
+    };
+    let mut app = create_test_app();
+    app.api_messages
+        .push(text_message("user", "current conversation"));
+    let previous_messages = app.api_messages.clone();
+    let previous_identity = app.provider_identity_for_persistence().to_string();
+
+    let mut session = saved_session_with_messages(vec![
+        text_message("user", "exact table conversation"),
+        text_message("assistant", "exact table reply"),
+    ]);
+    session.metadata.model_provider = "custom".to_string();
+    session.metadata.model_provider_id = Some("custom".to_string());
+    session.metadata.model = "table-model".to_string();
+
+    let error = apply_loaded_session(&mut app, &mut config, &session)
+        .expect_err("exact table record must not fall back to root");
+    assert!(error.contains("[providers.custom]"), "{error}");
+    assert!(error.contains("will not fall back"), "{error}");
+    assert_eq!(app.api_messages, previous_messages);
+    assert_eq!(app.provider_identity_for_persistence(), previous_identity);
+}
+
+#[test]
+fn file_load_respawns_engine_when_same_custom_identity_changes_endpoint() {
+    let workspace = PathBuf::from("/tmp/atomic-file-load-same-custom");
+    let mut stale_config =
+        named_custom_session_config("custom-a", "http://127.0.0.1:18181/v1", "model-a");
+    let mut fresh_config =
+        named_custom_session_config("custom-a", "http://127.0.0.1:18199/v1", "model-a");
+    let fresh_entry = fresh_config
+        .providers
+        .as_mut()
+        .expect("providers")
+        .custom
+        .get_mut("custom-a")
+        .expect("custom A");
+    fresh_entry.api_key = Some("rotated-key".to_string());
+    fresh_entry.http_headers = Some(std::collections::HashMap::from([(
+        "X-Route-Version".to_string(),
+        "fresh".to_string(),
+    )]));
+
+    let mut app = create_test_app();
+    app.workspace.clone_from(&workspace);
+    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_model_selection("model-a".to_string());
+    let mut session = saved_session_with_messages(vec![text_message("user", "new endpoint")]);
+    session.metadata.model_provider = "custom-a".to_string();
+    session.metadata.model = "model-a".to_string();
+    session.metadata.workspace = workspace;
+
+    let (_, respawn) = apply_loaded_session_config_snapshot(
+        &mut app,
+        &mut stale_config,
+        &session,
+        fresh_config,
+        true,
+    )
+    .expect("same-key fresh config should load atomically");
+
+    assert!(respawn, "file loads must install the fresh engine config");
+    assert_eq!(app.provider_identity_for_persistence(), "custom-a");
+    assert_eq!(
+        stale_config.deepseek_base_url(),
+        "http://127.0.0.1:18199/v1"
+    );
+    let entry = stale_config
+        .provider_config_for(ApiProvider::Custom)
+        .expect("fresh custom route");
+    assert_eq!(entry.api_key.as_deref(), Some("rotated-key"));
+    assert_eq!(
+        entry
+            .http_headers
+            .as_ref()
+            .and_then(|headers| headers.get("X-Route-Version"))
+            .map(String::as_str),
+        Some("fresh")
+    );
+}
+
+#[test]
+fn file_load_route_refresh_preserves_effective_permission_and_feature_overlays() {
+    let workspace = PathBuf::from("/tmp/atomic-file-load-policy");
+    let mut effective_config =
+        named_custom_session_config("custom-a", "http://127.0.0.1:18181/v1", "model-a");
+    effective_config.approval_policy = Some("never".to_string());
+    effective_config.sandbox_mode = Some("read-only".to_string());
+    effective_config.allow_shell = Some(false);
+    effective_config.max_subagents = Some(1);
+    effective_config.features = Some(crate::features::FeaturesToml {
+        entries: std::collections::BTreeMap::from([
+            ("shell_tool".to_string(), false),
+            ("subagents".to_string(), false),
+        ]),
+    });
+
+    let mut raw_disk_config =
+        named_custom_session_config("custom-a", "http://127.0.0.1:18199/v1", "model-a");
+    raw_disk_config.approval_policy = Some("always".to_string());
+    raw_disk_config.sandbox_mode = Some("danger-full-access".to_string());
+    raw_disk_config.allow_shell = Some(true);
+    raw_disk_config.max_subagents = Some(64);
+    raw_disk_config.features = Some(crate::features::FeaturesToml {
+        entries: std::collections::BTreeMap::from([
+            ("shell_tool".to_string(), true),
+            ("subagents".to_string(), true),
+        ]),
+    });
+
+    let mut app = create_test_app();
+    app.workspace.clone_from(&workspace);
+    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_model_selection("model-a".to_string());
+    let mut session = saved_session_with_messages(vec![text_message("user", "keep policy")]);
+    session.metadata.model_provider = "custom-a".to_string();
+    session.metadata.model = "model-a".to_string();
+    session.metadata.workspace = workspace;
+
+    let (_, respawn) = apply_loaded_session_config_snapshot(
+        &mut app,
+        &mut effective_config,
+        &session,
+        raw_disk_config,
+        true,
+    )
+    .expect("fresh route plus effective policy should load");
+
+    assert!(respawn);
+    assert_eq!(
+        effective_config.deepseek_base_url(),
+        "http://127.0.0.1:18199/v1"
+    );
+    assert_eq!(effective_config.approval_policy.as_deref(), Some("never"));
+    assert_eq!(effective_config.sandbox_mode.as_deref(), Some("read-only"));
+    assert_eq!(effective_config.allow_shell, Some(false));
+    assert_eq!(effective_config.max_subagents, Some(1));
+    let features = effective_config
+        .features
+        .expect("effective feature overlay");
+    assert_eq!(features.entries.get("shell_tool"), Some(&false));
+    assert_eq!(features.entries.get("subagents"), Some(&false));
 }
 
 #[test]
@@ -10463,6 +11205,7 @@ async fn model_picker_persists_model_and_reasoning_effort() {
         &mut config,
         "deepseek-v4-pro".to_string(),
         None,
+        None,
         ReasoningEffort::High,
         "auto".to_string(),
         ReasoningEffort::Auto,
@@ -10503,6 +11246,137 @@ async fn model_picker_persists_model_and_reasoning_effort() {
 }
 
 #[tokio::test]
+async fn model_picker_switches_between_exact_named_custom_routes() {
+    let _guard = SettingsHomeGuard::new();
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_model_selection("model-a".to_string());
+    let previous_effort = app.reasoning_effort;
+    let mut custom = HashMap::new();
+    for (name, base_url, model) in [
+        ("custom-a", "http://127.0.0.1:18181/v1", "model-a"),
+        ("custom-b", "http://127.0.0.1:18182/v1", "model-b"),
+    ] {
+        custom.insert(
+            name.to_string(),
+            ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some(base_url.to_string()),
+                model: Some(model.to_string()),
+                api_key: Some("local-test-key".to_string()),
+                ..Default::default()
+            },
+        );
+    }
+    // Opening custom B's model picker retargets only Config; App/engine still
+    // own A until the operator applies a model.
+    let mut config = Config {
+        provider: Some("custom-b".to_string()),
+        providers: Some(ProvidersConfig {
+            custom,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut engine = mock_engine_handle();
+
+    apply_model_picker_choice(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        "model-b".to_string(),
+        None,
+        Some("custom-b".to_string()),
+        ReasoningEffort::High,
+        "model-a".to_string(),
+        previous_effort,
+    )
+    .await;
+
+    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.provider_identity_for_persistence(), "custom-b");
+    assert_eq!(app.model_selection_for_persistence(), "model-b");
+    assert_eq!(config.provider.as_deref(), Some("custom-b"));
+    assert_eq!(config.deepseek_base_url(), "http://127.0.0.1:18182/v1");
+}
+
+#[tokio::test]
+async fn model_picker_auto_switches_exact_named_custom_route_transactionally() {
+    let _guard = SettingsHomeGuard::new();
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_model_selection("model-a".to_string());
+    let previous_effort = app.reasoning_effort;
+    let mut custom = HashMap::new();
+    for (name, base_url, model) in [
+        ("custom-a", "http://127.0.0.1:18181/v1", "model-a"),
+        ("custom-b", "http://127.0.0.1:18182/v1", "model-b"),
+    ] {
+        custom.insert(
+            name.to_string(),
+            ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some(base_url.to_string()),
+                model: Some(model.to_string()),
+                api_key: Some("local-test-key".to_string()),
+                ..Default::default()
+            },
+        );
+    }
+    let mut config = Config {
+        provider: Some("custom-b".to_string()),
+        providers: Some(ProvidersConfig {
+            custom,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut engine = mock_engine_handle();
+
+    apply_model_picker_choice(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        "auto".to_string(),
+        None,
+        Some("custom-b".to_string()),
+        ReasoningEffort::Auto,
+        "model-a".to_string(),
+        previous_effort,
+    )
+    .await;
+
+    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.provider_identity_for_persistence(), "custom-b");
+    assert!(app.auto_model);
+    assert_eq!(app.model_selection_for_persistence(), "auto");
+    assert_eq!(config.provider.as_deref(), Some("custom-b"));
+    assert_eq!(config.deepseek_base_url(), "http://127.0.0.1:18182/v1");
+}
+
+#[test]
+fn dismissing_named_custom_model_picker_restores_app_owned_config_route() {
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    let mut config =
+        named_custom_session_config("custom-a", "http://127.0.0.1:18181/v1", "model-a");
+    config.providers.as_mut().expect("providers").custom.insert(
+        "custom-b".to_string(),
+        ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("http://127.0.0.1:18182/v1".to_string()),
+            model: Some("model-b".to_string()),
+            ..Default::default()
+        },
+    );
+    config.provider = Some("custom-b".to_string());
+
+    sync_config_provider_from_app(&mut config, &app);
+
+    assert_eq!(config.provider.as_deref(), Some("custom-a"));
+}
+
+#[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn model_picker_skips_setup_receipt_when_settings_persistence_fails() {
     let _lock = crate::test_support::lock_test_env();
@@ -10532,6 +11406,7 @@ async fn model_picker_skips_setup_receipt_when_settings_persistence_fails() {
         &mut engine.handle,
         &mut config,
         "deepseek-v4-pro".to_string(),
+        None,
         None,
         ReasoningEffort::High,
         "auto".to_string(),

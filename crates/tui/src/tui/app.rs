@@ -191,6 +191,9 @@ pub struct TurnCacheRecord {
     /// API provider used for the turn. This is recorded so cache misses can be
     /// correlated with provider/model route changes.
     pub provider: Option<ApiProvider>,
+    /// Exact non-secret configured route key. This distinguishes named custom
+    /// providers which all share [`ApiProvider::Custom`].
+    pub provider_identity: Option<String>,
     /// Concrete model used for the turn. For auto-model turns this is the
     /// routed model, not the literal `auto` setting.
     pub model: Option<String>,
@@ -1777,6 +1780,9 @@ pub struct App {
     /// Built-ins use their canonical slug; named custom providers retain the
     /// user-owned key instead of collapsing to `custom`.
     pub(crate) provider_identity: String,
+    /// Additive exact configured id for persistence. `None` preserves the
+    /// legacy root-level custom route even when a same-key table appears.
+    pub(crate) provider_exact_id: Option<String>,
     /// Primary provider plus configured fallback providers for this session.
     pub provider_chain: Option<ProviderChain>,
     /// Per-provider auth/local readiness snapshot for the fallback chain (#2574).
@@ -2662,14 +2668,28 @@ impl App {
             .provider
             .as_deref()
             .is_some_and(|provider| !provider.trim().is_empty());
-        let mut provider_identity = config.provider_identity_for(provider);
+        let mut provider_identity_record = config
+            .active_provider_identity(provider)
+            .unwrap_or_else(|_| {
+                let key = config.provider_identity_for(provider);
+                let exact_id = (!(provider == ApiProvider::Custom
+                    && config.uses_legacy_literal_custom_route()))
+                .then(|| key.clone());
+                crate::config::ProviderIdentity {
+                    provider,
+                    key,
+                    exact_id,
+                }
+            });
         if !config_explicitly_selects_provider
             && let Some(ref provider_str) = settings.default_provider
             && let Ok(resolved) = config.resolve_provider_identity(provider_str)
         {
             provider = resolved.provider;
-            provider_identity = resolved.key;
+            provider_identity_record = resolved;
         }
+        let provider_identity = provider_identity_record.key;
+        let provider_exact_id = provider_identity_record.exact_id;
         let mut effective_auth_config = config.clone();
         effective_auth_config.provider = Some(provider_identity.clone());
         let model_ids_passthrough = effective_auth_config.model_ids_pass_through();
@@ -3005,6 +3025,7 @@ impl App {
             active_turn: None,
             api_provider: provider,
             provider_identity,
+            provider_exact_id,
             provider_chain,
             provider_readiness,
             provider_health: crate::provider_readiness::ProviderReadinessSnapshot::default(),
@@ -6498,13 +6519,31 @@ impl App {
         }
     }
 
+    #[must_use]
+    pub(crate) fn provider_id_for_persistence(&self) -> Option<&str> {
+        self.provider_exact_id.as_deref()
+    }
+
     pub(crate) fn set_provider_identity(
         &mut self,
         provider: ApiProvider,
         identity: impl Into<String>,
     ) {
+        let identity = identity.into();
         self.api_provider = provider;
-        self.provider_identity = identity.into();
+        self.provider_exact_id = (!(provider == ApiProvider::Custom
+            && identity.eq_ignore_ascii_case(ApiProvider::Custom.as_str())))
+        .then(|| identity.clone());
+        self.provider_identity = identity;
+    }
+
+    pub(crate) fn set_provider_identity_record(
+        &mut self,
+        identity: crate::config::ProviderIdentity,
+    ) {
+        self.api_provider = identity.provider;
+        self.provider_identity = identity.key;
+        self.provider_exact_id = identity.exact_id;
     }
 
     pub fn accepts_custom_model_ids(&self) -> bool {
@@ -6572,6 +6611,18 @@ impl App {
         (self.api_provider, self.model_display_label())
     }
 
+    /// Exact non-secret route label for user-visible status surfaces.
+    #[must_use]
+    pub fn effective_route_identity_display(&self) -> (String, String) {
+        let (provider, model) = self.effective_route_display();
+        let identity = if provider == ApiProvider::Custom {
+            self.provider_identity_for_persistence()
+        } else {
+            provider.display_name()
+        };
+        (identity.to_string(), model)
+    }
+
     pub fn reasoning_effort_display_label(&self) -> String {
         if self.auto_model || self.reasoning_effort == ReasoningEffort::Auto {
             if let Some(effective) = self.last_effective_reasoning_effort {
@@ -6588,14 +6639,48 @@ impl App {
     }
 
     pub fn compaction_config(&self) -> CompactionConfig {
+        let mut config = self.compaction_config_for_route(
+            self.api_provider,
+            self.effective_model_for_budget(),
+            self.active_route_limits,
+        );
+        // These cached fields are the active-route compatibility authority and
+        // are updated together by `update_model_compaction_budget`. Commands
+        // and embedders may also adjust them directly between route updates.
+        config.enabled = self.auto_compact;
+        config.token_threshold = self.compact_threshold;
+        config
+    }
+
+    /// Build compaction policy from one already-resolved provider route.
+    ///
+    /// Auto routing can select a provider/model whose context limits differ
+    /// from the route currently displayed by the app. Callers dispatching that
+    /// turn must derive every compaction input from the selected descriptor,
+    /// not from the previous route cached in `App`.
+    pub(crate) fn compaction_config_for_route(
+        &self,
+        provider: ApiProvider,
+        model: &str,
+        route_limits: Option<RouteLimits>,
+    ) -> CompactionConfig {
         CompactionConfig {
-            enabled: self.auto_compact,
-            token_threshold: self.compact_threshold,
-            model: self.effective_model_for_budget().to_string(),
+            enabled: if self.auto_compact_user_configured {
+                self.auto_compact
+            } else {
+                crate::route_budget::auto_compact_default_for_route(provider, model, route_limits)
+            },
+            token_threshold: crate::route_budget::compaction_threshold_for_route_at_percent(
+                provider,
+                model,
+                route_limits,
+                self.auto_compact_threshold_percent,
+            ),
+            model: model.to_string(),
             effective_context_window: Some(crate::route_budget::route_context_window_tokens(
-                self.api_provider,
-                self.effective_model_for_budget(),
-                self.active_route_limits,
+                provider,
+                model,
+                route_limits,
             )),
             ..Default::default()
         }

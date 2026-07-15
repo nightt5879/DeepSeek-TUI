@@ -93,6 +93,18 @@ pub enum ApiProvider {
 pub(crate) struct ProviderIdentity {
     pub(crate) provider: ApiProvider,
     pub(crate) key: String,
+    /// Additive exact configured provider id written by current persistence
+    /// schemas. `None` is meaningful: it identifies the released legacy
+    /// root-level `provider = "custom"` route and must never be upgraded to an
+    /// exact `[providers.custom]` table merely because one exists later.
+    pub(crate) exact_id: Option<String>,
+}
+
+impl ProviderIdentity {
+    #[must_use]
+    pub(crate) fn persisted_id(&self) -> Option<&str> {
+        self.exact_id.as_deref()
+    }
 }
 
 impl ApiProvider {
@@ -3388,11 +3400,11 @@ impl Config {
     }
 
     /// Surface a one-line warning when the user has set the legacy root
-    /// `base_url` field but their active provider is not DeepSeek (the only
-    /// provider that actually reads that field, plus an NvidiaNim back-compat
-    /// sniff). Common confusion: users add `base_url = "..."` at the top of
-    /// `~/.deepseek/config.toml` for ollama / vllm / openai-compat servers
-    /// and wonder why it's silently ignored (#1308).
+    /// `base_url` field but their active provider does not read it. DeepSeek,
+    /// the NvidiaNim compatibility sniff, and the literal legacy `custom`
+    /// route are the exceptions. Common confusion: users add a top-level
+    /// `base_url = "..."` to `~/.deepseek/config.toml` for ollama / vllm /
+    /// named OpenAI-compatible servers and wonder why it is ignored (#1308).
     fn warn_on_misplaced_root_base_url(&self) {
         let Some(root_base) = self.base_url.as_deref().map(str::trim) else {
             return;
@@ -3407,6 +3419,9 @@ impl Config {
         if matches!(provider, ApiProvider::NvidiaNim)
             && root_base.contains("integrate.api.nvidia.com")
         {
+            return;
+        }
+        if provider == ApiProvider::Custom && self.uses_legacy_literal_custom_route() {
             return;
         }
         // Only warn if the per-provider table doesn't have an explicit
@@ -3515,13 +3530,10 @@ impl Config {
 
     #[must_use]
     pub fn api_provider(&self) -> ApiProvider {
-        if let Some(provider) = self.provider.as_deref().and_then(ApiProvider::parse) {
-            return provider;
-        }
         // #1519 safety fix: when `provider = "<name>"` is not a built-in provider
         // but names a `[providers.<name>]` custom table, route as the dynamic
-        // custom identity. This MUST precede the DeepSeek fallback below so an
-        // arbitrary custom name can never silently misroute to DeepSeek.
+        // custom identity. Exact configured keys win even when their spelling
+        // collides case-insensitively with a built-in slug.
         if let Some(name) = self.provider.as_deref()
             && self
                 .providers
@@ -3530,6 +3542,9 @@ impl Config {
                 .is_some()
         {
             return ApiProvider::Custom;
+        }
+        if let Some(provider) = self.provider.as_deref().and_then(ApiProvider::parse) {
+            return provider;
         }
         self.base_url
             .as_deref()
@@ -3553,11 +3568,25 @@ impl Config {
                 .as_deref()
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
-            && ApiProvider::parse(name).is_none()
+            && (self
+                .providers
+                .as_ref()
+                .and_then(|providers| providers.custom_provider_config(name))
+                .is_some()
+                || ApiProvider::parse(name).is_none())
         {
             return name.to_string();
         }
         provider.as_str().to_string()
+    }
+
+    /// Resolve the currently selected live route while retaining whether the
+    /// literal custom key came from the legacy root fields or an exact table.
+    pub(crate) fn active_provider_identity(
+        &self,
+        provider: ApiProvider,
+    ) -> std::result::Result<ProviderIdentity, String> {
+        self.resolve_provider_identity(&self.provider_identity_for(provider))
     }
 
     /// Resolve a persisted provider key against the current live config.
@@ -3565,9 +3594,9 @@ impl Config {
     /// Named custom providers are exact and fail closed: a removed, renamed,
     /// or malformed table can never fall through to DeepSeek or whichever
     /// provider happens to be selected now. The literal legacy value `custom`
-    /// remains loadable only when the live config already selects one valid
-    /// named custom table; older records did not retain enough information to
-    /// do anything safer.
+    /// remains loadable only for the old root-field config shape where the live
+    /// provider is also literally `custom` and both `base_url` and
+    /// `default_text_model` identify one valid route.
     pub(crate) fn resolve_provider_identity(
         &self,
         persisted: &str,
@@ -3580,27 +3609,81 @@ impl Config {
             );
         }
 
-        if let Some(provider) = ApiProvider::parse(key)
+        let has_exact_custom_table = self
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.custom_provider_config(key))
+            .is_some();
+
+        if !has_exact_custom_table
+            && let Some(provider) = ApiProvider::parse(key)
             && provider != ApiProvider::Custom
         {
             return Ok(ProviderIdentity {
                 provider,
                 key: provider.as_str().to_string(),
+                exact_id: Some(provider.as_str().to_string()),
             });
         }
 
-        let exact_key = if key.eq_ignore_ascii_case(ApiProvider::Custom.as_str()) {
-            self.provider
-                .as_deref()
-                .map(str::trim)
-                .filter(|name| !name.is_empty() && ApiProvider::parse(name).is_none())
-                .ok_or_else(|| {
-                    "legacy session records only the generic `custom` provider kind. Set `provider = \"<name>\"` to the original `[providers.<name>]` table and retry; CodeWhale will not guess or fall back"
-                        .to_string()
-                })?
-        } else {
-            key
-        };
+        if !has_exact_custom_table && key.eq_ignore_ascii_case(ApiProvider::Custom.as_str()) {
+            if self.selects_literal_custom_provider() {
+                // The historical literal `provider = "custom"` can mean
+                // either the legacy root-field route or an exact
+                // `[providers.custom]` table. Prefer the table when it exists;
+                // otherwise validate the legacy root shape. This keeps old
+                // save/resume records deterministic without treating the
+                // literal key as a wildcard for some other named provider.
+                if !has_exact_custom_table {
+                    self.validate_legacy_literal_custom_route()?;
+                    return Ok(ProviderIdentity {
+                        provider: ApiProvider::Custom,
+                        key: ApiProvider::Custom.as_str().to_string(),
+                        exact_id: None,
+                    });
+                }
+            }
+
+            // Pre-exact releases persisted every named custom route as the
+            // generic literal `custom`. Migrate that record only when the live
+            // config selects the sole valid named custom table; otherwise the
+            // old value is genuinely ambiguous and must fail closed.
+            if !self.selects_literal_custom_provider() {
+                let selected = self.provider.as_deref().map(str::trim).unwrap_or_default();
+                let valid_named = self
+                    .providers
+                    .as_ref()
+                    .map(|providers| {
+                        providers
+                            .custom
+                            .keys()
+                            .filter(|name| {
+                                !name.eq_ignore_ascii_case(ApiProvider::Custom.as_str())
+                                    && ApiProvider::parse(name).is_none()
+                                    && self.resolve_provider_identity(name).is_ok()
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if let [name] = valid_named.as_slice()
+                    && selected == name
+                {
+                    return self.resolve_provider_identity(name);
+                }
+                return Err(format!(
+                    "legacy session records only the generic `custom` provider kind, but the live config does not select exactly one valid named custom route (selected '{}', valid named routes: {}). Restore the original single `[providers.<name>]` route or repair the saved provider identity; CodeWhale will not guess or fall back",
+                    if selected.is_empty() {
+                        "<unset>"
+                    } else {
+                        selected
+                    },
+                    valid_named.len()
+                ));
+            }
+        }
+
+        let exact_key = key;
 
         let entry = self
             .providers
@@ -3640,7 +3723,251 @@ impl Config {
         Ok(ProviderIdentity {
             provider: ApiProvider::Custom,
             key: exact_key.to_string(),
+            exact_id: Some(exact_key.to_string()),
         })
+    }
+
+    /// Resolve an additive exact provider id. Unlike raw selector resolution,
+    /// this never interprets the literal id `custom` as the legacy root route:
+    /// an id means the record requires that exact `[providers.<id>]` table.
+    fn resolve_exact_provider_identity(
+        &self,
+        persisted: &str,
+    ) -> std::result::Result<ProviderIdentity, String> {
+        let id = persisted.trim();
+        if id.is_empty() {
+            return Err(
+                "persisted provider route has an empty exact provider id; CodeWhale will not guess or fall back"
+                    .to_string(),
+            );
+        }
+        let has_exact_custom_table = self
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.custom_provider_config(id))
+            .is_some();
+        if id.eq_ignore_ascii_case(ApiProvider::Custom.as_str()) && !has_exact_custom_table {
+            return Err(format!(
+                "persisted provider route requires exact custom provider '{id}', but `[providers.{id}]` is missing from the live config. Restore that exact table and retry; CodeWhale will not fall back"
+            ));
+        }
+
+        let identity = self.resolve_provider_identity(id)?;
+        if identity.provider == ApiProvider::Custom && identity.persisted_id() != Some(id) {
+            return Err(format!(
+                "persisted provider route requires exact custom provider '{id}', but the live config only provides the legacy root-level custom route. Restore `[providers.{id}]` and retry; CodeWhale will not fall back"
+            ));
+        }
+        Ok(identity)
+    }
+
+    /// Resolve the two-field provider route written by current session/thread
+    /// schemas without erasing which field supplied the identity.
+    ///
+    /// `provider_kind` is the generic wire/provider class (`custom` for every
+    /// named OpenAI-compatible endpoint); `provider_id` is the additive exact
+    /// configured key. Older records have no id and may have overloaded the
+    /// kind field with an exact custom name. Keeping those cases distinct is
+    /// security-sensitive: a legacy built-in record must never be captured by
+    /// a later same-key custom table, while a current `custom` + exact-id pair
+    /// must retain that user-owned table identity.
+    pub(crate) fn resolve_persisted_provider_identity(
+        &self,
+        provider_kind: Option<&str>,
+        provider_id: Option<&str>,
+    ) -> std::result::Result<ProviderIdentity, String> {
+        let kind = provider_kind
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let id = provider_id.map(str::trim).filter(|value| !value.is_empty());
+
+        let Some(kind) = kind else {
+            return id.map_or_else(
+                || {
+                    Err(
+                        "persisted provider route has neither a provider kind nor an exact provider id; CodeWhale will not guess or fall back"
+                            .to_string(),
+                    )
+                },
+                |id| self.resolve_exact_provider_identity(id),
+            );
+        };
+
+        let Some(provider) = ApiProvider::parse(kind) else {
+            // Pre-additive releases sometimes wrote an exact named custom key
+            // into `model_provider`. Preserve that shape, but reject a
+            // contradictory additive id instead of silently choosing one.
+            if let Some(id) = id
+                && id != kind
+            {
+                return Err(format!(
+                    "persisted provider route has legacy identity '{kind}' but exact provider id '{id}'; repair the mismatched fields because CodeWhale will not guess or fall back"
+                ));
+            }
+            return match id {
+                Some(id) => self.resolve_exact_provider_identity(id),
+                None => self.resolve_provider_identity(kind),
+            };
+        };
+
+        if provider == ApiProvider::Custom {
+            if let Some(id) = id {
+                let identity = self.resolve_exact_provider_identity(id)?;
+                if identity.provider != ApiProvider::Custom {
+                    return Err(format!(
+                        "persisted provider route declares generic kind 'custom' but exact provider id '{id}' resolves as built-in '{}'; use the matching built-in kind or restore `[providers.{id}]`. CodeWhale will not guess or fall back",
+                        identity.provider.as_str()
+                    ));
+                }
+                return Ok(identity);
+            }
+
+            // The absence of the additive id is itself provenance. Released
+            // id-less `custom` records belong to the root-level route only;
+            // they must not be captured by a table added under the same key.
+            self.validate_legacy_literal_custom_root_route()?;
+            return Ok(ProviderIdentity {
+                provider: ApiProvider::Custom,
+                key: ApiProvider::Custom.as_str().to_string(),
+                exact_id: None,
+            });
+        }
+
+        if let Some(id) = id
+            && ApiProvider::parse(id) != Some(provider)
+        {
+            return Err(format!(
+                "persisted provider route declares built-in kind '{}' but exact provider id '{id}' names a different route; repair the mismatched fields because CodeWhale will not guess or fall back",
+                provider.as_str()
+            ));
+        }
+
+        // Exact custom keys normally win raw string resolution. A persisted
+        // built-in kind is stronger evidence than that raw key, but Config's
+        // single selector cannot represent both routes simultaneously. Fail
+        // closed instead of constructing a descriptor whose client would read
+        // credentials/settings from the shadowing custom table.
+        if self
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.custom_provider_config(provider.as_str()))
+            .is_some()
+        {
+            return Err(format!(
+                "persisted provider route requires built-in '{}', but an exact `[providers.{}]` custom route shadows the same selector. Rename the custom route or update the saved provider kind/id pair; CodeWhale will not guess or fall back",
+                provider.as_str(),
+                provider.as_str()
+            ));
+        }
+
+        Ok(ProviderIdentity {
+            provider,
+            key: provider.as_str().to_string(),
+            exact_id: Some(provider.as_str().to_string()),
+        })
+    }
+
+    /// Scope a cloned runtime config to one already-resolved identity. This is
+    /// required only for the root-literal custom route: when a later
+    /// `[providers.custom]` table coexists, ordinary selector lookup would
+    /// otherwise capture the table. Removing it from the scoped clone keeps
+    /// the root endpoint authoritative without mutating the live registry.
+    pub(crate) fn scope_to_provider_identity(&mut self, identity: &ProviderIdentity) {
+        self.provider = Some(identity.key.clone());
+        if identity.provider == ApiProvider::Custom
+            && identity.persisted_id().is_none()
+            && let Some(providers) = self.providers.as_mut()
+        {
+            providers.custom.retain(|name, _| {
+                !name
+                    .trim()
+                    .eq_ignore_ascii_case(ApiProvider::Custom.as_str())
+            });
+        }
+    }
+
+    fn validate_legacy_literal_custom_route(&self) -> std::result::Result<(), String> {
+        if self.has_literal_custom_provider_table() {
+            return Err(
+                "legacy `provider = \"custom\"` is ambiguous because `[providers.custom]` is also present. Move the route to one named `[providers.<name>]` table and update the saved provider identity; CodeWhale will not guess or fall back"
+                    .to_string(),
+            );
+        }
+
+        self.validate_legacy_literal_custom_root_route()
+    }
+
+    fn validate_legacy_literal_custom_root_route(&self) -> std::result::Result<(), String> {
+        let selected = self.provider.as_deref().map(str::trim).unwrap_or_default();
+        if !self.selects_literal_custom_provider() {
+            return Err(format!(
+                "legacy session records only the generic `custom` provider kind, but the live config selects '{}'. Only an unchanged legacy config with `provider = \"custom\"` and root-level `base_url`/`default_text_model` can load this session; CodeWhale will not guess or fall back",
+                if selected.is_empty() {
+                    "<unset>"
+                } else {
+                    selected
+                }
+            ));
+        }
+
+        let base_url = self
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|base_url| !base_url.is_empty())
+            .ok_or_else(|| {
+                "legacy `provider = \"custom\"` requires a non-empty root-level `base_url` to load a saved session; CodeWhale will not use the custom-provider placeholder or fall back"
+                    .to_string()
+            })?;
+        let parsed = reqwest::Url::parse(base_url).map_err(|err| {
+            format!(
+                "legacy `provider = \"custom\"` has an invalid root-level `base_url`: {err}. Fix the live config and retry; CodeWhale will not fall back"
+            )
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(
+                "legacy `provider = \"custom\"` requires a root-level `base_url` with an http(s) scheme and host; CodeWhale will not fall back"
+                    .to_string(),
+            );
+        }
+
+        let model = self
+            .default_text_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .ok_or_else(|| {
+                "legacy `provider = \"custom\"` requires a non-empty root-level `default_text_model` to load a saved session; CodeWhale will not guess or fall back"
+                    .to_string()
+            })?;
+        if model.eq_ignore_ascii_case("auto") || normalize_custom_model_id(model).is_none() {
+            return Err(
+                "legacy `provider = \"custom\"` requires one explicit, valid root-level `default_text_model` (not `auto`) to load a saved session; CodeWhale will not guess or fall back"
+                    .to_string(),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn selects_literal_custom_provider(&self) -> bool {
+        self.provider
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|name| name.eq_ignore_ascii_case(ApiProvider::Custom.as_str()))
+    }
+
+    fn has_literal_custom_provider_table(&self) -> bool {
+        self.providers.as_ref().is_some_and(|providers| {
+            providers.custom.keys().any(|name| {
+                name.trim()
+                    .eq_ignore_ascii_case(ApiProvider::Custom.as_str())
+            })
+        })
+    }
+
+    pub(crate) fn uses_legacy_literal_custom_route(&self) -> bool {
+        self.selects_literal_custom_provider() && !self.has_literal_custom_provider_table()
     }
 
     pub(crate) fn provider_config_for(&self, provider: ApiProvider) -> Option<&ProviderConfig> {
@@ -3757,6 +4084,72 @@ impl Config {
             // Handled by the name-keyed early return above (#1519).
             ApiProvider::Custom => unreachable!("custom provider resolved by name above"),
         }
+    }
+
+    /// Apply a runtime model override without migrating a released
+    /// root-literal custom route into an ambiguous `[providers.custom]` table.
+    pub(crate) fn set_provider_model_override(
+        &mut self,
+        provider: ApiProvider,
+        model: Option<String>,
+    ) {
+        if provider == ApiProvider::Custom && self.uses_legacy_literal_custom_route() {
+            self.default_text_model = model;
+        } else {
+            self.provider_config_for_mut(provider).model = model;
+        }
+    }
+
+    /// Apply a runtime endpoint override while preserving the storage shape of
+    /// a released root-literal custom route.
+    pub(crate) fn set_provider_base_url_override(
+        &mut self,
+        provider: ApiProvider,
+        base_url: Option<String>,
+    ) {
+        if provider == ApiProvider::Custom && self.uses_legacy_literal_custom_route() {
+            self.base_url = base_url;
+        } else {
+            self.provider_config_for_mut(provider).base_url = base_url;
+        }
+    }
+
+    /// Apply an in-memory credential update without creating a named custom
+    /// table for the legacy root-literal route.
+    pub(crate) fn set_provider_api_key_override(
+        &mut self,
+        provider: ApiProvider,
+        api_key: Option<String>,
+    ) {
+        if provider == ApiProvider::Custom && self.uses_legacy_literal_custom_route() {
+            self.api_key = api_key;
+        } else {
+            self.provider_config_for_mut(provider).api_key = api_key;
+        }
+    }
+
+    /// Refresh only model-provider route material from a newly loaded disk
+    /// snapshot. The receiver is the already-effective interactive Config,
+    /// including CLI feature toggles and workspace/project permission overlays;
+    /// replacing it wholesale during `/load` could silently loosen those
+    /// controls. Provider tables carry their endpoint, auth, headers, TLS,
+    /// model-passthrough, and per-route limits as one atomic registry.
+    pub(crate) fn refresh_provider_routes_from(&mut self, fresh: &Self) {
+        self.provider.clone_from(&fresh.provider);
+        self.api_key.clone_from(&fresh.api_key);
+        self.base_url.clone_from(&fresh.base_url);
+        self.http_headers.clone_from(&fresh.http_headers);
+        self.default_text_model
+            .clone_from(&fresh.default_text_model);
+        self.auth_mode.clone_from(&fresh.auth_mode);
+        self.fallback_providers
+            .clone_from(&fresh.fallback_providers);
+        self.retry.clone_from(&fresh.retry);
+        self.providers.clone_from(&fresh.providers);
+        self.reasoning_effort_inferred_from_legacy_alias =
+            fresh.reasoning_effort_inferred_from_legacy_alias;
+        self.migrated_deepseek_model_alias
+            .clone_from(&fresh.migrated_deepseek_model_alias);
     }
 
     /// Return the configured provider request concurrency cap.
@@ -4003,10 +4396,10 @@ impl Config {
         let provider = self.api_provider();
         let provider_base = self
             .provider_config_string_with_runtime_fallback(provider, |entry| entry.base_url.clone());
-        // Root `base_url` is the legacy DeepSeek field; only NvidiaNim has a
-        // back-compat sniff (integrate.api.nvidia.com). OpenRouter / Novita
-        // were added in v0.6.7 and require explicit `[providers.<name>]`
-        // entries or the corresponding `*_BASE_URL` env var.
+        // Root `base_url` is normally the legacy DeepSeek field. NvidiaNim has
+        // a back-compat sniff (integrate.api.nvidia.com), and the literal
+        // `provider = "custom"` legacy shape retains its root endpoint. Named
+        // custom providers always read their own `[providers.<name>]` table.
         let root_base = match provider {
             ApiProvider::Deepseek | ApiProvider::DeepseekCN => self.base_url.clone(),
             ApiProvider::DeepseekAnthropic => None,
@@ -4044,10 +4437,10 @@ impl Config {
             | ApiProvider::Sakana
             | ApiProvider::LongCat
             | ApiProvider::Meta
-            | ApiProvider::Xai
-            // Custom reads its base_url from the named `[providers.<name>]`
-            // table (via provider_base), never from the legacy root field.
-            | ApiProvider::Custom => None,
+            | ApiProvider::Xai => None,
+            ApiProvider::Custom if self.uses_legacy_literal_custom_route() => self.base_url.clone(),
+            // Named custom routes read their base URL from `provider_base`.
+            ApiProvider::Custom => None,
         };
         let configured_base_url = provider_base.or(root_base);
         let base = if provider == ApiProvider::XiaomiMimo {
@@ -4160,9 +4553,10 @@ impl Config {
         let provider = self.api_provider();
         let explicit_cli_key = explicit_cli_api_key_override();
 
-        // 0. DeepSeek compatibility slot. The legacy top-level `api_key`
-        // belongs to DeepSeek only; provider-specific keys below must win for
-        // NIM/OpenRouter/etc. so a stale DeepSeek key is not sent elsewhere.
+        // 0. Legacy root compatibility slot. The top-level `api_key` belongs
+        // to DeepSeek, plus the literal root-field `provider = "custom"`
+        // compatibility route. Provider-specific keys below must win for all
+        // named/custom-table routes so a stale root key is not sent elsewhere.
         //
         // However, when the CLI dispatcher forwards an explicit `--api-key`
         // through `DEEPSEEK_API_KEY` with the dispatcher source marker, that
@@ -4231,6 +4625,14 @@ impl Config {
             && !configured.trim().is_empty()
         {
             return Ok(configured);
+        }
+        if provider == ApiProvider::Custom
+            && self.uses_legacy_literal_custom_route()
+            && let Some(configured) = self.api_key.as_ref()
+            && !configured.trim().is_empty()
+            && configured != API_KEYRING_SENTINEL
+        {
+            return Ok(configured.clone());
         }
 
         // 1b. Custom providers (#1519) name their auth env var per-entry via
@@ -5340,9 +5742,10 @@ fn apply_env_overrides(config: &mut Config) {
                     .base_url = Some(value);
             }
             // Custom resolves to the named `[providers.<name>]` table; route the
-            // override through the name-keyed mutable accessor (#1519).
+            // override through the exact route while retaining the released
+            // root-literal custom storage shape (#1519, #4334).
             ApiProvider::Custom => {
-                config.provider_config_for_mut(ApiProvider::Custom).base_url = Some(value);
+                config.set_provider_base_url_override(ApiProvider::Custom, Some(value));
             }
         }
     }
@@ -5546,60 +5949,65 @@ fn apply_env_overrides(config: &mut Config) {
         config.http_headers = Some(root_headers);
 
         let provider = config.api_provider();
-        // Capture the custom entry key (the selected provider name) before the
-        // mutable borrow of `providers` below (#1519).
-        let custom_key = (provider == ApiProvider::Custom).then(|| {
-            config
-                .provider
-                .clone()
-                .unwrap_or_else(|| "__custom__".to_string())
-        });
-        let providers = config
-            .providers
-            .get_or_insert_with(ProvidersConfig::default);
-        let entry = match provider {
-            ApiProvider::Deepseek => &mut providers.deepseek,
-            ApiProvider::DeepseekCN => &mut providers.deepseek_cn,
-            ApiProvider::DeepseekAnthropic => &mut providers.deepseek_anthropic,
-            ApiProvider::NvidiaNim => &mut providers.nvidia_nim,
-            ApiProvider::Openai => &mut providers.openai,
-            ApiProvider::Atlascloud => &mut providers.atlascloud,
-            ApiProvider::WanjieArk => &mut providers.wanjie_ark,
-            ApiProvider::Openrouter => &mut providers.openrouter,
-            ApiProvider::XiaomiMimo => &mut providers.xiaomi_mimo,
-            ApiProvider::Novita => &mut providers.novita,
-            ApiProvider::Fireworks => &mut providers.fireworks,
-            ApiProvider::Siliconflow => &mut providers.siliconflow,
-            ApiProvider::SiliconflowCn => &mut providers.siliconflow_cn,
-            ApiProvider::Arcee => &mut providers.arcee,
-            ApiProvider::Moonshot => &mut providers.moonshot,
-            ApiProvider::Sglang => &mut providers.sglang,
-            ApiProvider::Vllm => &mut providers.vllm,
-            ApiProvider::Ollama => &mut providers.ollama,
-            ApiProvider::Volcengine => &mut providers.volcengine,
-            ApiProvider::Huggingface => &mut providers.huggingface,
-            ApiProvider::Deepinfra => &mut providers.deepinfra,
-            ApiProvider::Together => &mut providers.together,
-            ApiProvider::Qianfan => &mut providers.qianfan,
-            ApiProvider::OpenaiCodex => &mut providers.openai_codex,
-            ApiProvider::Anthropic => &mut providers.anthropic,
-            ApiProvider::Openmodel => &mut providers.openmodel,
-            ApiProvider::Zai => &mut providers.zai,
-            ApiProvider::Stepfun => &mut providers.stepfun,
-            ApiProvider::Minimax => &mut providers.minimax,
-            ApiProvider::MinimaxAnthropic => &mut providers.minimax_anthropic,
-            ApiProvider::Sakana => &mut providers.sakana,
-            ApiProvider::LongCat => &mut providers.longcat,
-            ApiProvider::Meta => &mut providers.meta,
-            ApiProvider::Xai => &mut providers.xai,
-            ApiProvider::Custom => providers
-                .custom
-                .entry(custom_key.expect("custom key captured for custom provider"))
-                .or_default(),
-        };
-        let mut provider_headers = entry.http_headers.clone().unwrap_or_default();
-        provider_headers.extend(headers);
-        entry.http_headers = Some(provider_headers);
+        // Root headers are the canonical header slot for a released literal
+        // custom route. Creating `[providers.custom]` here would make the route
+        // ambiguous and disconnect its root endpoint, model, and credential.
+        if !(provider == ApiProvider::Custom && config.uses_legacy_literal_custom_route()) {
+            // Capture the custom entry key (the selected provider name) before
+            // the mutable borrow of `providers` below (#1519).
+            let custom_key = (provider == ApiProvider::Custom).then(|| {
+                config
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| "__custom__".to_string())
+            });
+            let providers = config
+                .providers
+                .get_or_insert_with(ProvidersConfig::default);
+            let entry = match provider {
+                ApiProvider::Deepseek => &mut providers.deepseek,
+                ApiProvider::DeepseekCN => &mut providers.deepseek_cn,
+                ApiProvider::DeepseekAnthropic => &mut providers.deepseek_anthropic,
+                ApiProvider::NvidiaNim => &mut providers.nvidia_nim,
+                ApiProvider::Openai => &mut providers.openai,
+                ApiProvider::Atlascloud => &mut providers.atlascloud,
+                ApiProvider::WanjieArk => &mut providers.wanjie_ark,
+                ApiProvider::Openrouter => &mut providers.openrouter,
+                ApiProvider::XiaomiMimo => &mut providers.xiaomi_mimo,
+                ApiProvider::Novita => &mut providers.novita,
+                ApiProvider::Fireworks => &mut providers.fireworks,
+                ApiProvider::Siliconflow => &mut providers.siliconflow,
+                ApiProvider::SiliconflowCn => &mut providers.siliconflow_cn,
+                ApiProvider::Arcee => &mut providers.arcee,
+                ApiProvider::Moonshot => &mut providers.moonshot,
+                ApiProvider::Sglang => &mut providers.sglang,
+                ApiProvider::Vllm => &mut providers.vllm,
+                ApiProvider::Ollama => &mut providers.ollama,
+                ApiProvider::Volcengine => &mut providers.volcengine,
+                ApiProvider::Huggingface => &mut providers.huggingface,
+                ApiProvider::Deepinfra => &mut providers.deepinfra,
+                ApiProvider::Together => &mut providers.together,
+                ApiProvider::Qianfan => &mut providers.qianfan,
+                ApiProvider::OpenaiCodex => &mut providers.openai_codex,
+                ApiProvider::Anthropic => &mut providers.anthropic,
+                ApiProvider::Openmodel => &mut providers.openmodel,
+                ApiProvider::Zai => &mut providers.zai,
+                ApiProvider::Stepfun => &mut providers.stepfun,
+                ApiProvider::Minimax => &mut providers.minimax,
+                ApiProvider::MinimaxAnthropic => &mut providers.minimax_anthropic,
+                ApiProvider::Sakana => &mut providers.sakana,
+                ApiProvider::LongCat => &mut providers.longcat,
+                ApiProvider::Meta => &mut providers.meta,
+                ApiProvider::Xai => &mut providers.xai,
+                ApiProvider::Custom => providers
+                    .custom
+                    .entry(custom_key.expect("custom key captured for custom provider"))
+                    .or_default(),
+            };
+            let mut provider_headers = entry.http_headers.clone().unwrap_or_default();
+            provider_headers.extend(headers);
+            entry.http_headers = Some(provider_headers);
+        }
     }
     if matches!(config.api_provider(), ApiProvider::Ollama)
         && let Ok(value) = std::env::var("OLLAMA_BASE_URL")
@@ -5782,19 +6190,21 @@ fn apply_env_overrides(config: &mut Config) {
         // (issue #1714). Mirror the OPENAI_MODEL branch above for every
         // non-DeepSeek provider.
         let provider = config.api_provider();
-        // Capture the custom entry key before the mutable borrow below (#1519).
-        let custom_key = (provider == ApiProvider::Custom).then(|| {
-            config
-                .provider
-                .clone()
-                .unwrap_or_else(|| "__custom__".to_string())
-        });
-        if matches!(
-            provider,
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic
-        ) {
+        if (provider == ApiProvider::Custom && config.uses_legacy_literal_custom_route())
+            || matches!(
+                provider,
+                ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic
+            )
+        {
             config.default_text_model = Some(value);
         } else {
+            // Capture the custom entry key before the mutable borrow below (#1519).
+            let custom_key = (provider == ApiProvider::Custom).then(|| {
+                config
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| "__custom__".to_string())
+            });
             let providers = config
                 .providers
                 .get_or_insert_with(ProvidersConfig::default);
@@ -7225,7 +7635,8 @@ pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
         return true;
     }
 
-    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
+    if (matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
+        || (provider == ApiProvider::Custom && config.uses_legacy_literal_custom_route()))
         && config
             .api_key
             .as_ref()
@@ -7329,12 +7740,37 @@ fn provider_config_is_explicit(entry: &ProviderConfig) -> bool {
 /// `[providers.<name>] api_key = "..."` to `~/.codewhale/config.toml`.
 /// Returns the config file path.
 pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf> {
+    save_api_key_for_identity(
+        &ProviderIdentity {
+            provider,
+            key: provider.as_str().to_string(),
+            exact_id: Some(provider.as_str().to_string()),
+        },
+        &Config {
+            provider: Some(provider.as_str().to_string()),
+            ..Config::default()
+        },
+        api_key,
+    )
+}
+
+pub(crate) fn save_api_key_for_identity(
+    identity: &ProviderIdentity,
+    _route_config: &Config,
+    api_key: &str,
+) -> Result<PathBuf> {
+    let provider = identity.provider;
     if provider == ApiProvider::OpenaiCodex {
         anyhow::bail!(
             "OpenAI Codex uses OAuth. Run `codex login` or set OPENAI_CODEX_ACCESS_TOKEN; CodeWhale does not store an API key for this provider."
         );
     }
-    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+    let is_legacy_literal_custom = provider == ApiProvider::Custom
+        && identity.key.trim() == ApiProvider::Custom.as_str()
+        && identity.persisted_id().is_none();
+    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
+        || is_legacy_literal_custom
+    {
         return match save_api_key(api_key)? {
             SavedCredential::KeyringAndConfigFile { path, .. }
             | SavedCredential::ConfigFile(path) => Ok(path),
@@ -7345,7 +7781,13 @@ pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf>
         .context("Failed to resolve config path: home directory not found.")?;
     ensure_parent_dir(&config_path)?;
 
-    let key_inside = provider_config_key(provider).context("provider api key table")?;
+    let key_inside = if provider == ApiProvider::Custom {
+        let key = identity.key.trim();
+        anyhow::ensure!(!key.is_empty(), "custom provider id cannot be empty");
+        key
+    } else {
+        provider_config_key(provider).context("provider api key table")?
+    };
     // Edit the `[providers.<name>]` table in place so unrelated sections,
     // comments, and formatting survive the write.
     crate::config_persistence::mutate_config_document(&config_path, |doc| {
@@ -7360,7 +7802,7 @@ pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf>
         "credential.save",
         json!({
             "backend": "config_file",
-            "provider": provider.as_str(),
+            "provider": identity.key,
             "config_path": config_path.display().to_string(),
         }),
     );
@@ -7371,7 +7813,12 @@ pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf>
 /// Persist a default model for `provider` via the comment-preserving config
 /// path used by guided provider setup (#3875). DeepSeek writes root
 /// `default_text_model`; other hosted providers write `[providers.<name>] model`.
-pub fn save_provider_model_for(provider: ApiProvider, model: &str) -> Result<PathBuf> {
+pub(crate) fn save_provider_model_for_identity(
+    identity: &ProviderIdentity,
+    _route_config: &Config,
+    model: &str,
+) -> Result<PathBuf> {
+    let provider = identity.provider;
     let model = model.trim();
     anyhow::ensure!(!model.is_empty(), "model cannot be empty");
 
@@ -7379,7 +7826,12 @@ pub fn save_provider_model_for(provider: ApiProvider, model: &str) -> Result<Pat
         .context("Failed to resolve config path: home directory not found.")?;
     ensure_parent_dir(&config_path)?;
 
-    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+    let is_legacy_literal_custom = provider == ApiProvider::Custom
+        && identity.key.trim() == ApiProvider::Custom.as_str()
+        && identity.persisted_id().is_none();
+    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
+        || is_legacy_literal_custom
+    {
         crate::config_persistence::mutate_config_document(&config_path, |doc| {
             crate::config_persistence::set_document_value(doc, &["default_text_model"], model)
         })
@@ -7387,7 +7839,13 @@ pub fn save_provider_model_for(provider: ApiProvider, model: &str) -> Result<Pat
         return Ok(config_path);
     }
 
-    let key_inside = provider_config_key(provider).context("provider model table")?;
+    let key_inside = if provider == ApiProvider::Custom {
+        let key = identity.key.trim();
+        anyhow::ensure!(!key.is_empty(), "custom provider id cannot be empty");
+        key
+    } else {
+        provider_config_key(provider).context("provider model table")?
+    };
     crate::config_persistence::mutate_config_document(&config_path, |doc| {
         crate::config_persistence::set_document_value(
             doc,
@@ -7734,12 +8192,38 @@ pub fn clear_active_provider_api_key(provider: &str) -> Result<()> {
         return Ok(());
     }
 
+    // `custom` is both the legacy root-shaped route id and a valid exact
+    // `[providers.custom]` table key. Inspect the persisted shape before the
+    // mutation so logout clears exactly one credential scope.
+    let persisted = fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config from {}", config_path.display()))?;
+    let persisted_config: Config = toml::from_str(&persisted)
+        .with_context(|| format!("Failed to parse config from {}", config_path.display()))?;
+    let exact_literal_custom_table = provider == ApiProvider::Custom.as_str()
+        && persisted_config
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.custom_provider_config(provider))
+            .is_some();
+
     crate::config_persistence::mutate_config_document(&config_path, |doc| {
-        // The root-level api_key is the legacy DeepSeek slot.
-        if provider == "deepseek" {
+        // The root-level api_key is shared by the legacy DeepSeek and released
+        // literal-custom config shapes. Exact named custom ids remain scoped
+        // to their own table.
+        if matches!(
+            provider,
+            value if value == ApiProvider::Deepseek.as_str()
+                || value == ApiProvider::DeepseekCN.as_str()
+        ) || (provider == ApiProvider::Custom.as_str() && !exact_literal_custom_table)
+        {
             crate::config_persistence::unset_document_value(doc, &["api_key"])?;
         }
-        crate::config_persistence::unset_document_value(doc, &["providers", provider, "api_key"])?;
+        if provider != ApiProvider::Custom.as_str() || exact_literal_custom_table {
+            crate::config_persistence::unset_document_value(
+                doc,
+                &["providers", provider, "api_key"],
+            )?;
+        }
         Ok(())
     })
     .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
