@@ -1,5 +1,6 @@
 {
     "ComposerPlaceholder": "编写任务或使用 /。",
+    "ComposerDispatchFailedRestored": "消息未发送（{error}）；已恢复到输入框。",
     "HistorySearchPlaceholder": "搜索提示历史...",
     "HistorySearchTitle": "历史搜索",
     "HistoryHintMove": "Up/Down 移动",

@@ -1,5 +1,6 @@
 {
     "ComposerPlaceholder": "Escribe una tarea o usa /.",
+    "ComposerDispatchFailedRestored": "No se envió el mensaje ({error}); se restauró en el editor.",
     "HistorySearchPlaceholder": "Buscar en el historial de prompts...",
     "HistorySearchTitle": "Búsqueda en el historial",
     "HistoryHintMove": "Arriba/Abajo mover",

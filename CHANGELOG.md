@@ -17,6 +17,9 @@ quieter, docs-first community foundation.
 
 ### Fixed — final integration
 
+- Keep immediate TUI submit failures inside the shell: custom-provider route
+  preflight and closed-mailbox errors now restore the exact composer draft and
+  selected skill for retry, with a sticky visible error instead of exiting.
 - Anchor automatic compaction thresholds to the route's spendable input
   budget after output reservation and safety headroom, so large-output and
   tight self-hosted routes compact before provider context rejection. The TUI

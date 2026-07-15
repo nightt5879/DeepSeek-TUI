@@ -85,6 +85,7 @@ impl Locale {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageId {
     ComposerPlaceholder,
+    ComposerDispatchFailedRestored,
     HistorySearchPlaceholder,
     HistorySearchTitle,
     HistoryHintMove,
@@ -1013,6 +1014,7 @@ pub enum MessageId {
 #[allow(dead_code)]
 pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ComposerPlaceholder,
+    MessageId::ComposerDispatchFailedRestored,
     MessageId::HistorySearchPlaceholder,
     MessageId::HistorySearchTitle,
     MessageId::HistoryHintMove,

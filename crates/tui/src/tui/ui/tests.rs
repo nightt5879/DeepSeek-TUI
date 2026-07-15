@@ -4408,6 +4408,79 @@ async fn real_engine_client_preflight_failure_leaves_dispatch_state_atomic() {
 }
 
 #[tokio::test]
+async fn immediate_submit_closed_mailbox_restores_composer_and_skill() {
+    let mut app = create_test_app();
+    app.input = "retry this exactly".to_string();
+    app.cursor_position = app.input.chars().count();
+    app.active_skill = Some("keep the selected skill".to_string());
+    let input = app
+        .handle_composer_enter()
+        .expect("non-empty composer should submit");
+    let queued = build_queued_message(&mut app, input);
+    assert!(app.input.is_empty());
+    assert!(app.active_skill.is_none());
+
+    let engine = mock_engine_handle();
+    drop(engine.rx_op);
+
+    submit_or_steer_message(&mut app, &Config::default(), &engine.handle, queued)
+        .await
+        .expect("UI submit failures must remain inside the TUI");
+
+    assert_eq!(app.input, "retry this exactly");
+    assert_eq!(app.cursor_position, app.input.chars().count());
+    assert_eq!(app.active_skill.as_deref(), Some("keep the selected skill"));
+    assert!(!app.is_loading);
+    assert!(app.status_message.as_deref().is_some_and(|status| {
+        status.contains("Message not sent") && status.contains("restored to composer")
+    }));
+    let sticky = app
+        .sticky_status
+        .as_ref()
+        .expect("dispatch failure should stay visible");
+    assert_eq!(sticky.level, StatusToastLevel::Error);
+    assert!(sticky.ttl_ms.is_none());
+}
+
+#[tokio::test]
+async fn immediate_submit_custom_provider_preflight_restores_exact_message() {
+    let mut config =
+        named_custom_session_config("lm-studio", "http://127.0.0.1:1234/v1", "local-model");
+    config
+        .providers
+        .as_mut()
+        .expect("providers")
+        .custom
+        .get_mut("lm-studio")
+        .expect("lm-studio")
+        .insecure_skip_tls_verify = Some(true);
+    let mut app = create_test_app();
+    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_model_selection("local-model".to_string());
+    app.input = "preserve 用户 input".to_string();
+    app.cursor_position = app.input.chars().count();
+    let input = app
+        .handle_composer_enter()
+        .expect("non-empty composer should submit");
+    let queued = build_queued_message(&mut app, input);
+    let (_engine, handle) = crate::core::engine::Engine::new(EngineConfig::default(), &config);
+
+    submit_or_steer_message(&mut app, &config, &handle, queued)
+        .await
+        .expect("provider preflight failures must remain inside the TUI");
+
+    assert_eq!(app.input, "preserve 用户 input");
+    assert_eq!(app.cursor_position, app.input.chars().count());
+    assert!(app.api_messages.is_empty());
+    assert!(app.history.is_empty());
+    assert!(app.last_submitted_prompt.is_none());
+    assert!(app.status_message.as_deref().is_some_and(|status| {
+        status.contains("Failed to configure provider route")
+            && status.contains("restored to composer")
+    }));
+}
+
+#[tokio::test]
 async fn dispatch_uses_app_owned_exact_custom_identity_when_config_selector_drifts() {
     let mut custom = HashMap::new();
     for (name, base_url, model) in [

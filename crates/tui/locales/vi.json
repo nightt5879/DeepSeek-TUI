@@ -1,5 +1,6 @@
 {
     "ComposerPlaceholder": "Nhập nhiệm vụ hoặc sử dụng /.",
+    "ComposerDispatchFailedRestored": "Chưa gửi được tin nhắn ({error}); đã khôi phục vào ô soạn thảo.",
     "HistorySearchPlaceholder": "Tìm kiếm lịch sử câu lệnh...",
     "HistorySearchTitle": "Tìm kiếm lịch sử",
     "HistoryHintMove": "Lên/Xuống để di chuyển",

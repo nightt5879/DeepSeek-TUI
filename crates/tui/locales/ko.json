@@ -1,5 +1,6 @@
 {
     "ComposerPlaceholder": "작업을 입력하거나 /를 사용하세요.",
+    "ComposerDispatchFailedRestored": "메시지를 보내지 못했습니다({error}). 작성란에 복원했습니다.",
     "HistorySearchPlaceholder": "프롬프트 기록 검색...",
     "HistorySearchTitle": "기록 검색",
     "HistoryHintMove": "Up/Down 이동",

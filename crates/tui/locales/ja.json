@@ -1,5 +1,6 @@
 {
     "ComposerPlaceholder": "タスクを書くか / を使う。",
+    "ComposerDispatchFailedRestored": "メッセージを送信できませんでした（{error}）。入力欄に復元しました。",
     "HistorySearchPlaceholder": "プロンプト履歴を検索...",
     "HistorySearchTitle": "履歴検索",
     "HistoryHintMove": "Up/Down 移動",

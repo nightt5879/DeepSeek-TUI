@@ -1,5 +1,6 @@
 {
     "ComposerPlaceholder": "Write a task or use /.",
+    "ComposerDispatchFailedRestored": "Message not sent ({error}); restored to composer.",
     "HistorySearchPlaceholder": "Search prompt history...",
     "HistorySearchTitle": "History Search",
     "HistoryHintMove": "Up/Down move",

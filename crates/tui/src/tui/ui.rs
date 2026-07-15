@@ -10285,7 +10285,12 @@ async fn submit_or_steer_message(
         .unwrap_or(SubmitDisposition::Immediate)
     {
         SubmitDisposition::Immediate => {
-            dispatch_user_message(app, config, engine_handle, message).await
+            if let Err(err) =
+                dispatch_user_message(app, config, engine_handle, message.clone()).await
+            {
+                restore_failed_immediate_submit(app, message, &err);
+            }
+            Ok(())
         }
         SubmitDisposition::Queue => {
             let count = app.queued_message_count().saturating_add(1);
@@ -10322,6 +10327,21 @@ async fn submit_or_steer_message(
         }
         SubmitDisposition::QueueFollowUp => queue_follow_up(app, message).await,
     }
+}
+
+fn restore_failed_immediate_submit(app: &mut App, message: QueuedMessage, error: &anyhow::Error) {
+    tracing::warn!(
+        error = %error,
+        "immediate user message dispatch failed; restored composer"
+    );
+    app.input = message.display;
+    app.cursor_position = app.input.chars().count();
+    app.active_skill = message.skill_instruction;
+    let status = tr(app.ui_locale, MessageId::ComposerDispatchFailedRestored)
+        .replace("{error}", &error.to_string());
+    app.status_message = Some(status.clone());
+    app.set_sticky_status(status, StatusToastLevel::Error, None);
+    app.needs_redraw = true;
 }
 
 /// Drain `app.pending_steers` into a single `QueuedMessage` ready for
