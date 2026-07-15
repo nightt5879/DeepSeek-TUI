@@ -8,6 +8,20 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::{Builder as TempDirBuilder, tempdir};
 
+fn built_in_whale_name_that_cannot_be_generated_for(agent_id: &str) -> &'static str {
+    WHALE_NICKNAMES
+        .iter()
+        .chain(WHALE_NICKNAMES_JA)
+        .chain(WHALE_NICKNAMES_ZH_HANT)
+        .chain(WHALE_NICKNAMES_PT_BR)
+        .chain(WHALE_NICKNAMES_ES_419)
+        .chain(WHALE_NICKNAMES_VI)
+        .chain(WHALE_NICKNAMES_KO)
+        .copied()
+        .find(|name| generated_whale_name_base(agent_id, name).is_none())
+        .expect("the combined pools contain labels not generated for one id")
+}
+
 #[test]
 fn generated_whale_names_follow_session_language_without_mixing() {
     let localized_pools: &[(&str, &[&str])] = &[
@@ -65,12 +79,18 @@ fn locale_matched_whale_collision_suffix_stays_in_language() {
 
 #[test]
 fn localized_whale_displays_rederive_legacy_names_from_neutral_ids() {
+    let generated_a = whale_name_for_id_in_locale("agent_english_a", "zh-Hans");
+    let generated_b = whale_name_for_id_in_locale("agent_english_b", "ja");
+    let generated_c = whale_name_for_id_in_locale("agent_english_c", "vi");
+    let explicit_whale_id = "agent_explicit_whale";
+    let explicit_whale = built_in_whale_name_that_cannot_be_generated_for(explicit_whale_id);
     let displays = localized_whale_display_names(
         [
-            ("agent_english_a", Some("蓝鲸")),
-            ("agent_english_b", Some("シャチ")),
-            ("agent_english_c", Some("Cá voi xanh")),
+            ("agent_english_a", Some(generated_a.as_str())),
+            ("agent_english_b", Some(generated_b.as_str())),
+            ("agent_english_c", Some(generated_c.as_str())),
             ("agent_explicit", Some("docs-fixer")),
+            (explicit_whale_id, Some(explicit_whale)),
         ],
         "en",
     );
@@ -81,7 +101,7 @@ fn localized_whale_displays_rederive_legacy_names_from_neutral_ids() {
             display.is_ascii(),
             "English UI leaked a prior-locale whale name: {display}"
         );
-        let base = generated_whale_name_base(display).expect("English whale display");
+        let base = generated_whale_name_base(agent_id, display).expect("English whale display");
         let index = WHALE_NICKNAMES
             .iter()
             .position(|candidate| *candidate == base)
@@ -92,6 +112,28 @@ fn localized_whale_displays_rederive_legacy_names_from_neutral_ids() {
         displays.get("agent_explicit").map(String::as_str),
         Some("docs-fixer"),
         "an explicit non-whale nickname remains user-owned"
+    );
+    assert_eq!(
+        displays.get(explicit_whale_id).map(String::as_str),
+        Some(explicit_whale),
+        "a built-in whale word belonging to another id remains user-owned"
+    );
+}
+
+#[test]
+fn exact_deterministic_whale_match_remains_generated_without_provenance() {
+    let agent_id = "agent_ambiguous_whale";
+    let generated = whale_name_for_id_in_locale(agent_id, "en");
+    let suffixed = format!("{generated} (17)");
+
+    assert_eq!(
+        generated_whale_name_base(agent_id, &generated),
+        Some(generated.as_str())
+    );
+    assert_eq!(
+        generated_whale_name_base(agent_id, &suffixed),
+        Some(generated.as_str()),
+        "a collision suffix remains presentation-only"
     );
 }
 
@@ -3709,13 +3751,15 @@ fn generated_whale_name_is_not_persisted_or_replayed_on_load() {
     let mut manager =
         SubAgentManager::new(workspace.clone(), 2).with_state_path(state_path.clone());
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let agent_id = "agent_locale_neutral";
+    let generated = whale_name_for_id_in_locale(agent_id, "ja");
     let mut agent = SubAgent::new(
-        "agent_locale_neutral".to_string(),
+        agent_id.to_string(),
         SubAgentType::General,
         "work".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
-        Some("シャチ".to_string()),
+        Some(generated.clone()),
         Some(vec!["read_file".to_string()]),
         input_tx,
         PathBuf::from("."),
@@ -3739,7 +3783,7 @@ fn generated_whale_name_is_not_persisted_or_replayed_on_load() {
 
     // Recreate a pre-fix state file whose generated display came from a
     // Japanese session. Loading under a later session must discard it.
-    persisted["agents"][0]["nickname"] = json!("シャチ");
+    persisted["agents"][0]["nickname"] = json!(generated);
     std::fs::write(
         &state_path,
         serde_json::to_string_pretty(&persisted).expect("serialize legacy state"),
@@ -3749,11 +3793,57 @@ fn generated_whale_name_is_not_persisted_or_replayed_on_load() {
     let mut reloaded = SubAgentManager::new(workspace, 2).with_state_path(state_path);
     reloaded.load_state().expect("load legacy state");
     let snapshot = reloaded
-        .get_result("agent_locale_neutral")
+        .get_result(agent_id)
         .expect("neutral id survives load");
     assert_eq!(snapshot.agent_id, "agent_locale_neutral");
     assert_eq!(snapshot.name, "docs-worker");
     assert_eq!(snapshot.nickname, None);
+}
+
+#[test]
+fn explicit_nonmatching_whale_word_is_persisted_and_loaded() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().to_path_buf();
+    let state_path = default_state_path(tmp.path()).expect("default state path");
+    let agent_id = "agent_explicit_whale_word";
+    let explicit_whale = built_in_whale_name_that_cannot_be_generated_for(agent_id);
+    assert!(generated_whale_name_base(agent_id, explicit_whale).is_none());
+
+    let mut manager =
+        SubAgentManager::new(workspace.clone(), 2).with_state_path(state_path.clone());
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let agent = SubAgent::new(
+        agent_id.to_string(),
+        SubAgentType::General,
+        "work".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        Some(explicit_whale.to_string()),
+        Some(vec!["read_file".to_string()]),
+        input_tx,
+        PathBuf::from("."),
+        "boot_test".to_string(),
+    );
+    manager.agents.insert(agent.id.clone(), agent);
+    manager
+        .persist_state()
+        .expect("persist state")
+        .join()
+        .expect("persist thread");
+
+    let persisted: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).expect("read persisted state"))
+            .expect("parse persisted state");
+    assert_eq!(
+        persisted["agents"][0]["nickname"],
+        json!(explicit_whale),
+        "the explicit whale-word nickname remains durable"
+    );
+
+    let mut reloaded = SubAgentManager::new(workspace, 2).with_state_path(state_path);
+    reloaded.load_state().expect("load state");
+    let snapshot = reloaded.get_result(agent_id).expect("agent survives load");
+    assert_eq!(snapshot.nickname.as_deref(), Some(explicit_whale));
 }
 
 #[test]

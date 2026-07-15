@@ -475,10 +475,10 @@ pub fn assign_unique_whale_name_in_locale(
     format!("{base} ({})", id.get(..4).unwrap_or("?"))
 }
 
-/// Return the unsuffixed whale label when `name` is one of Codewhale's
-/// generated display names. Numeric collision suffixes are presentation-only
-/// and do not make the label user-authored.
-fn generated_whale_name_base(name: &str) -> Option<&str> {
+/// Return the unsuffixed whale label when `name` could have been generated for
+/// this exact agent id in a shipped locale. Numeric collision suffixes are
+/// presentation-only and do not make the label user-authored.
+fn generated_whale_name_base<'a>(agent_id: &str, name: &'a str) -> Option<&'a str> {
     let name = name.trim();
     if name.is_empty() {
         return None;
@@ -493,15 +493,14 @@ fn generated_whale_name_base(name: &str) -> Option<&str> {
         })
         .unwrap_or(name);
 
-    WHALE_NICKNAMES
+    // With no persisted provenance bit, the narrowest truthful test is whether
+    // this exact agent id could have generated the label in a shipped locale.
+    // A user-authored label that happens to be a whale word for some other id
+    // remains explicit. An exact deterministic match is inherently ambiguous
+    // and stays classified as generated for backward compatibility.
+    crate::localization::Locale::shipped()
         .iter()
-        .chain(WHALE_NICKNAMES_JA)
-        .chain(WHALE_NICKNAMES_ZH_HANT)
-        .chain(WHALE_NICKNAMES_PT_BR)
-        .chain(WHALE_NICKNAMES_ES_419)
-        .chain(WHALE_NICKNAMES_VI)
-        .chain(WHALE_NICKNAMES_KO)
-        .any(|candidate| *candidate == base)
+        .any(|locale| whale_name_for_id_in_locale(agent_id, locale.tag()) == base)
         .then_some(base)
 }
 
@@ -510,8 +509,9 @@ fn generated_whale_name_base(name: &str) -> Option<&str> {
 ///
 /// Persisted `nickname` values predate locale-scoped naming and may contain a
 /// whale label chosen under another language. Those generated values are
-/// deliberately ignored here. A nickname outside every built-in whale pool is
-/// an explicit custom label and remains intact.
+/// deliberately ignored here. A nickname that this agent id could not have
+/// generated is an explicit custom label and remains intact, even when it is a
+/// whale word from a built-in pool.
 #[must_use]
 pub(crate) fn localized_whale_display_names<'a>(
     agents: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
@@ -543,7 +543,7 @@ pub(crate) fn localized_whale_display_names<'a>(
     for (agent_id, nickname) in &by_id {
         let Some(nickname) = nickname
             .as_deref()
-            .filter(|name| generated_whale_name_base(name).is_none())
+            .filter(|name| generated_whale_name_base(agent_id, name).is_none())
         else {
             continue;
         };
@@ -2421,7 +2421,7 @@ impl SubAgentManager {
                 nickname: agent
                     .nickname
                     .clone()
-                    .filter(|name| generated_whale_name_base(name).is_none()),
+                    .filter(|name| generated_whale_name_base(&agent.id, name).is_none()),
                 status: agent.status.clone(),
                 result: agent.result.clone(),
                 steps_taken: agent.steps_taken,
@@ -2578,6 +2578,9 @@ impl SubAgentManager {
         self.agents.clear();
         self.worker_records.clear();
         for persisted in state.agents {
+            let nickname = persisted
+                .nickname
+                .filter(|name| generated_whale_name_base(&persisted.id, name).is_none());
             let mut status = persisted.status;
             if matches!(status, SubAgentStatus::Running) {
                 status = SubAgentStatus::Interrupted(SUBAGENT_RESTART_REASON.to_string());
@@ -2612,9 +2615,7 @@ impl SubAgentManager {
                 // v0.8.68 and earlier persisted generated whale text. It may
                 // have been chosen under a different UI language, so never
                 // replay it into a new session. Explicit custom names survive.
-                nickname: persisted
-                    .nickname
-                    .filter(|name| generated_whale_name_base(name).is_none()),
+                nickname,
                 status,
                 result: persisted.result,
                 steps_taken: persisted.steps_taken,

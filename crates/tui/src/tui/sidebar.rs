@@ -7309,13 +7309,15 @@ mod tests {
     fn english_sidebar_relocalizes_mixed_persisted_whale_names() {
         let mut app = create_test_app();
         app.ui_locale = Locale::En;
-        for (agent_id, legacy_name) in [
-            ("agent_locale_a", "蓝鲸"),
-            ("agent_locale_b", "シャチ"),
-            ("agent_locale_c", "Cá voi xanh"),
+        for (agent_id, legacy_locale) in [
+            ("agent_locale_a", "zh-Hans"),
+            ("agent_locale_b", "ja"),
+            ("agent_locale_c", "vi"),
         ] {
+            let legacy_name =
+                crate::tools::subagent::whale_name_for_id_in_locale(agent_id, legacy_locale);
             app.subagent_cache
-                .push(cached_agent(agent_id, Some(legacy_name)));
+                .push(cached_agent(agent_id, Some(&legacy_name)));
         }
 
         let rows = super::sidebar_agent_rows(&app);

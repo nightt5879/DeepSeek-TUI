@@ -392,11 +392,18 @@ mod tests {
     fn english_fleet_strip_relocalizes_mixed_persisted_whale_names() {
         let mut app = test_app();
         app.ui_locale = crate::localization::Locale::En;
-        app.subagent_cache = vec![
-            cached_agent("agent_strip_a", "蓝鲸"),
-            cached_agent("agent_strip_b", "シャチ"),
-            cached_agent("agent_strip_c", "Cá voi xanh"),
-        ];
+        app.subagent_cache = [
+            ("agent_strip_a", "zh-Hans"),
+            ("agent_strip_b", "ja"),
+            ("agent_strip_c", "vi"),
+        ]
+        .into_iter()
+        .map(|(agent_id, legacy_locale)| {
+            let legacy_name =
+                crate::tools::subagent::whale_name_for_id_in_locale(agent_id, legacy_locale);
+            cached_agent(agent_id, &legacy_name)
+        })
+        .collect();
 
         let projection = LiveWorkProjection::from_app(&app);
         let workers = projection
