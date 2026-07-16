@@ -5590,30 +5590,34 @@ SOURCE EVIDENCE
 - crates/cli/src/lib.rs: start_lane
 - crates/tui/src/tools/workflow.rs: record_task_started
 - crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated
-- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted"#,
+- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted
+- crates/lane/src/runtime.rs: process_exit_receipt -> lane_reconciled"#,
             r#"APPROVE
 PLAN
 - crates/workflow/src/role_resolve.rs: resolve_workflow_agent -> role resolution
 - crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated -> gate promotion
-- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted -> terminal reconciliation"#,
+- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted -> terminal workflow receipt
+- crates/lane/src/runtime.rs: process_exit_receipt -> tmux Lane reconciliation"#,
             r#"APPROVE
 EVIDENCE REVIEW
 - crates/workflow/src/role_resolve.rs: resolve_workflow_agent
 - crates/tui/src/tools/workflow.rs: record_task_started
 - crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated
-- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted"#,
+- crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted
+- crates/lane/src/runtime.rs: process_exit_receipt -> lane_reconciled"#,
             r#"APPROVE
 EVIDENCE MATRIX
 - task_started: crates/tui/src/tools/workflow.rs: record_task_started
 - gate_updated: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated
 - run_completed: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted
 - metadata: crates/workflow/src/role_resolve.rs: resolve_workflow_agent
-- lane_exit: crates/cli/src/lib.rs: start_lane"#,
+- lane_exit: crates/lane/src/runtime.rs: process_exit_receipt -> lane_reconciled"#,
             r#"APPROVE
 FINAL RECEIPT
 - declared role and resolved profile: crates/workflow/src/role_resolve.rs: resolve_workflow_agent
 - gate states: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::GateUpdated
-- terminal status: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted"#,
+- terminal status: crates/tui/src/tools/workflow.rs: WorkflowUiEventKind::RunCompleted
+- Lane exit: crates/lane/src/runtime.rs: process_exit_receipt -> lane_reconciled"#,
         ];
         let (client, calls) = fake_chat_client_responses(&responses).await;
         let runtime = SubAgentRuntime::new(

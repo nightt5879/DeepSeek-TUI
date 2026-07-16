@@ -690,20 +690,21 @@ workflow({
                         "crates/cli/src/lib.rs",
                         "crates/workflow/src/role_resolve.rs",
                         "crates/tui/src/tools/workflow.rs",
+                        "crates/lane/src/runtime.rs",
                     ],
                     "the scout grep must not include its own authored prompt"
                 );
                 assert!(
                     leaf.prompt.contains(
-                        "`include` set exactly to [`fleets/stopship.toml`, `crates/cli/src/lib.rs`, `crates/workflow/src/role_resolve.rs`, `crates/tui/src/tools/workflow.rs`]"
+                        "`include` set exactly to [`fleets/stopship.toml`, `crates/cli/src/lib.rs`, `crates/workflow/src/role_resolve.rs`, `crates/tui/src/tools/workflow.rs`, `crates/lane/src/runtime.rs`]"
                     ) && leaf.prompt.contains("Matches outside that exact include list do not count"),
                     "the one grep must constrain the actual tool input, not only File scope metadata"
                 );
                 assert!(
-                    leaf.prompt.contains("if you can populate all six")
+                    leaf.prompt.contains("if you can populate all seven")
                         && leaf
                             .prompt
-                            .contains("never return BLOCK after citing all six")
+                            .contains("never return BLOCK after citing all seven")
                         && leaf
                             .prompt
                             .contains("identify each missing owner as MISSING"),
