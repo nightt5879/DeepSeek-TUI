@@ -345,6 +345,8 @@ fn messages_from_thread_detail_batches_tool_results() {
             ),
         ],
         latest_seq: 0,
+        pending_approvals: Vec::new(),
+        pending_user_inputs: Vec::new(),
     };
 
     let messages = messages_from_thread_detail(&detail);
@@ -418,6 +420,8 @@ fn legacy_exact_thread_export_normalizes_provider_kind_and_id() {
         turns: Vec::new(),
         items: Vec::new(),
         latest_seq: 0,
+        pending_approvals: Vec::new(),
+        pending_user_inputs: Vec::new(),
     };
     let config = Config {
         provider: Some("lm-studio".to_string()),

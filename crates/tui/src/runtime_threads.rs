@@ -863,6 +863,32 @@ pub struct ThreadDetail {
     pub turns: Vec<TurnRecord>,
     pub items: Vec<TurnItemRecord>,
     pub latest_seq: u64,
+    /// Approval prompts that are still waiting for a decision. These are part
+    /// of the canonical snapshot so clients can recover attention UI after a
+    /// tab reload without replaying events older than `latest_seq`.
+    #[serde(default)]
+    pub pending_approvals: Vec<PendingApprovalRequest>,
+    /// User-input prompts that are still waiting for answers. As with
+    /// approvals, the snapshot is authoritative across client reconnects.
+    #[serde(default)]
+    pub pending_user_inputs: Vec<PendingUserInputRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingApprovalRequest {
+    pub id: String,
+    pub turn_id: String,
+    pub tool_name: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingUserInputRequest {
+    pub id: String,
+    pub turn_id: String,
+    pub request: crate::tools::user_input::UserInputRequest,
 }
 
 /// Aggregation key for `aggregate_usage`. Whalescale#261 / #564.
@@ -1026,8 +1052,9 @@ pub struct RuntimeThreadManager {
     task_manager: Arc<parking_lot::Mutex<Option<crate::task_manager::SharedTaskManager>>>,
     automations:
         Arc<parking_lot::Mutex<Option<crate::automation_manager::SharedAutomationManager>>>,
-    pending_approvals:
-        Arc<parking_lot::Mutex<HashMap<String, oneshot::Sender<ExternalApprovalDecision>>>>,
+    pending_approvals: Arc<parking_lot::Mutex<HashMap<String, PendingApprovalEntry>>>,
+    pending_user_inputs:
+        Arc<parking_lot::Mutex<HashMap<(String, String), PendingUserInputRequest>>>,
     pending_dynamic_tools:
         Arc<parking_lot::Mutex<HashMap<String, oneshot::Sender<DynamicToolCallResult>>>>,
 }
@@ -1069,6 +1096,12 @@ enum RuntimeApprovalDecision {
 pub enum ExternalApprovalDecision {
     Allow { remember: bool },
     Deny { remember: bool },
+}
+
+struct PendingApprovalEntry {
+    thread_id: String,
+    request: PendingApprovalRequest,
+    sender: oneshot::Sender<ExternalApprovalDecision>,
 }
 
 impl RuntimeThreadManager {
@@ -1256,6 +1289,7 @@ impl RuntimeThreadManager {
             task_manager: Arc::new(parking_lot::Mutex::new(None)),
             automations: Arc::new(parking_lot::Mutex::new(None)),
             pending_approvals: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            pending_user_inputs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pending_dynamic_tools: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         };
         manager.recover_interrupted_state()?;
@@ -1280,6 +1314,7 @@ impl RuntimeThreadManager {
     pub fn shutdown(&self) {
         self.cancel_token.cancel();
         self.pending_approvals.lock().clear();
+        self.pending_user_inputs.lock().clear();
         self.pending_dynamic_tools.lock().clear();
     }
 
@@ -1290,17 +1325,89 @@ impl RuntimeThreadManager {
 
     fn register_pending_approval(
         &self,
-        approval_id: &str,
+        thread_id: &str,
+        request: PendingApprovalRequest,
     ) -> oneshot::Receiver<ExternalApprovalDecision> {
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .insert(approval_id.to_string(), tx);
+        self.pending_approvals.lock().insert(
+            request.id.clone(),
+            PendingApprovalEntry {
+                thread_id: thread_id.to_string(),
+                request,
+                sender: tx,
+            },
+        );
         rx
     }
 
     fn cancel_pending_approval(&self, approval_id: &str) {
         self.pending_approvals.lock().remove(approval_id);
+    }
+
+    fn register_pending_user_input(&self, thread_id: &str, request: PendingUserInputRequest) {
+        self.pending_user_inputs
+            .lock()
+            .insert((thread_id.to_string(), request.id.clone()), request);
+    }
+
+    fn take_pending_user_input(
+        &self,
+        thread_id: &str,
+        input_id: &str,
+    ) -> Option<PendingUserInputRequest> {
+        self.pending_user_inputs
+            .lock()
+            .remove(&(thread_id.to_string(), input_id.to_string()))
+    }
+
+    fn pending_requests_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> (Vec<PendingApprovalRequest>, Vec<PendingUserInputRequest>) {
+        let mut approvals = self
+            .pending_approvals
+            .lock()
+            .values()
+            .filter(|entry| entry.thread_id == thread_id)
+            .map(|entry| entry.request.clone())
+            .collect::<Vec<_>>();
+        approvals.sort_by(|left, right| {
+            left.turn_id
+                .cmp(&right.turn_id)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let mut user_inputs = self
+            .pending_user_inputs
+            .lock()
+            .iter()
+            .filter(|((pending_thread_id, _), _)| pending_thread_id == thread_id)
+            .map(|(_, request)| request.clone())
+            .collect::<Vec<_>>();
+        user_inputs.sort_by(|left, right| {
+            left.turn_id
+                .cmp(&right.turn_id)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        (approvals, user_inputs)
+    }
+
+    fn clear_pending_user_inputs_for_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Vec<PendingUserInputRequest> {
+        let mut pending = self.pending_user_inputs.lock();
+        let keys = pending
+            .iter()
+            .filter(|((pending_thread_id, _), request)| {
+                pending_thread_id == thread_id && request.turn_id == turn_id
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|key| pending.remove(&key))
+            .collect()
     }
 
     fn register_pending_dynamic_tool(
@@ -1323,9 +1430,9 @@ impl RuntimeThreadManager {
         approval_id: &str,
         decision: ExternalApprovalDecision,
     ) -> bool {
-        let sender = self.pending_approvals.lock().remove(approval_id);
-        match sender {
-            Some(tx) => tx.send(decision).is_ok(),
+        let entry = self.pending_approvals.lock().remove(approval_id);
+        match entry {
+            Some(entry) => entry.sender.send(decision).is_ok(),
             None => false,
         }
     }
@@ -1348,21 +1455,47 @@ impl RuntimeThreadManager {
         input_id: &str,
         response: crate::tools::user_input::UserInputResponse,
     ) -> Result<bool> {
-        let active = self.active.lock().await;
-        let Some(state) = active.engines.get(thread_id) else {
-            bail!("thread '{thread_id}' not found");
+        let engine = {
+            let active = self.active.lock().await;
+            let Some(state) = active.engines.get(thread_id) else {
+                bail!("thread '{thread_id}' not found");
+            };
+            state.engine.clone()
         };
-        state.engine.submit_user_input(input_id, response).await?;
+        engine.submit_user_input(input_id, response).await?;
+        if let Some(pending) = self.take_pending_user_input(thread_id, input_id) {
+            self.emit_event(
+                thread_id,
+                Some(&pending.turn_id),
+                None,
+                "user_input.answered",
+                json!({ "id": input_id, "input_id": input_id }),
+            )
+            .await?;
+        }
         Ok(true)
     }
 
     #[allow(dead_code)]
     pub async fn cancel_user_input(&self, thread_id: &str, input_id: &str) -> Result<bool> {
-        let active = self.active.lock().await;
-        let Some(state) = active.engines.get(thread_id) else {
-            bail!("thread '{thread_id}' not found");
+        let engine = {
+            let active = self.active.lock().await;
+            let Some(state) = active.engines.get(thread_id) else {
+                bail!("thread '{thread_id}' not found");
+            };
+            state.engine.clone()
         };
-        state.engine.cancel_user_input(input_id).await?;
+        engine.cancel_user_input(input_id).await?;
+        if let Some(pending) = self.take_pending_user_input(thread_id, input_id) {
+            self.emit_event(
+                thread_id,
+                Some(&pending.turn_id),
+                None,
+                "user_input.canceled",
+                json!({ "id": input_id, "input_id": input_id }),
+            )
+            .await?;
+        }
         Ok(true)
     }
 
@@ -1381,7 +1514,16 @@ impl RuntimeThreadManager {
         &self,
         approval_id: &str,
     ) -> oneshot::Receiver<ExternalApprovalDecision> {
-        self.register_pending_approval(approval_id)
+        self.register_pending_approval(
+            "test-thread",
+            PendingApprovalRequest {
+                id: approval_id.to_string(),
+                turn_id: "test-turn".to_string(),
+                tool_name: "test-tool".to_string(),
+                description: "test approval".to_string(),
+                intent_summary: None,
+            },
+        )
     }
 
     #[cfg(test)]
@@ -1854,11 +1996,19 @@ impl RuntimeThreadManager {
             }
         }
         let latest_seq = self.store.current_seq().await;
+        // Read attention state after the replay cursor. If a request is
+        // registered concurrently after this point, its required event will
+        // have a sequence newer than `latest_seq`; if its event was already
+        // sequenced, registration necessarily happened first and it appears
+        // in this snapshot unless it has already been resolved.
+        let (pending_approvals, pending_user_inputs) = self.pending_requests_for_thread(id);
         Ok(ThreadDetail {
             thread,
             turns,
             items,
             latest_seq,
+            pending_approvals,
+            pending_user_inputs,
         })
     }
 
@@ -4182,29 +4332,36 @@ impl RuntimeThreadManager {
                     intent_summary,
                     ..
                 } => {
-                    self.emit_event(
-                        &thread_id,
-                        Some(&turn_id),
-                        None,
-                        "approval.required",
-                        json!({
-                            "id": id,
-                            "approval_id": id,
-                            "tool_name": tool_name,
-                            "description": description,
-                            "intent_summary": intent_summary,
-                        }),
-                    )
-                    .await?;
-
                     let Some((auto_approve, trust_mode)) =
                         self.active_turn_flags(&thread_id, &turn_id).await
                     else {
-                        let _ = engine.deny_tool_call(id).await;
+                        let _ = engine.deny_tool_call(&id).await;
                         continue;
                     };
 
+                    let pending_request = PendingApprovalRequest {
+                        id: id.clone(),
+                        turn_id: turn_id.clone(),
+                        tool_name: tool_name.clone(),
+                        description: description.clone(),
+                        intent_summary: intent_summary.clone(),
+                    };
+
                     if auto_approve {
+                        self.emit_event(
+                            &thread_id,
+                            Some(&turn_id),
+                            None,
+                            "approval.required",
+                            json!({
+                                "id": id,
+                                "approval_id": id,
+                                "tool_name": tool_name,
+                                "description": description,
+                                "intent_summary": intent_summary,
+                            }),
+                        )
+                        .await?;
                         let auto_decision =
                             Self::approval_decision(auto_approve, trust_mode, false);
                         let (dec_str, approved) = match auto_decision {
@@ -4239,7 +4396,30 @@ impl RuntimeThreadManager {
                         continue;
                     }
 
-                    let rx = self.register_pending_approval(&id);
+                    // Register before sequencing the event. A snapshot racing
+                    // this branch therefore either contains the request or
+                    // subscribes from an older cursor that will replay it.
+                    let rx = self.register_pending_approval(&thread_id, pending_request);
+                    if let Err(err) = self
+                        .emit_event(
+                            &thread_id,
+                            Some(&turn_id),
+                            None,
+                            "approval.required",
+                            json!({
+                                "id": id,
+                                "approval_id": id,
+                                "tool_name": tool_name,
+                                "description": description,
+                                "intent_summary": intent_summary,
+                            }),
+                        )
+                        .await
+                    {
+                        self.cancel_pending_approval(&id);
+                        let _ = engine.deny_tool_call(&id).await;
+                        return Err(err);
+                    }
                     let approval_timeout = approval_decision_timeout();
                     match tokio::time::timeout(approval_timeout, rx).await {
                         Ok(Ok(ExternalApprovalDecision::Allow { remember })) => {
@@ -4351,17 +4531,31 @@ impl RuntimeThreadManager {
                     }
                 }
                 EngineEvent::UserInputRequired { id, request } => {
-                    self.emit_event(
+                    self.register_pending_user_input(
                         &thread_id,
-                        Some(&turn_id),
-                        None,
-                        "user_input.required",
-                        json!({
-                            "id": id,
-                            "request": request,
-                        }),
-                    )
-                    .await?;
+                        PendingUserInputRequest {
+                            id: id.clone(),
+                            turn_id: turn_id.clone(),
+                            request: request.clone(),
+                        },
+                    );
+                    if let Err(err) = self
+                        .emit_event(
+                            &thread_id,
+                            Some(&turn_id),
+                            None,
+                            "user_input.required",
+                            json!({
+                                "id": id,
+                                "request": request,
+                            }),
+                        )
+                        .await
+                    {
+                        self.take_pending_user_input(&thread_id, &id);
+                        let _ = engine.cancel_user_input(&id).await;
+                        return Err(err);
+                    }
                 }
                 EngineEvent::Status { message } => {
                     let item = TurnItemRecord {
@@ -4568,6 +4762,21 @@ impl RuntimeThreadManager {
             thread.latest_turn_id = Some(turn_id.clone());
             thread.updated_at = Utc::now();
             self.store.save_thread(&thread)?;
+        }
+
+        // A terminal turn can no longer answer an outstanding prompt. Clear
+        // it before publishing completion so fresh snapshots never resurrect
+        // stale attention UI, and notify already-connected clients as well.
+        for pending in self.clear_pending_user_inputs_for_turn(&thread_id, &turn_id) {
+            let _ = engine.cancel_user_input(&pending.id).await;
+            self.emit_event(
+                &thread_id,
+                Some(&turn_id),
+                None,
+                "user_input.canceled",
+                json!({ "id": pending.id, "input_id": pending.id, "terminal": true }),
+            )
+            .await?;
         }
 
         self.emit_event(
