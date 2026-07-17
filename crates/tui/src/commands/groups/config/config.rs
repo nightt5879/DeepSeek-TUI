@@ -1840,13 +1840,23 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
         "theme" | "ui_theme" | "background_color" | "background" | "bg" => {
             app.theme_id = crate::palette::ThemeId::from_name(&settings.theme)
                 .unwrap_or(crate::palette::ThemeId::System);
-            app.background_color_override = settings
-                .background_color
-                .as_deref()
-                .and_then(crate::palette::parse_hex_rgb_color);
+            // Theme previews reload persisted settings for each cursor move.
+            // Keep a session-only background overlay live unless this command
+            // is itself updating (or clearing) the background.
+            let background_color_override = if matches!(key.as_str(), "theme" | "ui_theme") {
+                app.background_color_override
+            } else {
+                settings
+                    .background_color
+                    .as_deref()
+                    .and_then(crate::palette::parse_hex_rgb_color)
+            };
+            app.background_color_override = background_color_override;
+            let background_setting =
+                background_color_override.and_then(crate::palette::hex_rgb_string);
             app.ui_theme = crate::palette::ui_theme_from_settings(
                 &settings.theme,
-                settings.background_color.as_deref(),
+                background_setting.as_deref(),
             );
             app.needs_redraw = true;
         }
@@ -3836,6 +3846,57 @@ max_concurrent = 4
         assert!(
             crate::tui::ocean::OceanRamp::for_theme(&app.ui_theme).is_some(),
             "the explicit surface must retain ombre when previewing another theme"
+        );
+    }
+
+    #[test]
+    fn session_only_background_override_survives_theme_preview() {
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-session-background-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(temp_root.join(".deepseek")).expect("settings dir");
+        let _guard = EnvGuard::new(&temp_root);
+        fs::write(
+            temp_root.join(".deepseek").join("settings.toml"),
+            "theme = \"solarized-light\"\n",
+        )
+        .expect("seed settings");
+
+        let mut app = create_test_app();
+        let custom = ratatui::style::Color::Rgb(0x1a, 0x1b, 0x26);
+        let background = set_config_value(&mut app, "background_color", "#1a1b26", false);
+        assert!(!background.is_error, "{:?}", background.message);
+        assert_eq!(app.background_color_override, Some(custom));
+
+        let preview = set_config_value(&mut app, "theme", "dark", false);
+        assert!(!preview.is_error, "{:?}", preview.message);
+        assert_eq!(app.background_color_override, Some(custom));
+        assert_eq!(app.ui_theme.surface_bg, custom);
+
+        let solarized_preview = set_config_value(&mut app, "theme", "solarized-light", false);
+        assert!(
+            !solarized_preview.is_error,
+            "{:?}",
+            solarized_preview.message
+        );
+        assert_eq!(app.background_color_override, Some(custom));
+        assert_eq!(app.ui_theme.surface_bg, custom);
+        assert!(crate::tui::ocean::OceanRamp::for_theme(&app.ui_theme).is_some());
+
+        let saved_theme = set_config_value(&mut app, "theme", "dark", true);
+        assert!(!saved_theme.is_error, "{:?}", saved_theme.message);
+        assert_eq!(app.background_color_override, Some(custom));
+        assert_eq!(app.ui_theme.surface_bg, custom);
+        let persisted = Settings::load_persisted().expect("persisted settings");
+        assert_eq!(persisted.theme, "dark");
+        assert_eq!(
+            persisted.background_color, None,
+            "saving a theme must not persist the session-only background"
         );
     }
 
