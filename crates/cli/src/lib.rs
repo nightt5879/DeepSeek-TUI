@@ -307,6 +307,7 @@ Forwarded serve options:
       --mcp                 Start MCP server over stdio
       --http                Start runtime HTTP/SSE API server
       --mobile              Start runtime HTTP/SSE API server with the mobile control page
+      --web                 Start the embedded loopback-only browser client
       --qr                  Show a QR code for the mobile URL (requires --mobile)
       --acp                 Start ACP server over stdio for editor clients
       --host <HOST>         Bind host (default 127.0.0.1; --mobile defaults to 0.0.0.0)
@@ -320,6 +321,11 @@ Forwarded serve options:
 aliases for `codewhale app-server --http` and `codewhale app-server --mobile`.
 New integrations should prefer `codewhale app-server`.")]
     Serve(TuiPassthroughArgs),
+    /// Open the first-class local browser client over the canonical Runtime API.
+    #[command(
+        after_help = "The browser receives a one-time loopback bootstrap capability, never the Runtime token.\nThe capability is exchanged for a bounded, process-local HttpOnly, SameSite=Strict web session and then invalidated."
+    )]
+    Web(WebArgs),
     /// Generate shell completions for the TUI binary.
     Completions(TuiPassthroughArgs),
     /// Configure provider credentials.
@@ -477,6 +483,13 @@ struct RunArgs {
 struct TuiPassthroughArgs {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct WebArgs {
+    /// Loopback port for the local Runtime API and embedded client.
+    #[arg(long, default_value_t = 7878)]
+    port: u16,
 }
 
 #[derive(Debug, Args)]
@@ -1677,6 +1690,10 @@ fn run() -> Result<()> {
             // delegated child so it is torn down with the dispatcher (#3259).
             delegate_server_to_tui(&cli, &resolved_runtime, tui_args("serve", args))
         }
+        Some(Commands::Web(args)) => {
+            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+            delegate_server_to_tui(&cli, &resolved_runtime, web_serve_passthrough(&args))
+        }
         Some(Commands::Completions(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             delegate_to_tui(&cli, &resolved_runtime, tui_args("completions", args))
@@ -2695,6 +2712,15 @@ fn app_server_serve_passthrough(args: &AppServerArgs) -> Vec<String> {
         forwarded.push("--qr".to_string());
     }
     forwarded
+}
+
+fn web_serve_passthrough(args: &WebArgs) -> Vec<String> {
+    vec![
+        "serve".to_string(),
+        "--web".to_string(),
+        "--port".to_string(),
+        args.port.to_string(),
+    ]
 }
 
 fn app_server_token_from_env() -> Option<String> {
@@ -3920,9 +3946,35 @@ mod tests {
     }
 
     #[test]
+    fn web_command_is_typed_and_delegates_without_auth_material() {
+        let cli = parse_ok(&["codewhale", "web", "--port", "9091"]);
+        let args = match cli.command {
+            Some(Commands::Web(args)) => args,
+            other => panic!("expected web command, got {other:?}"),
+        };
+        assert_eq!(args.port, 9091);
+        let forwarded = web_serve_passthrough(&args);
+        assert_eq!(forwarded, ["serve", "--web", "--port", "9091"]);
+        assert!(!forwarded.iter().any(|arg| arg.contains("token")));
+    }
+
+    #[test]
+    fn web_command_defaults_to_runtime_port_and_documents_bootstrap_boundary() {
+        let cli = parse_ok(&["codewhale", "web"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Web(WebArgs { port: 7878 }))
+        ));
+        let help = help_for(&["codewhale", "web", "--help"]);
+        assert!(help.contains("--port"));
+        assert!(help.contains("one-time loopback bootstrap"));
+        assert!(!help.contains("--auth-token"));
+    }
+
+    #[test]
     fn serve_help_documents_forwarded_runtime_modes() {
         let help = help_for(&["codewhale", "serve", "--help"]);
-        for flag in ["--http", "--mobile", "--mcp", "--acp"] {
+        for flag in ["--http", "--mobile", "--web", "--mcp", "--acp"] {
             assert!(
                 help.contains(flag),
                 "serve help should document forwarded flag {flag}; help was:\n{help}"
