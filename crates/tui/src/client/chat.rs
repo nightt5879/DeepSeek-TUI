@@ -1471,7 +1471,8 @@ fn compact_tool_result_for_wire(
     // the model to chase a reference, and there's no retrieval burden to
     // satisfy, so both predicates are false.
     let persist_eligible = original_chars >= TOOL_RESULT_DEDUP_MIN_CHARS;
-    let dedup_eligible = persist_eligible && !is_mutation_tool(tool_name);
+    let dedup_eligible =
+        persist_eligible && !is_mutation_tool(tool_name) && tool_name != "read_file";
 
     if dedup_eligible && let Some(previous) = seen_tool_results.get(&sha) {
         // Re-check persistence before emitting a ref. If the file is
@@ -4247,11 +4248,14 @@ mod stream_decoder_tests {
             // (1,024) but below TOOL_RESULT_SENT_CHAR_BUDGET (12,000). This
             // verifies the cache-saving path for repeated medium outputs that
             // do not otherwise need truncation.
+            // Uses list_dir (not read_file) so that dedup still applies;
+            // read_file is excluded from dedup to keep file_read_tracker
+            // consistent with compaction.
             let output = "A".repeat(2_000);
             let messages = vec![
-                tool_use_message("tool-1", "read_file", json!({"path": "README.md"})),
+                tool_use_message("tool-1", "list_dir", json!({"path": "."})),
                 tool_result_message("tool-1", &output),
-                tool_use_message("tool-2", "read_file", json!({"path": "README.md"})),
+                tool_use_message("tool-2", "list_dir", json!({"path": "."})),
                 tool_result_message("tool-2", &output),
             ];
 
@@ -4301,8 +4305,10 @@ mod stream_decoder_tests {
             assert_eq!(second, output);
             assert!(!second.contains("<TOOL_RESULT_REF"), "got: {second}");
 
-            // Non-mutation tools still dedup: an identical large read_file
-            // result collapses to a retrievable SHA ref.
+            // read_file results are NOT dedup-eligible (unlike other
+            // non-mutation tools), so that compaction does not leave
+            // file_read_tracker out of sync with the model's context.
+            // Both identical large read_file results must stay inline.
             let read_messages = vec![
                 tool_use_message("read-1", "read_file", json!({"path": "README.md"})),
                 tool_result_message("read-1", &output),
@@ -4313,9 +4319,10 @@ mod stream_decoder_tests {
             let read_first = tool_message_content(&read_built, 0);
             let read_second = tool_message_content(&read_built, 1);
             assert_eq!(read_first, output);
+            assert_eq!(read_second, output);
             assert!(
-                read_second.starts_with("<TOOL_RESULT_REF sha=\""),
-                "got: {read_second}"
+                !read_second.contains("<TOOL_RESULT_REF"),
+                "read_file results must not dedup: got {read_second}"
             );
         });
     }
@@ -4401,9 +4408,9 @@ mod stream_decoder_tests {
             "persisted content must match the original write_file result verbatim"
         );
 
-        // Sanity: a large NON-mutation result still dedups (back-ref on
-        // the second sighting) — decoupling didn't regress #1695's
-        // preserved read-path behavior.
+        // Sanity: read_file results are excluded from dedup so that
+        // compaction does not leave file_read_tracker out of sync.
+        // Both identical large read_file results must stay inline.
         let read_messages = vec![
             tool_use_message("r-1", "read_file", json!({"path": "huge.rs"})),
             tool_result_message("r-1", &big_diff),
@@ -4413,8 +4420,8 @@ mod stream_decoder_tests {
         let read_built = build_chat_messages(None, &read_messages, "deepseek-v4-flash");
         let read_second = tool_message_content(&read_built, 1);
         assert!(
-            read_second.starts_with("<TOOL_RESULT_REF sha=\""),
-            "large read_file must still dedup to a ref, got: {read_second}"
+            !read_second.contains("<TOOL_RESULT_REF"),
+            "read_file results must not dedup: got {read_second}"
         );
     }
 
