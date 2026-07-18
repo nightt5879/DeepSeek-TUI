@@ -174,6 +174,9 @@ pub struct DeepSeekClient {
     model_bound_secret_values: Arc<Vec<String>>,
     pub(super) base_url: String,
     pub(super) api_provider: ApiProvider,
+    /// ChatGPT account id captured through the same consent-gated credential
+    /// resolution as the Codex bearer token.
+    pub(super) codex_account_id: Option<String>,
     retry: RetryPolicy,
     default_model: String,
     connection_health: Arc<AsyncMutex<ConnectionHealth>>,
@@ -397,6 +400,7 @@ impl Clone for DeepSeekClient {
             model_bound_secret_values: Arc::clone(&self.model_bound_secret_values),
             base_url: self.base_url.clone(),
             api_provider: self.api_provider,
+            codex_account_id: self.codex_account_id.clone(),
             retry: self.retry.clone(),
             default_model: self.default_model.clone(),
             connection_health: self.connection_health.clone(),
@@ -893,7 +897,12 @@ impl DeepSeekClient {
         if api_provider == ApiProvider::OpencodeGo {
             validate_route(api_provider, &default_model).map_err(anyhow::Error::msg)?;
         }
-        let api_key = config.deepseek_api_key()?;
+        let (api_key, codex_account_id) = if api_provider == ApiProvider::OpenaiCodex {
+            let credentials = config.codex_credentials()?;
+            (credentials.access_token, credentials.account_id)
+        } else {
+            (config.deepseek_api_key()?, None)
+        };
         let model_bound_secret_values =
             Arc::new(configured_model_bound_secret_values(config, &api_key));
         validate_base_url_security(&base_url)?;
@@ -960,6 +969,7 @@ impl DeepSeekClient {
             model_bound_secret_values,
             base_url,
             api_provider,
+            codex_account_id,
             retry,
             default_model,
             connection_health: Arc::new(AsyncMutex::new(ConnectionHealth::default())),
@@ -2663,6 +2673,67 @@ mod tests {
         "zai-active-config-secret-007",
         "sakana-config-secret-008",
     ];
+
+    #[test]
+    fn codex_client_uses_one_coherent_external_credential_snapshot() {
+        let _env = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("credential fixture");
+        let path = temp
+            .path()
+            .canonicalize()
+            .expect("canonical temp root")
+            .join("auth.json");
+        let token_a = crate::test_support::future_test_jwt("a");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "tokens": {"access_token": token_a.clone(), "account_id": "account-a"}
+            }))
+            .expect("serialize fixture"),
+        )
+        .expect("write fixture");
+        let _auth_path = crate::test_support::EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &path);
+        let _access = crate::test_support::EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
+        let _legacy_access = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+        let config = Config {
+            provider: Some(ApiProvider::OpenaiCodex.as_str().to_string()),
+            providers: Some(ProvidersConfig {
+                openai_codex: ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    external_credentials: Some(
+                        codewhale_config::ExternalCredentialConsentToml::read_only(
+                            codewhale_config::ProviderKind::OpenaiCodex,
+                            codewhale_config::ExternalCredentialSource::CodexCli,
+                            path.clone(),
+                        ),
+                    ),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        };
+
+        crate::external_credentials::reset_side_effect_trap();
+        let client = DeepSeekClient::new(&config).expect("Codex client");
+        assert_eq!(client.api_key, token_a);
+        assert_eq!(client.codex_account_id.as_deref(), Some("account-a"));
+        assert_eq!(
+            crate::external_credentials::side_effect_trap_counts(),
+            (1, 1),
+            "bearer and account id must come from one secure open/read"
+        );
+
+        // An owner rotation after construction cannot splice account B into
+        // the already-resolved bearer snapshot.
+        std::fs::write(
+            &path,
+            serde_json::to_string(&serde_json::json!({"tokens": {"access_token": crate::test_support::future_test_jwt("b"), "account_id": "account-b"}})).expect("serialize rotated fixture"),
+        )
+        .expect("rotate fixture");
+        assert_eq!(client.api_key, token_a);
+        assert_eq!(client.codex_account_id.as_deref(), Some("account-a"));
+    }
 
     fn client_with_config_secret_sentinels() -> DeepSeekClient {
         let _ = rustls::crypto::ring::default_provider().install_default();

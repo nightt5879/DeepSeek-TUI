@@ -8,6 +8,27 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
+fn malformed_config_error_omits_secret_contents_and_keys() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    let secret = "cw-secret-tui-config-4507";
+    fs::write(
+        &path,
+        format!("[providers.xai]\napi_key = \"{secret}\" trailing-junk\n"),
+    )
+    .expect("write malformed config");
+
+    let error = Config::load(Some(path), None).expect_err("malformed config must fail");
+    let diagnostic = format!("{error:#}");
+    assert!(!diagnostic.contains(secret), "{diagnostic}");
+    assert!(!diagnostic.contains("api_key"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("file contents were omitted"),
+        "{diagnostic}"
+    );
+}
+
+#[test]
 fn api_provider_metadata_helpers_follow_config_provider_metadata() {
     let sorted = ApiProvider::sorted_for_display();
     let expected_sorted: Vec<ApiProvider> =
@@ -2477,6 +2498,98 @@ fn save_non_deepseek_key_uses_isolated_file_store_without_plaintext_config() -> 
 }
 
 #[test]
+fn provider_api_key_config_failure_restores_secret_and_keeps_external_route() -> Result<()> {
+    let _lock = lock_test_env();
+    for prior in [None, Some("prior-xai-secret")] {
+        let temp_root = tempfile::tempdir()?;
+        let _guard = EnvGuard::new(temp_root.path());
+        let codewhale_home = temp_root.path().canonicalize()?.join("codewhale-home");
+        fs::create_dir_all(&codewhale_home)?;
+        let config_path = codewhale_home.join("config.toml");
+        fs::create_dir(&config_path)?;
+        let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+        let _config_path = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", &config_path);
+        let _backend = EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let generation = "xai-auth-0123456789abcdef0123456789abcdef.json";
+        codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
+            store.write(generation, b"prior-owned-epoch", false)
+        })?;
+        let secrets = codewhale_secrets::Secrets::auto_detect();
+        if let Some(prior) = prior {
+            secrets.set("xai", prior)?;
+        }
+        let external_path = temp_root.path().join("external-grok.json");
+        let route_config = Config {
+            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            providers: Some(ProvidersConfig {
+                xai: ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    oauth_credential_generation: Some(generation.to_string()),
+                    external_credentials: Some(
+                        codewhale_config::ExternalCredentialConsentToml::read_only(
+                            codewhale_config::ProviderKind::Xai,
+                            codewhale_config::ExternalCredentialSource::GrokCli,
+                            external_path,
+                        ),
+                    ),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        };
+        let identity = ProviderIdentity {
+            provider: ApiProvider::Xai,
+            key: ApiProvider::Xai.as_str().to_string(),
+            exact_id: Some(ApiProvider::Xai.as_str().to_string()),
+        };
+        let error = save_api_key_for_identity(&identity, &route_config, "new-xai-secret")
+            .expect_err("config directory must reject metadata mutation");
+        assert!(error.to_string().contains("config"), "{error:#}");
+        assert_eq!(secrets.get("xai")?, prior.map(str::to_string));
+        let xai = route_config
+            .provider_config_for(ApiProvider::Xai)
+            .expect("unchanged live route");
+        assert_eq!(xai.auth_mode.as_deref(), Some("oauth"));
+        assert!(xai.external_credentials.is_some());
+        assert!(config_path.is_dir());
+        assert_eq!(
+            fs::read(codewhale_home.join("credentials").join(generation))?,
+            b"prior-owned-epoch",
+            "failed API-key mode switch must restore the prior OAuth epoch"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn root_api_key_config_failure_restores_absent_and_existing_secret_state() -> Result<()> {
+    let _lock = lock_test_env();
+    for prior in [None, Some("prior-deepseek-secret")] {
+        let temp_root = tempfile::tempdir()?;
+        let _guard = EnvGuard::new(temp_root.path());
+        let codewhale_home = temp_root.path().join("codewhale-home");
+        fs::create_dir_all(&codewhale_home)?;
+        let config_path = codewhale_home.join("config.toml");
+        fs::create_dir(&config_path)?;
+        let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+        let _config_path = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", &config_path);
+        let _backend = EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let secrets = codewhale_secrets::Secrets::auto_detect();
+        if let Some(prior) = prior {
+            secrets.set("deepseek", prior)?;
+        }
+
+        let error = save_api_key("new-deepseek-secret")
+            .expect_err("config directory must reject root metadata mutation");
+        assert!(error.to_string().contains("config"), "{error:#}");
+        assert_eq!(secrets.get("deepseek")?, prior.map(str::to_string));
+        assert!(config_path.is_dir());
+    }
+    Ok(())
+}
+
+#[test]
 fn save_key_falls_back_to_config_when_isolated_file_store_is_unwritable() -> Result<()> {
     let _lock = lock_test_env();
     let temp_root = tempfile::tempdir()?;
@@ -2744,6 +2857,7 @@ fn clear_api_key_strips_root_and_provider_scoped_keys() -> Result<()> {
         nanos
     ));
     fs::create_dir_all(&temp_root)?;
+    let temp_root = temp_root.canonicalize()?;
     let _guard = EnvGuard::new(&temp_root);
 
     let config_dir = temp_root.join(".deepseek");
@@ -2952,6 +3066,7 @@ fn clear_api_key_preserves_comments_and_unrelated_keys() -> Result<()> {
         nanos
     ));
     fs::create_dir_all(&temp_root)?;
+    let temp_root = temp_root.canonicalize()?;
     let _guard = EnvGuard::new(&temp_root);
 
     let config_path = temp_root.join(".deepseek").join("config.toml");
@@ -3592,6 +3707,120 @@ model = "managed-model"
     assert_eq!(config.deepseek_api_key()?, "managed-route-key");
     assert!(active_provider_has_config_api_key(&config));
     assert!(has_api_key_for(&config, ApiProvider::Openrouter));
+    Ok(())
+}
+
+#[test]
+fn managed_config_cannot_grant_external_credential_consent() -> Result<()> {
+    let _lock = lock_test_env();
+    let temp_root = tempfile::tempdir()?;
+    let _guard = EnvGuard::new(temp_root.path());
+    let config_path = temp_root.path().join("config.toml");
+    let managed_path = temp_root.path().join("managed.toml");
+    let external_path = temp_root.path().join("codex-auth.json");
+    let external_raw = r#"{"tokens":{"access_token":"must-never-be-read"}}"#;
+    fs::write(&external_path, external_raw)?;
+    fs::write(
+        &managed_path,
+        format!(
+            r#"[providers.openai_codex.external_credentials]
+access = "read_only"
+provider = "openai-codex"
+source = "codex_cli"
+path = {:?}
+consent_version = 1
+"#,
+            external_path.display().to_string()
+        ),
+    )?;
+    fs::write(
+        &config_path,
+        format!(
+            "provider = \"openai-codex\"\nmanaged_config_path = {:?}\n",
+            managed_path.display().to_string()
+        ),
+    )?;
+
+    crate::external_credentials::reset_side_effect_trap();
+    let config = Config::load(Some(config_path), None)?;
+    assert!(
+        config
+            .provider_config_for(ApiProvider::OpenaiCodex)
+            .and_then(|provider| provider.external_credentials.as_ref())
+            .is_none()
+    );
+    assert!(!has_api_key_for(&config, ApiProvider::OpenaiCodex));
+    assert_eq!(
+        crate::external_credentials::side_effect_trap_counts(),
+        (0, 0),
+        "managed config must not consent to user-owned external credentials"
+    );
+    assert_eq!(fs::read_to_string(external_path)?, external_raw);
+    Ok(())
+}
+
+#[test]
+fn managed_disabled_external_policy_tightens_lower_user_consent() -> Result<()> {
+    let _lock = lock_test_env();
+    let temp_root = tempfile::tempdir()?;
+    let _guard = EnvGuard::new(temp_root.path());
+    let config_path = temp_root.path().join("config.toml");
+    let managed_path = temp_root.path().join("managed.toml");
+    let external_path = temp_root.path().join("codex-auth.json");
+    fs::write(
+        &external_path,
+        r#"{"tokens":{"access_token":"must-not-read"}}"#,
+    )?;
+    fs::write(
+        &managed_path,
+        format!(
+            r#"[providers.openai_codex.external_credentials]
+access = "disabled"
+provider = "openai-codex"
+source = "codex_cli"
+path = {:?}
+consent_version = 1
+"#,
+            external_path.display().to_string()
+        ),
+    )?;
+    fs::write(
+        &config_path,
+        format!(
+            r#"provider = "openai-codex"
+managed_config_path = {:?}
+
+[providers.openai_codex]
+auth_mode = "oauth"
+
+[providers.openai_codex.external_credentials]
+access = "read_only"
+provider = "openai-codex"
+source = "codex_cli"
+path = {:?}
+consent_version = 1
+"#,
+            managed_path.display().to_string(),
+            external_path.display().to_string(),
+        ),
+    )?;
+    let _auth_path = EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &external_path);
+    crate::external_credentials::reset_side_effect_trap();
+    let config = Config::load(Some(config_path), None)?;
+    let effective = config
+        .provider_config_for(ApiProvider::OpenaiCodex)
+        .and_then(|provider| provider.external_credentials.as_ref())
+        .expect("managed disabled tombstone");
+    assert_eq!(
+        effective.access,
+        codewhale_config::ExternalCredentialAccess::Disabled
+    );
+    assert!(!has_api_key_for(&config, ApiProvider::OpenaiCodex));
+    assert_eq!(
+        crate::external_credentials::complete_side_effect_trap_counts(),
+        (0, 0, 0, 0, 0),
+        "managed deny must suppress lower consent before every side effect"
+    );
     Ok(())
 }
 
@@ -7172,7 +7401,7 @@ api_key = "novita-table-key"
 }
 
 #[test]
-fn moonshot_kimi_import_reads_unexpired_token_without_mutation() -> Result<()> {
+fn moonshot_kimi_import_is_api_key_only_and_never_reads_external_credentials() -> Result<()> {
     let _lock = lock_test_env();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7191,19 +7420,17 @@ fn moonshot_kimi_import_reads_unexpired_token_without_mutation() -> Result<()> {
     fs::create_dir_all(&credential_dir)?;
     unsafe { env::set_var("KIMI_CODE_HOME", &kimi_code_home) };
 
-    let expires_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64()
-        + 3600.0;
     let credential = json!({
-        "access_token": "fresh-kimi-code-oauth-token",
-        "refresh_token": "refresh-token",
-        "expires_at": expires_at,
+        "access_token": "must-never-be-read",
+        "refresh_token": "must-never-be-used",
+        "expires_at": SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_secs_f64()
+            + 3600.0,
         "scope": "openid profile email",
         "token_type": "Bearer",
     });
-    let credential_path = credential_dir.join(KIMI_CODE_CREDENTIAL_FILE);
+    let credential_path = credential_dir.join("kimi-code.json");
     let credential_raw = serde_json::to_string(&credential)?;
     fs::write(&credential_path, &credential_raw)?;
 
@@ -7223,122 +7450,192 @@ api_key = "stale-api-key"
     assert_eq!(config.api_provider(), ApiProvider::Moonshot);
     assert_eq!(config.deepseek_base_url(), DEFAULT_KIMI_CODE_BASE_URL);
     assert_eq!(config.default_model(), DEFAULT_KIMI_CODE_MODEL);
-    assert_eq!(config.deepseek_api_key()?, "fresh-kimi-code-oauth-token");
-    assert!(has_api_key_for(&config, ApiProvider::Moonshot));
+    let error = config
+        .deepseek_api_key()
+        .expect_err("Kimi external OAuth credentials are never imported");
+    assert!(error.to_string().contains("does not impersonate"));
+    assert!(
+        error
+            .to_string()
+            .contains("https://platform.kimi.ai/console/api-keys")
+    );
+    assert!(!has_api_key_for(&config, ApiProvider::Moonshot));
     assert_eq!(
         fs::read_to_string(credential_path)?,
         credential_raw,
-        "CodeWhale must never rewrite imported Kimi CLI credentials"
+        "Codewhale must never read, refresh, or rewrite Kimi CLI credentials"
     );
     Ok(())
 }
 
 #[test]
-fn moonshot_kimi_import_falls_back_to_legacy_share_dir_credential() -> Result<()> {
+fn codex_external_credentials_are_disabled_by_default_and_managed_fails_before_io() -> Result<()> {
     let _lock = lock_test_env();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let temp_root = env::temp_dir().join(format!(
-        "codewhale-tui-kimi-oauth-key-{}-{}",
-        std::process::id(),
-        nanos
-    ));
-    fs::create_dir_all(&temp_root)?;
-    let _guard = EnvGuard::new(&temp_root);
+    let temp = tempfile::tempdir()?;
+    let temp_root = temp.path().canonicalize()?;
+    let auth_path = temp_root.join("codex-auth.json");
+    let token = crate::test_support::future_test_jwt("codex");
+    let raw = serde_json::to_string_pretty(&json!({
+        "tokens": {
+            "access_token": token.clone(),
+            "account_id": "acct-must-not-be-read",
+            "refresh_token": "must-never-be-used"
+        },
+        "unknown": {"preserve": true}
+    }))?;
+    fs::write(&auth_path, &raw)?;
+    let ambient_decoy = temp_root.join("ambient-decoy.json");
+    let ambient_decoy_raw = r#"{"tokens":{"access_token":"must-not-be-read"}}"#;
+    fs::write(&ambient_decoy, ambient_decoy_raw)?;
+    let _auth_path = EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &ambient_decoy);
+    let _access = EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
+    let _legacy_access = EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+    let _account = EnvVarGuard::remove("OPENAI_CODEX_ACCOUNT_ID");
+    let _legacy_account = EnvVarGuard::remove("CODEX_ACCOUNT_ID");
 
-    let kimi_share_dir = temp_root.join(".kimi");
-    let credential_dir = kimi_share_dir.join("credentials");
-    fs::create_dir_all(&credential_dir)?;
-    unsafe { env::set_var("KIMI_SHARE_DIR", &kimi_share_dir) };
+    let disabled = Config {
+        provider: Some(ApiProvider::OpenaiCodex.as_str().to_string()),
+        ..Default::default()
+    };
+    crate::external_credentials::reset_side_effect_trap();
+    assert!(!has_api_key_for(&disabled, ApiProvider::OpenaiCodex));
+    let error = disabled
+        .deepseek_api_key()
+        .expect_err("external credentials default to disabled");
+    assert!(error.to_string().contains("are disabled"));
+    assert_eq!(disabled.codex_account_id(), None);
+    assert_eq!(
+        crate::external_credentials::side_effect_trap_counts(),
+        (0, 0)
+    );
 
-    let expires_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64()
-        + 3600.0;
-    let credential = json!({
-        "access_token": "fresh-oauth-token",
-        "refresh_token": "refresh-token",
-        "expires_at": expires_at,
-        "scope": "openid profile email",
-        "token_type": "Bearer",
-    });
-    fs::write(
-        credential_dir.join(KIMI_CODE_CREDENTIAL_FILE),
-        serde_json::to_string(&credential)?,
-    )?;
-
-    let config_path = temp_root.join(".deepseek").join("config.toml");
-    ensure_parent_dir(&config_path)?;
-    fs::write(
-        &config_path,
-        r#"provider = "moonshot"
-
-[providers.moonshot]
-auth_mode = "kimi_oauth"
-api_key = "stale-api-key"
-"#,
-    )?;
-
-    let config = Config::load(None, None)?;
-    assert_eq!(config.api_provider(), ApiProvider::Moonshot);
-    assert_eq!(config.deepseek_base_url(), DEFAULT_KIMI_CODE_BASE_URL);
-    assert_eq!(config.default_model(), DEFAULT_KIMI_CODE_MODEL);
-    assert_eq!(config.deepseek_api_key()?, "fresh-oauth-token");
-    assert!(has_api_key_for(&config, ApiProvider::Moonshot));
+    let mut managed_consent = codewhale_config::ExternalCredentialConsentToml::read_only(
+        codewhale_config::ProviderKind::OpenaiCodex,
+        codewhale_config::ExternalCredentialSource::CodexCli,
+        auth_path.clone(),
+    );
+    managed_consent.access = codewhale_config::ExternalCredentialAccess::Managed;
+    let managed = Config {
+        provider: Some(ApiProvider::OpenaiCodex.as_str().to_string()),
+        providers: Some(ProvidersConfig {
+            openai_codex: ProviderConfig {
+                auth_mode: Some("oauth".to_string()),
+                external_credentials: Some(managed_consent),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    crate::external_credentials::reset_side_effect_trap();
+    assert!(!has_api_key_for(&managed, ApiProvider::OpenaiCodex));
+    let error = managed
+        .deepseek_api_key()
+        .expect_err("managed access needs a preservation adapter");
+    assert!(
+        error
+            .to_string()
+            .contains("schema-safe preservation adapter")
+    );
+    assert_eq!(
+        crate::external_credentials::side_effect_trap_counts(),
+        (0, 0)
+    );
+    assert_eq!(fs::read_to_string(&auth_path)?, raw);
     Ok(())
 }
 
 #[test]
-fn moonshot_kimi_import_expired_token_fails_closed_without_refresh_or_mutation() -> Result<()> {
+fn codex_read_only_consent_reads_exact_file_without_mutation() -> Result<()> {
     let _lock = lock_test_env();
-    let temp_root = tempfile::tempdir()?;
-    let _guard = EnvGuard::new(temp_root.path());
+    let temp = tempfile::tempdir()?;
+    let temp_root = temp.path().canonicalize()?;
+    let auth_path = temp_root.join("codex-auth.json");
+    let token = crate::test_support::future_test_jwt("codex");
+    let raw = serde_json::to_string_pretty(&json!({
+        "tokens": {
+            "access_token": token.clone(),
+            "account_id": "acct-read-only",
+            "refresh_token": "must-never-be-used",
+            "future_field": ["preserve"]
+        },
+        "future_top_level": true
+    }))?;
+    fs::write(&auth_path, &raw)?;
+    let ambient_decoy = temp_root.join("ambient-decoy.json");
+    let ambient_decoy_raw = r#"{"tokens":{"access_token":"must-not-be-read"}}"#;
+    fs::write(&ambient_decoy, ambient_decoy_raw)?;
+    let _auth_path = EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &ambient_decoy);
+    let _access = EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
+    let _legacy_access = EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+    let config = Config {
+        provider: Some(ApiProvider::OpenaiCodex.as_str().to_string()),
+        providers: Some(ProvidersConfig {
+            openai_codex: ProviderConfig {
+                auth_mode: Some("oauth".to_string()),
+                external_credentials: Some(
+                    codewhale_config::ExternalCredentialConsentToml::read_only(
+                        codewhale_config::ProviderKind::OpenaiCodex,
+                        codewhale_config::ExternalCredentialSource::CodexCli,
+                        auth_path.clone(),
+                    ),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
 
-    let kimi_code_home = temp_root.path().join(".kimi-code");
-    let credential_dir = kimi_code_home.join("credentials");
-    fs::create_dir_all(&credential_dir)?;
-    unsafe { env::set_var("KIMI_CODE_HOME", &kimi_code_home) };
-
-    let credential = json!({
-        "access_token": "expired-imported-token",
-        "refresh_token": "must-never-be-used",
-        "expires_at": SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs_f64()
-            - 3600.0,
-        "token_type": "Bearer",
-    });
-    let credential_path = credential_dir.join(KIMI_CODE_CREDENTIAL_FILE);
-    let credential_raw = serde_json::to_string(&credential)?;
-    fs::write(&credential_path, &credential_raw)?;
-
-    let config_path = temp_root.path().join(".deepseek").join("config.toml");
-    ensure_parent_dir(&config_path)?;
-    fs::write(
-        &config_path,
-        r#"provider = "moonshot"
-
-[providers.moonshot]
-auth_mode = "kimi_oauth"
-"#,
-    )?;
-
-    let config = Config::load(None, None)?;
-    let err = config
-        .deepseek_api_key()
-        .expect_err("an expired imported token must not refresh");
-    let message = err.to_string();
-    assert!(message.contains("cannot refresh Kimi OAuth"));
-    assert!(message.contains("Kimi Code API key"));
-    assert!(message.contains("#4417"));
-    assert!(!has_api_key_for(&config, ApiProvider::Moonshot));
+    let mut inactive = config.clone();
+    inactive.provider = Some(ApiProvider::Deepseek.as_str().to_string());
+    crate::external_credentials::reset_side_effect_trap();
+    assert!(inactive.external_credential_read_consent_configured(
+        ApiProvider::OpenaiCodex,
+        codewhale_config::ExternalCredentialSource::CodexCli,
+    ));
+    let dormant_error = inactive
+        .external_credential_read_grant(
+            ApiProvider::OpenaiCodex,
+            codewhale_config::ExternalCredentialSource::CodexCli,
+            &ambient_decoy,
+        )
+        .expect_err("inactive providers cannot mint external read capabilities");
+    assert!(dormant_error.to_string().contains("explicitly selected"));
     assert_eq!(
-        fs::read_to_string(credential_path)?,
-        credential_raw,
-        "the unusable import must remain read-only"
+        crate::external_credentials::side_effect_trap_counts(),
+        (0, 0)
+    );
+
+    let active_grant = config.external_credential_read_grant(
+        ApiProvider::OpenaiCodex,
+        codewhale_config::ExternalCredentialSource::CodexCli,
+        &ambient_decoy,
+    )?;
+    assert_eq!(
+        active_grant.path(),
+        auth_path,
+        "the selected route remains pinned to the persisted consent path"
+    );
+
+    crate::external_credentials::reset_side_effect_trap();
+    assert_eq!(config.deepseek_api_key()?, token);
+    assert_eq!(
+        crate::external_credentials::side_effect_trap_counts(),
+        (1, 1)
+    );
+    assert_eq!(fs::read_to_string(&auth_path)?, raw);
+    assert_eq!(fs::read_to_string(&ambient_decoy)?, ambient_decoy_raw);
+
+    drop(_access);
+    let _process_access = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "process-token");
+    crate::external_credentials::reset_side_effect_trap();
+    assert_eq!(config.deepseek_api_key()?, "process-token");
+    assert_eq!(config.codex_account_id(), None);
+    assert_eq!(
+        crate::external_credentials::side_effect_trap_counts(),
+        (0, 0),
+        "process-scoped Codex auth must not be mixed with external-file metadata"
     );
     Ok(())
 }
@@ -7699,7 +7996,7 @@ fn provider_auth_source_metadata_is_not_a_runtime_credential() -> Result<()> {
 }
 
 #[test]
-fn has_api_key_for_accepts_xai_oauth_without_masking_api_keys() -> Result<()> {
+fn xai_oauth_selection_falls_back_to_explicit_api_key_without_external_io() -> Result<()> {
     let _lock = lock_test_env();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7713,17 +8010,26 @@ fn has_api_key_for_accepts_xai_oauth_without_masking_api_keys() -> Result<()> {
     fs::create_dir_all(&temp_root)?;
     let auth_path = temp_root.join("auth.json");
     let _auth_path = EnvVarGuard::set("GROK_AUTH_PATH", auth_path.as_os_str());
+    let _xai_key = EnvVarGuard::remove("XAI_API_KEY");
 
     let mut providers = ProvidersConfig::default();
     providers.xai.api_key = Some("xai-api-key".to_string());
+    providers.xai.auth_mode = Some("oauth".to_string());
     let api_key_config = Config {
+        provider: Some("xai".to_string()),
         providers: Some(providers),
         ..Config::default()
     };
+    crate::external_credentials::reset_side_effect_trap();
     assert!(has_api_key_for(&api_key_config, ApiProvider::Xai));
+    assert_eq!(api_key_config.deepseek_api_key()?, "xai-api-key");
+    assert_eq!(
+        crate::external_credentials::side_effect_trap_counts(),
+        (0, 0)
+    );
 
     fs::write(&auth_path, "{}")?;
-    assert!(has_api_key_for(&Config::default(), ApiProvider::Xai));
+    assert!(!has_api_key_for(&Config::default(), ApiProvider::Xai));
     fs::remove_dir_all(temp_root)?;
     Ok(())
 }
@@ -9377,21 +9683,62 @@ fn session_provider_identity_fails_closed_for_removed_or_invalid_custom_table() 
 }
 
 #[test]
-fn provider_auth_mode_save_uses_requested_path_and_preserves_comments() {
+fn picker_consent_persists_only_confirmed_exact_scope_and_revoke_is_one_step() {
     let dir = tempfile::TempDir::new().expect("tempdir");
-    let path = dir.path().join("config.toml");
+    let config_path = dir.path().join("config.toml");
+    let external_path = dir.path().join("codex-auth.json");
     std::fs::write(
-        &path,
-        "# keep this operator note\n[providers.xai]\nmodel = \"grok-code-fast-1\" # keep model note\n",
+        &config_path,
+        "# preserve operator comment\n[providers.openai_codex]\nmodel = \"gpt-5-codex\" # preserve model\n",
     )
     .expect("seed config");
+    let mut live = Config {
+        provider: Some(ApiProvider::OpenaiCodex.as_str().to_string()),
+        ..Config::default()
+    };
 
-    let saved = save_provider_auth_mode_for_at(ApiProvider::Xai, "oauth", Some(&path))
-        .expect("save auth mode");
+    crate::external_credentials::reset_side_effect_trap();
+    persist_external_credential_consent_for_at(
+        Some(&config_path),
+        &mut live,
+        ApiProvider::OpenaiCodex,
+        codewhale_config::ProviderKind::OpenaiCodex,
+        codewhale_config::ExternalCredentialSource::CodexCli,
+        &external_path,
+    )
+    .expect("persist confirmed consent");
+    let saved = std::fs::read_to_string(&config_path).expect("saved config");
+    assert!(saved.contains("# preserve operator comment"));
+    assert!(saved.contains("model = \"gpt-5-codex\" # preserve model"));
+    assert!(saved.contains("access = \"read_only\""));
+    assert!(saved.contains("source = \"codex_cli\""));
+    assert!(saved.contains(&external_path.display().to_string()));
+    let consent = live
+        .provider_config_for(ApiProvider::OpenaiCodex)
+        .and_then(|entry| entry.external_credentials.as_ref())
+        .expect("live consent");
+    assert_eq!(consent.path, external_path);
+    assert_eq!(
+        crate::external_credentials::complete_side_effect_trap_counts(),
+        (0, 0, 0, 0, 0),
+        "grant persistence must not inspect the disclosed external path"
+    );
 
-    assert_eq!(saved, path);
-    let contents = std::fs::read_to_string(&saved).expect("read config");
-    assert!(contents.contains("# keep this operator note"));
-    assert!(contents.contains("model = \"grok-code-fast-1\" # keep model note"));
-    assert!(contents.contains("auth_mode = \"oauth\""));
+    revoke_external_credential_consent_for_at(
+        Some(&config_path),
+        &mut live,
+        ApiProvider::OpenaiCodex,
+    )
+    .expect("one-step revoke");
+    let revoked = std::fs::read_to_string(&config_path).expect("revoked config");
+    assert!(!revoked.contains("external_credentials"));
+    assert!(
+        live.provider_config_for(ApiProvider::OpenaiCodex)
+            .and_then(|entry| entry.external_credentials.as_ref())
+            .is_none()
+    );
+    assert_eq!(
+        crate::external_credentials::complete_side_effect_trap_counts(),
+        (0, 0, 0, 0, 0)
+    );
 }

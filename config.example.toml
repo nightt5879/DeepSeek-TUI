@@ -490,10 +490,8 @@ max_subagents = 10 # optional (1-20)
 # # api_key = "YOUR_KIMI_CODE_API_KEY"
 # # base_url = "https://api.kimi.com/coding/v1"
 # # model = "kimi-for-coding"
-# # Legacy compatibility only: auth_mode = "kimi_oauth" reads an already
-# # unexpired Kimi CLI access token, read-only. Codewhale never logs in,
-# # refreshes, or rewrites Kimi CLI credentials; API-key setup is recommended
-# # while first-class vendor registration remains tracked in #4417.
+# # Kimi OAuth is not supported. Legacy auth_mode = "kimi_oauth" fails closed
+# # to the API-key guidance above without probing Kimi CLI credential files.
 
 # Z.AI GLM Coding Plan endpoint (https://docs.z.ai)
 [providers.zai]
@@ -601,8 +599,9 @@ max_subagents = 10 # optional (1-20)
 #
 # Auth modes:
 #   api_key (default) — console.x.ai pay-per-use key via api_key / XAI_API_KEY / keyring
-#   oauth             — reuse Grok CLI ~/.grok/auth.json (or device-code login).
-#                       SuperGrok / X Premium+ subscription path; may 403 on some tiers.
+#   oauth             — `codewhale auth xai-device` uses Codewhale-owned storage.
+#                       Reading an existing Grok CLI file requires explicit
+#                       `codewhale auth external-consent --provider xai --mode read-only`.
 [providers.xai]
 # api_key = "YOUR_XAI_API_KEY"
 # auth_mode = "oauth"                      # or "device_code" / "grok_cli"
@@ -630,15 +629,24 @@ max_subagents = 10 # optional (1-20)
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # OpenAI Codex (ChatGPT) Provider — EXPERIMENTAL
-# Reuses your existing ChatGPT/Codex CLI OAuth login. Run `codex login` first;
-# Codewhale reads and refreshes the access token from ~/.codex/auth.json. No API
-# key is stored here. Talks to the OpenAI Responses API at /codex/responses.
+# Run `codex login`, then explicitly grant read-only access to that exact file:
+#   codewhale auth external-consent --provider openai-codex --mode read-only
+# Codewhale never refreshes or rewrites the Codex CLI file. No API key is
+# stored here. Talks to the OpenAI Responses API at /codex/responses.
 # Env var aliases: OPENAI_CODEX_ACCESS_TOKEN / CODEX_ACCESS_TOKEN (token override),
 #   OPENAI_CODEX_BASE_URL / CODEX_BASE_URL, OPENAI_CODEX_MODEL / CODEX_MODEL,
 #   OPENAI_CODEX_ACCOUNT_ID / CODEX_ACCOUNT_ID, OPENAI_CODEX_AUTH_FILE, CODEX_HOME
 [providers.openai_codex]
 # base_url = "https://chatgpt.com/backend-api"
 # model = "gpt-5.5"
+# The CLI writes this table after informed consent; do not copy it between
+# providers or machines. Absence means disabled.
+# [providers.openai_codex.external_credentials]
+# access = "read_only"
+# provider = "openai-codex"
+# source = "codex_cli"
+# path = "/absolute/path/to/.codex/auth.json"
+# consent_version = 1
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Anthropic Provider (native Messages API)

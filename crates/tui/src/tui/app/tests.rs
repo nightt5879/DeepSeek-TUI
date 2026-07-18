@@ -3808,6 +3808,91 @@ fn advance_fallback_all_unready_exhausts_with_clear_reason() {
 }
 
 #[test]
+fn startup_and_fallback_skip_inactive_external_only_routes_without_io() {
+    let _lock = lock_test_env();
+    let temp = tempfile::tempdir().expect("external fallback fixtures");
+    let codex_path = temp.path().join("codex-auth.json");
+    let grok_path = temp.path().join("grok-auth.json");
+    let codex_raw = "inactive Codex bytes must not be read";
+    let grok_raw = "inactive Grok bytes must not be read";
+    std::fs::write(&codex_path, codex_raw).expect("write Codex trap");
+    std::fs::write(&grok_path, grok_raw).expect("write Grok trap");
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", temp.path().join("owned-home"));
+    let _codex_path = EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &codex_path);
+    let _grok_path = EnvVarGuard::set("GROK_AUTH_PATH", &grok_path);
+    let _codex_access = EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
+    let _legacy_codex_access = EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+    let _xai_key = EnvVarGuard::remove("XAI_API_KEY");
+    let _cli_key = EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+    let _cli_source = EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+
+    let config = Config {
+        provider: Some(ApiProvider::Deepseek.as_str().to_string()),
+        api_key: Some("active-deepseek-key".to_string()),
+        fallback_providers: vec![
+            codewhale_config::ProviderKind::OpenaiCodex,
+            codewhale_config::ProviderKind::Xai,
+        ],
+        providers: Some(ProvidersConfig {
+            openai_codex: ProviderConfig {
+                auth_mode: Some("oauth".to_string()),
+                external_credentials: Some(
+                    codewhale_config::ExternalCredentialConsentToml::read_only(
+                        codewhale_config::ProviderKind::OpenaiCodex,
+                        codewhale_config::ExternalCredentialSource::CodexCli,
+                        codex_path.clone(),
+                    ),
+                ),
+                ..Default::default()
+            },
+            xai: ProviderConfig {
+                auth_mode: Some("oauth".to_string()),
+                external_credentials: Some(
+                    codewhale_config::ExternalCredentialConsentToml::read_only(
+                        codewhale_config::ProviderKind::Xai,
+                        codewhale_config::ExternalCredentialSource::GrokCli,
+                        grok_path.clone(),
+                    ),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut options = test_options(false);
+    options.skip_onboarding = true;
+
+    crate::external_credentials::reset_side_effect_trap();
+    let mut app = App::new(options, &config);
+    assert_eq!(
+        crate::external_credentials::side_effect_trap_counts(),
+        (0, 0),
+        "startup readiness must not inspect inactive external credentials"
+    );
+    assert_eq!(app.advance_fallback("active route unavailable"), None);
+    assert_eq!(
+        crate::external_credentials::side_effect_trap_counts(),
+        (0, 0),
+        "fallback selection must skip external-only inactive routes without inspection"
+    );
+    let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("skipped openai-codex: needs auth"),
+        "{reason}"
+    );
+    assert!(reason.contains("skipped xai: needs auth"), "{reason}");
+    assert_eq!(
+        std::fs::read_to_string(&codex_path).expect("Codex trap unchanged"),
+        codex_raw
+    );
+    assert_eq!(
+        std::fs::read_to_string(&grok_path).expect("Grok trap unchanged"),
+        grok_raw
+    );
+}
+
+#[test]
 fn advance_fallback_local_primary_does_not_fall_back_to_cloud() {
     let _lock = lock_test_env();
     let _openai = EnvVarGuard::remove("OPENAI_API_KEY");

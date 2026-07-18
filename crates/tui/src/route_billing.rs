@@ -92,11 +92,11 @@ pub fn for_route(config: &Config, provider: ApiProvider) -> BillingPresentation 
         ApiProvider::XiaomiMimo if !xiaomi_is_explicit_pay_as_you_go(provider_config) => {
             BillingPresentation::Subscription("MiMo token plan")
         }
-        ApiProvider::Xai if provider_config.is_some_and(uses_xai_oauth) => {
+        ApiProvider::Xai
+            if provider_config.is_some_and(uses_xai_oauth)
+                && crate::xai_oauth::credentials_valid(config) =>
+        {
             BillingPresentation::Subscription("Grok OAuth quota")
-        }
-        ApiProvider::Moonshot if provider_config.is_some_and(uses_kimi_imported_token) => {
-            BillingPresentation::Subscription("Kimi imported token")
         }
         ApiProvider::Anthropic if provider_config.is_some_and(uses_anthropic_oauth) => {
             BillingPresentation::Subscription("Claude OAuth quota")
@@ -284,15 +284,6 @@ fn uses_xai_oauth(config: &ProviderConfig) -> bool {
     auth_mode(config).is_some_and(|mode| crate::xai_oauth::auth_mode_uses_xai_oauth(&mode))
 }
 
-fn uses_kimi_imported_token(config: &ProviderConfig) -> bool {
-    auth_mode(config).is_some_and(|mode| {
-        matches!(
-            mode.as_str(),
-            "oauth" | "kimi" | "kimi_oauth" | "kimi_cli" | "kimi_code"
-        )
-    })
-}
-
 fn uses_anthropic_oauth(config: &ProviderConfig) -> bool {
     auth_mode(config).is_some_and(|mode| {
         matches!(
@@ -395,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn kimi_cli_compatibility_route_is_labeled_as_an_import_not_oauth() {
+    fn unsupported_kimi_cli_mode_never_claims_imported_token_billing() {
         let config = config_with(
             ApiProvider::Moonshot,
             ProviderConfig {
@@ -404,10 +395,7 @@ mod tests {
             },
         );
         let billing = for_route(&config, ApiProvider::Moonshot);
-        assert_eq!(
-            billing,
-            BillingPresentation::Subscription("Kimi imported token")
-        );
+        assert_eq!(billing, BillingPresentation::Metered);
         let chip = usage_chip(
             billing,
             ApiProvider::Moonshot,
@@ -416,12 +404,42 @@ mod tests {
             CostCurrency::Usd,
             None,
         );
-        assert_eq!(
-            format_usage_chip(&chip).as_deref(),
-            Some("usage: Kimi imported token")
-        );
+        assert_eq!(format_usage_chip(&chip).as_deref(), Some("cost: unknown"));
         assert!(!format_usage_line(&chip).contains("OAuth"));
+        assert!(!format_usage_line(&chip).contains("imported token"));
         assert!(!format_usage_line(&chip).contains('$'));
+    }
+
+    #[test]
+    fn xai_api_key_fallback_is_metered_when_external_oauth_is_unavailable() {
+        let _lock = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("xAI billing fixture");
+        let grok_path = temp.path().join("external-grok-auth.json");
+        std::fs::write(&grok_path, "must-never-be-read").expect("external trap");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
+        let _grok = crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &grok_path);
+
+        let config = config_with(
+            ApiProvider::Xai,
+            ProviderConfig {
+                auth_mode: Some("oauth".to_string()),
+                api_key: Some("xai-api-key".to_string()),
+                ..ProviderConfig::default()
+            },
+        );
+        crate::external_credentials::reset_side_effect_trap();
+        assert_eq!(
+            for_route(&config, ApiProvider::Xai),
+            BillingPresentation::Metered
+        );
+        assert_eq!(
+            crate::external_credentials::side_effect_trap_counts(),
+            (0, 0)
+        );
+        assert_eq!(
+            std::fs::read_to_string(grok_path).expect("external trap unchanged"),
+            "must-never-be-read"
+        );
     }
 
     #[test]
@@ -635,6 +653,47 @@ mod tests {
 
     #[test]
     fn xai_oauth_and_api_key_routes_stay_distinct() {
+        let _lock = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("xAI owned credential fixture");
+        let owned_home = temp
+            .path()
+            .canonicalize()
+            .expect("canonical xAI owned credential fixture");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &owned_home);
+        let owned_path = owned_home.join("credentials/xai-auth.json");
+        std::fs::create_dir_all(owned_path.parent().expect("owned credential parent"))
+            .expect("create owned credential directory");
+        #[cfg(windows)]
+        crate::external_credentials::secure_codewhale_owned_windows_path(
+            owned_path.parent().expect("owned credential parent"),
+            true,
+        )
+        .expect("secure owned credential directory");
+        let scope = format!(
+            "{}::{}",
+            crate::xai_oauth::XAI_OIDC_ISSUER,
+            crate::xai_oauth::GROK_OIDC_CLIENT_ID
+        );
+        std::fs::write(
+            &owned_path,
+            serde_json::json!({
+                scope: {
+                    "key": crate::test_support::future_test_jwt("billing"),
+                    "auth_mode": "oidc"
+                }
+            })
+            .to_string(),
+        )
+        .expect("write Codewhale-owned xAI credential");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&owned_path, std::fs::Permissions::from_mode(0o600))
+                .expect("secure owned credential file");
+        }
+        #[cfg(windows)]
+        crate::external_credentials::secure_codewhale_owned_windows_path(&owned_path, false)
+            .expect("secure owned credential file");
         let oauth = config_with(
             ApiProvider::Xai,
             ProviderConfig {

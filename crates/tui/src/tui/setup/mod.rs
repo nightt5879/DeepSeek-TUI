@@ -324,7 +324,10 @@ impl SetupRuntimeFacts {
         ) {
             format!("{}; retry or open /provider", readiness.label())
         } else if app.api_provider == crate::config::ApiProvider::OpenaiCodex {
-            format!("{}; run codex login or open /provider", readiness.label())
+            format!(
+                "{}; run codex login, then grant exact read-only access with `codewhale auth external-consent --provider openai-codex --mode read-only`, or open /provider",
+                readiness.label()
+            )
         } else if let Some(url) = app.api_provider.credential_help().credential_url {
             format!(
                 "{}; credentials: {url}; open /provider to repair the route",
@@ -4409,6 +4412,7 @@ mod tests {
         let text = lines_to_text(view.provider_model_detail_lines());
 
         assert!(text.contains("codex login"), "{text}");
+        assert!(text.contains("external-consent"), "{text}");
         assert!(!text.contains("credentials:"), "{text}");
     }
 

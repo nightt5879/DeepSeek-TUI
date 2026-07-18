@@ -1,5 +1,7 @@
 pub mod auth_source;
 pub mod catalog;
+mod config_document;
+pub mod external_credentials;
 mod harness;
 pub mod model_reference;
 pub mod models_dev;
@@ -11,6 +13,11 @@ mod provider_kind;
 pub mod route;
 pub mod setup_state;
 pub mod user_constitution;
+mod xai_credentials;
+pub use config_document::{
+    create_config_document, mutate_config_document, replace_config_document_if_unchanged,
+    set_config_document_value, unset_config_document_value,
+};
 pub use harness::{
     HarnessCompactionStrategy, HarnessPosture, HarnessPostureKind, HarnessProfile,
     HarnessSafetyPosture, HarnessToolSurface, built_in_harness_profiles,
@@ -24,6 +31,13 @@ pub use setup_state::{
 };
 pub use user_constitution::{
     AutonomyPreference, UntrustedDraftParse, UserConstitution, UserConstitutionLoad,
+};
+pub use xai_credentials::{
+    LEGACY_XAI_OAUTH_FILE_NAME, XAI_OAUTH_GENERATION_PREFIX, XAI_OAUTH_GENERATION_SUFFIX,
+    XaiOAuthCredentialStore, XaiOAuthRevocation, clear_all_xai_oauth_credentials,
+    is_valid_xai_oauth_generation, legacy_xai_oauth_path, remove_xai_oauth_generation,
+    validate_xai_oauth_generation, with_xai_oauth_lifecycle_lock,
+    with_xai_oauth_revocation_transaction, xai_oauth_credentials_dir, xai_oauth_generation_path,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,6 +56,12 @@ pub use codewhale_execpolicy::ToolAskRule;
 use codewhale_execpolicy::{ExecPolicyEngine, Ruleset};
 use codewhale_secrets::SecretSource;
 pub use codewhale_secrets::Secrets;
+pub use external_credentials::{
+    EXTERNAL_CREDENTIAL_CONSENT_VERSION, EXTERNAL_CREDENTIAL_READ_ONLY_SEMANTICS,
+    ExternalCredentialAccess, ExternalCredentialConsentStatus, ExternalCredentialConsentToml,
+    ExternalCredentialReadGrant, ExternalCredentialSource, external_credential_consent_status,
+    quote_os_path, resolve_external_credential_path,
+};
 use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
@@ -102,6 +122,19 @@ pub struct ProviderConfigToml {
     pub path_suffix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<ProviderAuthSourceToml>,
+    /// Explicit consent for reading one exact credential file owned by
+    /// another CLI. Absence means disabled and must not trigger discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_credentials: Option<ExternalCredentialConsentToml>,
+    /// Codewhale-owned xAI OAuth generation selected by config. The value is a
+    /// validated basename under `$CODEWHALE_HOME/credentials`, never an
+    /// arbitrary path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_credential_generation: Option<String>,
+    /// Preserve provider fields introduced by newer Codewhale versions and by
+    /// custom provider adapters when an older typed writer saves this file.
+    #[serde(flatten)]
+    pub extras: BTreeMap<String, toml::Value>,
 }
 
 impl ProviderConfigToml {
@@ -119,6 +152,9 @@ impl ProviderConfigToml {
             && http_headers_are_effectively_empty(&self.http_headers)
             && blank(self.path_suffix.as_ref())
             && self.auth.is_none()
+            && self.external_credentials.is_none()
+            && self.oauth_credential_generation.is_none()
+            && self.extras.is_empty()
     }
 }
 
@@ -305,6 +341,10 @@ pub struct ProvidersToml {
     /// provider's config.
     #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub custom: ProviderConfigToml,
+    /// Preserve dynamically named provider tables and providers added by a
+    /// newer Codewhale version.
+    #[serde(flatten)]
+    pub extras: BTreeMap<String, toml::Value>,
 }
 
 /// Sibling `permissions.toml` schema.
@@ -366,9 +406,10 @@ impl PermissionsToml {
 impl ProvidersToml {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        ProviderKind::all()
-            .iter()
-            .all(|provider| self.for_provider(*provider).is_empty())
+        self.extras.is_empty()
+            && ProviderKind::all()
+                .iter()
+                .all(|provider| self.for_provider(*provider).is_empty())
     }
 
     #[must_use]
@@ -2538,8 +2579,11 @@ pub fn load_project_config(workspace: &Path) -> Option<ConfigToml> {
         };
         match toml::from_str(&raw) {
             Ok(config) => return Some(config),
-            Err(e) => {
-                tracing::warn!("Failed to parse project config {}: {e}", path.display());
+            Err(_) => {
+                tracing::warn!(
+                    "Failed to parse project config {}; file contents were omitted",
+                    quote_os_path(&path)
+                );
                 return None;
             }
         }
@@ -3393,8 +3437,12 @@ impl ConfigStore {
         let path = resolve_config_path(path)?;
         let (config, original_raw) = if checked_path_exists(&path)? {
             let raw = read_checked_config_file(&path)?;
-            let parsed: ConfigToml = toml::from_str(&raw)
-                .with_context(|| format!("failed to parse config at {}", path.display()))?;
+            let parsed: ConfigToml = toml::from_str(&raw).map_err(|_| {
+                anyhow::anyhow!(
+                    "failed to parse config at {}; file contents were omitted",
+                    quote_os_path(&path)
+                )
+            })?;
             (parsed, Some(raw))
         } else {
             (ConfigToml::default(), None)
@@ -3418,34 +3466,30 @@ impl ConfigStore {
         let serialized =
             toml::to_string_pretty(&self.config).context("failed to serialize config")?;
         if let Some(ref original_raw) = self.original_raw {
-            Ok(
-                merge_and_preserve_comments(&serialized, original_raw).unwrap_or_else(|e| {
-                    tracing::warn!("failed to merge config comments, saving without them: {e:#}");
-                    serialized
-                }),
-            )
+            merge_and_preserve_comments(&serialized, original_raw).with_context(|| {
+                format!(
+                    "cannot safely preserve config at {}; reload it and retry instead of replacing an unmergeable snapshot",
+                    quote_os_path(&self.path)
+                )
+            })
         } else {
             Ok(serialized)
         }
     }
 
-    pub fn save(&self) -> Result<()> {
+    pub fn save(&mut self) -> Result<()> {
         let path = normalize_config_file_path(self.path.clone())?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create config directory {}", parent.display())
-            })?;
-        }
         let body = self.rendered_body()?;
-        if checked_path_exists(&path)? {
-            let existing = read_checked_config_file(&path)?;
-            if existing == body {
-                return Ok(());
-            }
-            write_one_time_config_backup(&path)?;
-        }
-        persistence::atomic_write(&path, body.as_bytes())
-            .with_context(|| format!("failed to write config at {}", path.display()))?;
+        replace_config_document_if_unchanged(&path, self.original_raw.as_deref(), &body)?;
+        self.original_raw = Some(body);
+        Ok(())
+    }
+
+    /// Refresh the typed value and byte snapshot after a targeted writer used
+    /// the shared config lock. This keeps a long-lived command process from
+    /// treating its own successful mutation as an external stale conflict.
+    pub fn reload(&mut self) -> Result<()> {
+        *self = Self::load(Some(self.path.clone()))?;
         Ok(())
     }
 
@@ -3494,14 +3538,22 @@ impl ConfigStore {
         let mut permissions = if raw.trim().is_empty() {
             PermissionsToml::default()
         } else {
-            toml::from_str(&raw)
-                .with_context(|| format!("failed to parse permissions at {}", path.display()))?
+            toml::from_str(&raw).map_err(|_| {
+                anyhow::anyhow!(
+                    "failed to parse permissions at {}; file contents were omitted",
+                    quote_os_path(&path)
+                )
+            })?
         };
         let mut document = if raw.trim().is_empty() {
             toml_edit::DocumentMut::new()
         } else {
-            raw.parse::<toml_edit::DocumentMut>()
-                .with_context(|| format!("failed to edit permissions at {}", path.display()))?
+            raw.parse::<toml_edit::DocumentMut>().map_err(|_| {
+                anyhow::anyhow!(
+                    "failed to edit permissions at {}; file contents were omitted",
+                    quote_os_path(&path)
+                )
+            })?
         };
 
         if !document.contains_key("rules") {
@@ -3526,10 +3578,10 @@ impl ConfigStore {
         }
 
         let body = document.to_string();
-        let persisted: PermissionsToml = toml::from_str(&body).with_context(|| {
-            format!(
-                "generated invalid permissions document for {}",
-                path.display()
+        let persisted: PermissionsToml = toml::from_str(&body).map_err(|_| {
+            anyhow::anyhow!(
+                "generated invalid permissions document for {}; file contents were omitted",
+                quote_os_path(&path)
             )
         })?;
         write_permissions_atomic(&path, body.as_bytes())?;
@@ -3629,7 +3681,11 @@ fn write_one_time_config_backup(path: &Path) -> Result<()> {
 fn config_toml_without_plaintext_api_keys(raw: &str) -> Result<String> {
     let mut document = raw
         .parse::<toml_edit::DocumentMut>()
-        .context("failed to parse config TOML while removing plaintext API keys")?;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "failed to parse config TOML while removing plaintext API keys; file contents were omitted"
+            )
+        })?;
     remove_plaintext_api_keys_recursive(document.as_table_mut());
     Ok(document.to_string())
 }
@@ -3657,11 +3713,17 @@ fn remove_plaintext_api_keys_recursive(table: &mut dyn toml_edit::TableLike) {
 pub fn merge_and_preserve_comments(serialized: &str, original_raw: &str) -> Result<String> {
     let original = original_raw
         .parse::<toml_edit::DocumentMut>()
-        .context("failed to parse original config for comment merge")?;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "failed to parse original config for comment merge; file contents were omitted"
+            )
+        })?;
 
-    let mut new_doc = serialized
-        .parse::<toml_edit::DocumentMut>()
-        .context("failed to parse serialized config for comment merge")?;
+    let mut new_doc = serialized.parse::<toml_edit::DocumentMut>().map_err(|_| {
+        anyhow::anyhow!(
+            "failed to parse serialized config for comment merge; file contents were omitted"
+        )
+    })?;
 
     // Reuse the original document’s trailing text (file-footer comments /
     // disabled keys) so they survive the rewrite.
@@ -4121,10 +4183,10 @@ fn load_sibling_permissions(config_path: &Path) -> Result<PermissionsToml> {
     }
 
     let raw = read_checked_permissions_file(&permissions_path)?;
-    toml::from_str(&raw).with_context(|| {
-        format!(
-            "failed to parse permissions at {}",
-            permissions_path.display()
+    toml::from_str(&raw).map_err(|_| {
+        anyhow::anyhow!(
+            "failed to parse permissions at {}; file contents were omitted",
+            quote_os_path(&permissions_path)
         )
     })
 }

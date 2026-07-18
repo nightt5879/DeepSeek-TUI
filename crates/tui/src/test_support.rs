@@ -4,6 +4,15 @@ use std::ffi::{OsStr, OsString};
 use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
 use std::thread::ThreadId;
 
+/// Build a syntactically valid, non-secret JWT fixture without embedding a
+/// high-entropy token-shaped literal in Git history.
+pub(crate) fn future_test_jwt(label: &str) -> String {
+    use base64::Engine as _;
+
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":9999999999}"#);
+    format!("test.{payload}.{label}")
+}
+
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))

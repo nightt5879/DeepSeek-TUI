@@ -888,6 +888,7 @@ dependencies = [
  "codewhale-execpolicy",
  "codewhale-secrets",
  "dirs",
+ "fd-lock",
  "libc",
  "serde",
  "serde_json",
@@ -895,6 +896,7 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "toml_edit 0.25.12+spec-1.1.0",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1111,6 +1113,7 @@ dependencies = [
  "wait-timeout",
  "webbrowser",
  "windows",
+ "windows-sys 0.61.2",
  "wiremock",
 ]
 

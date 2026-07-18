@@ -54,7 +54,8 @@ use crate::commands;
 use crate::compaction::estimate_input_tokens_conservative;
 use crate::config::{
     ApiProvider, Config, ProviderConfig, ProviderIdentity, ProvidersConfig, StatusItem,
-    UpdateConfig, save_provider_auth_mode_for_at,
+    UpdateConfig, persist_external_credential_consent_for_at,
+    revoke_external_credential_consent_for_at,
 };
 use crate::config_ui::{self, ConfigUiMode, WebConfigSession, WebConfigSessionEvent};
 use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
@@ -8672,7 +8673,11 @@ async fn switch_provider(
                         config,
                         runtime_status,
                     )
-                    .map(|picker| picker.with_provider_health(&app.provider_health))
+                    .map(|picker| {
+                        picker
+                            .with_locale(app.ui_locale)
+                            .with_provider_health(&app.provider_health)
+                    })
                 {
                     *config = previous_config;
                     app.view_stack.push(picker);
@@ -9581,6 +9586,7 @@ async fn apply_command_result(
                             runtime_status,
                             app.provider_picker_memory.as_ref(),
                         )
+                        .with_locale(app.ui_locale)
                         .with_provider_health(&app.provider_health),
                     );
                 }
@@ -9595,6 +9601,7 @@ async fn apply_command_result(
                             config,
                             runtime_status,
                         )
+                        .with_locale(app.ui_locale)
                         .with_provider_health(&app.provider_health),
                     );
                     app.status_message = Some("Provider setup catalog opened.".to_string());
@@ -10282,6 +10289,12 @@ fn clear_active_provider_api_key_from_memory(app: &App, config: &mut Config) {
         config.api_key = None;
     }
     config.set_provider_api_key_override(app.api_provider, None);
+    if app.api_provider == ApiProvider::Xai {
+        let entry = config.provider_config_for_mut(ApiProvider::Xai);
+        entry.auth_mode = None;
+        entry.oauth_credential_generation = None;
+        entry.external_credentials = None;
+    }
 }
 
 fn parse_queue_send_command(input: &str) -> Option<Result<usize, String>> {
@@ -12063,6 +12076,7 @@ async fn handle_view_events(
                             config,
                             runtime_status,
                         )
+                        .with_locale(app.ui_locale)
                         .with_provider_health(&app.provider_health),
                     );
                     app.status_message =
@@ -12258,6 +12272,57 @@ async fn handle_view_events(
             }
             ViewEvent::ProviderPickerXaiOAuthRequested => {
                 run_xai_device_login_from_tui(terminal, app, engine_handle, config).await?;
+            }
+            ViewEvent::ProviderPickerExternalConsentConfirmed {
+                provider,
+                consent_provider,
+                source,
+                path,
+            } => match persist_external_credential_consent_for_at(
+                app.config_path.as_deref(),
+                config,
+                provider,
+                consent_provider,
+                source,
+                &path,
+            ) {
+                Ok(_) => {
+                    let toast = app
+                        .tr(MessageId::ProviderExternalGrantedToast)
+                        .replace("{owner}", source.owner_label())
+                        .replace("{provider}", provider.as_str());
+                    app.push_status_toast(toast, StatusToastLevel::Success, Some(8_000));
+                    let model_override = provider_picker_model_override(app, config, provider);
+                    switch_provider(app, engine_handle, config, provider, model_override).await;
+                    refresh_config_view_if_open(app, "provider");
+                }
+                Err(error) => app.push_status_toast(
+                    app.tr(MessageId::ProviderExternalSaveFailedToast)
+                        .replace("{error}", &error.to_string()),
+                    StatusToastLevel::Error,
+                    None,
+                ),
+            },
+            ViewEvent::ProviderPickerExternalConsentRevoked { provider } => {
+                match revoke_external_credential_consent_for_at(
+                    app.config_path.as_deref(),
+                    config,
+                    provider,
+                ) {
+                    Ok(_) => app.push_status_toast(
+                        app.tr(MessageId::ProviderExternalRevokedToast)
+                            .replace("{provider}", provider.as_str()),
+                        StatusToastLevel::Success,
+                        Some(5_000),
+                    ),
+                    Err(error) => app.push_status_toast(
+                        app.tr(MessageId::ProviderExternalRevokeFailedToast)
+                            .replace("{error}", &error.to_string()),
+                        StatusToastLevel::Error,
+                        None,
+                    ),
+                }
+                refresh_config_view_if_open(app, "provider");
             }
             ViewEvent::ProviderPickerOpenModels {
                 provider,
@@ -13027,7 +13092,11 @@ async fn apply_provider_picker_api_key_with_verifier(
                     runtime_status,
                     api_key,
                 )
-                .map(|picker| picker.with_provider_health(&app.provider_health))
+                .map(|picker| {
+                    picker
+                        .with_locale(app.ui_locale)
+                        .with_provider_health(&app.provider_health)
+                })
             {
                 app.view_stack.push(picker);
                 app.status_message = Some(format!(
@@ -13055,7 +13124,11 @@ async fn apply_provider_picker_api_key_with_verifier(
                     runtime_status,
                     reason,
                 )
-                .map(|picker| picker.with_provider_health(&app.provider_health))
+                .map(|picker| {
+                    picker
+                        .with_locale(app.ui_locale)
+                        .with_provider_health(&app.provider_health)
+                })
             {
                 app.view_stack.push(picker);
                 app.status_message = Some(format!(
@@ -13215,34 +13288,44 @@ fn mirror_saved_api_key_in_config(config: &mut Config, provider: ApiProvider, ap
     }
     entry.auth_mode = Some("api_key".to_string());
     entry.api_key = Some(api_key);
+    entry.external_credentials = None;
+    if provider == ApiProvider::Xai {
+        entry.oauth_credential_generation = None;
+    }
 }
 
-async fn apply_provider_picker_auth_mode(
+async fn apply_codewhale_owned_xai_login(
     app: &mut App,
     engine_handle: &mut EngineHandle,
     config: &mut Config,
-    provider: ApiProvider,
-    auth_mode: &str,
+    pending: crate::xai_oauth::PendingXaiDeviceLogin,
     status_prefix: &str,
 ) {
-    match save_provider_auth_mode_for_at(provider, auth_mode, app.config_path.as_deref()) {
-        Ok(path) => {
-            set_provider_auth_mode_in_memory(config, provider, auth_mode.to_string());
-            app.status_message = Some(format!("{status_prefix}; saved to {}", path.display()));
+    match crate::xai_oauth::activate_device_login(
+        pending,
+        app.config_path.as_deref(),
+        Some(&mut *config),
+    ) {
+        Ok(activation) => {
+            app.status_message = Some(format!(
+                "{status_prefix}; activated {} via {}",
+                codewhale_config::quote_os_path(&activation.auth_path),
+                codewhale_config::quote_os_path(&activation.config_path)
+            ));
             app.api_key_env_only = false;
         }
         Err(err) => {
             app.add_message(HistoryCell::System {
                 content: format!(
-                    "Failed to save {} auth mode: {err}\nProvider unchanged.",
-                    provider.as_str()
+                    "Failed to finalize {} device login: {err}\nProvider unchanged.",
+                    ApiProvider::Xai.as_str()
                 ),
             });
             return;
         }
     }
 
-    switch_provider(app, engine_handle, config, provider, None).await;
+    switch_provider(app, engine_handle, config, ApiProvider::Xai, None).await;
 }
 
 async fn run_xai_device_login_from_tui(
@@ -13267,13 +13350,12 @@ async fn run_xai_device_login_from_tui(
     )?;
 
     match login_result {
-        Ok(_) => {
-            apply_provider_picker_auth_mode(
+        Ok(pending) => {
+            apply_codewhale_owned_xai_login(
                 app,
                 engine_handle,
                 config,
-                ApiProvider::Xai,
-                "oauth",
+                pending,
                 "xAI device login complete",
             )
             .await;
@@ -13288,60 +13370,6 @@ async fn run_xai_device_login_from_tui(
     }
     app.needs_redraw = true;
     Ok(())
-}
-
-fn set_provider_auth_mode_in_memory(config: &mut Config, provider: ApiProvider, auth_mode: String) {
-    // Capture the custom entry key (the selected provider name) before the
-    // mutable borrow of `providers` below (#1519).
-    let custom_key = (provider == ApiProvider::Custom).then(|| {
-        config
-            .provider
-            .clone()
-            .unwrap_or_else(|| "__custom__".to_string())
-    });
-    let providers = config
-        .providers
-        .get_or_insert_with(ProvidersConfig::default);
-    let entry: &mut ProviderConfig = match provider {
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN => return,
-        ApiProvider::Custom => providers
-            .custom
-            .entry(custom_key.expect("custom key captured for custom provider"))
-            .or_default(),
-        ApiProvider::DeepseekAnthropic => &mut providers.deepseek_anthropic,
-        ApiProvider::NvidiaNim => &mut providers.nvidia_nim,
-        ApiProvider::Openai => &mut providers.openai,
-        ApiProvider::Atlascloud => &mut providers.atlascloud,
-        ApiProvider::WanjieArk => &mut providers.wanjie_ark,
-        ApiProvider::Volcengine => &mut providers.volcengine,
-        ApiProvider::Openrouter => &mut providers.openrouter,
-        ApiProvider::XiaomiMimo => &mut providers.xiaomi_mimo,
-        ApiProvider::Novita => &mut providers.novita,
-        ApiProvider::Fireworks => &mut providers.fireworks,
-        ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => &mut providers.siliconflow,
-        ApiProvider::Arcee => &mut providers.arcee,
-        ApiProvider::Moonshot => &mut providers.moonshot,
-        ApiProvider::Sglang => &mut providers.sglang,
-        ApiProvider::Vllm => &mut providers.vllm,
-        ApiProvider::Ollama => &mut providers.ollama,
-        ApiProvider::Huggingface => &mut providers.huggingface,
-        ApiProvider::Deepinfra => &mut providers.deepinfra,
-        ApiProvider::Together => &mut providers.together,
-        ApiProvider::Qianfan => &mut providers.qianfan,
-        ApiProvider::OpenaiCodex => &mut providers.openai_codex,
-        ApiProvider::Anthropic => &mut providers.anthropic,
-        ApiProvider::Openmodel => &mut providers.openmodel,
-        ApiProvider::Zai => &mut providers.zai,
-        ApiProvider::Stepfun => &mut providers.stepfun,
-        ApiProvider::Minimax => &mut providers.minimax,
-        ApiProvider::MinimaxAnthropic => &mut providers.minimax_anthropic,
-        ApiProvider::Sakana => &mut providers.sakana,
-        ApiProvider::LongCat => &mut providers.longcat,
-        ApiProvider::OpencodeGo => &mut providers.opencode_go,
-        ApiProvider::Meta => &mut providers.meta,
-        ApiProvider::Xai => &mut providers.xai,
-    };
-    entry.auth_mode = Some(auth_mode);
 }
 
 fn apply_loaded_session(
@@ -14779,6 +14807,45 @@ mod provider_key_validation_tests {
         app.model = "deepseek-v4-pro".to_string();
         app.auto_model = false;
         app
+    }
+
+    #[test]
+    fn api_key_live_mirror_revokes_stale_external_credential_consent() {
+        let external_path = if cfg!(windows) {
+            PathBuf::from(r"C:\Users\test\grok-auth.json")
+        } else {
+            PathBuf::from("/tmp/grok-auth.json")
+        };
+        let mut config = Config {
+            providers: Some(ProvidersConfig {
+                xai: ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    external_credentials: Some(
+                        codewhale_config::ExternalCredentialConsentToml::read_only(
+                            codewhale_config::ProviderKind::Xai,
+                            codewhale_config::ExternalCredentialSource::GrokCli,
+                            external_path,
+                        ),
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        mirror_saved_api_key_in_config(
+            &mut config,
+            ApiProvider::Xai,
+            "codewhale-owned-api-key".to_string(),
+        );
+
+        let xai = config
+            .provider_config_for(ApiProvider::Xai)
+            .expect("xAI live config");
+        assert_eq!(xai.auth_mode.as_deref(), Some("api_key"));
+        assert_eq!(xai.api_key.as_deref(), Some("codewhale-owned-api-key"));
+        assert!(xai.external_credentials.is_none());
     }
 
     struct MockProviderKeyVerifier {

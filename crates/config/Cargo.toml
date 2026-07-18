@@ -12,6 +12,7 @@ anyhow.workspace = true
 codewhale-execpolicy = { path = "../execpolicy", version = "0.9.1" }
 codewhale-secrets = { path = "../secrets", version = "0.9.1" }
 dirs.workspace = true
+fd-lock = "4.0.4"
 libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
@@ -19,3 +20,6 @@ tempfile.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }

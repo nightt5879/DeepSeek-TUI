@@ -676,6 +676,29 @@ fn test_mcp_config_parse_mcp_servers_alias_and_snapshot() {
 }
 
 #[test]
+fn malformed_mcp_config_error_omits_secret_contents_and_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.json");
+    let secret = "cw-secret-mcp-config-4507";
+    fs::write(
+        &path,
+        format!(
+            r#"{{"servers":{{"private":{{"headers":{{"Authorization":"{secret}"}} trailing-junk}}}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let error = load_config(&path).expect_err("malformed MCP config must fail");
+    let diagnostic = format!("{error:#}");
+    assert!(!diagnostic.contains(secret), "{diagnostic}");
+    assert!(!diagnostic.contains("Authorization"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("file contents were omitted"),
+        "{diagnostic}"
+    );
+}
+
+#[test]
 fn workspace_mcp_config_merges_with_project_overrides() {
     let dir = tempfile::tempdir().unwrap();
     let global_path = dir.path().join("global-mcp.json");

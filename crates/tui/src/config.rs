@@ -2,8 +2,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-#[cfg(unix)]
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -11,7 +9,7 @@ use codewhale_execpolicy::ExecPolicyEngine;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 
 use crate::audit::log_sensitive_event;
 use crate::features::{Feature, Features, FeaturesToml, is_known_feature_key};
@@ -2640,6 +2638,10 @@ pub struct ProviderConfig {
     pub mode: Option<String>,
     #[serde(alias = "authMode")]
     pub auth_mode: Option<String>,
+    /// Validated basename of the active Codewhale-owned xAI OAuth generation.
+    /// The file always lives below Codewhale's private credentials directory.
+    #[serde(default, alias = "oauthCredentialGeneration")]
+    pub oauth_credential_generation: Option<String>,
     #[serde(alias = "insecureSkipTlsVerify")]
     pub insecure_skip_tls_verify: Option<bool>,
     #[serde(alias = "httpHeaders")]
@@ -2656,6 +2658,10 @@ pub struct ProviderConfig {
     )]
     pub max_concurrency: Option<usize>,
     pub auth: Option<codewhale_config::ProviderAuthSourceToml>,
+    /// Explicit, provider-scoped consent for one credential file owned by
+    /// another CLI. Absence is the disabled default.
+    #[serde(default, alias = "externalCredentials")]
+    pub external_credentials: Option<codewhale_config::ExternalCredentialConsentToml>,
     /// Wire-protocol selector for a custom `[providers.<name>]` entry (#1519).
     ///
     /// Only `"openai-compatible"` is accepted for now; any other value is
@@ -3007,6 +3013,42 @@ pub(crate) fn approval_policy_baseline_from_permission_posture(
 // === Config Loading ===
 
 impl Config {
+    /// Structural external-credential status for user-facing inventory. This
+    /// resolves only environment/config strings and performs no filesystem or
+    /// network access.
+    pub(crate) fn external_credential_consent_status(
+        &self,
+        provider: ApiProvider,
+    ) -> Option<codewhale_config::ExternalCredentialConsentStatus> {
+        let (kind, source, path) = match provider {
+            ApiProvider::OpenaiCodex => (
+                codewhale_config::ProviderKind::OpenaiCodex,
+                codewhale_config::ExternalCredentialSource::CodexCli,
+                crate::oauth::auth_file_path(),
+            ),
+            ApiProvider::Xai => (
+                codewhale_config::ProviderKind::Xai,
+                codewhale_config::ExternalCredentialSource::GrokCli,
+                crate::xai_oauth::auth_file_path(),
+            ),
+            _ => return None,
+        };
+        let active_kind = self
+            .api_provider()
+            .kind()
+            .unwrap_or(codewhale_config::ProviderKind::Deepseek);
+        let consent = self
+            .provider_config_for(provider)
+            .and_then(|entry| entry.external_credentials.as_ref());
+        Some(codewhale_config::external_credential_consent_status(
+            consent,
+            kind,
+            source,
+            &path,
+            active_kind,
+        ))
+    }
+
     /// Return the non-root source that prevents an interactive runtime preset
     /// from safely rewriting approval, shell, and sandbox posture. Presets may
     /// edit user-owned root keys, but must never overwrite a profile, env,
@@ -3420,8 +3462,12 @@ impl Config {
             if path.exists() {
                 let contents = fs::read_to_string(path)
                     .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-                let parsed: ConfigFile = toml::from_str(&contents)
-                    .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+                let parsed: ConfigFile = toml::from_str(&contents).map_err(|_| {
+                    anyhow::anyhow!(
+                        "Failed to parse config file {}; file contents were omitted",
+                        codewhale_config::quote_os_path(path)
+                    )
+                })?;
                 if let Some(msg) = warn_on_misplaced_top_level_keys(&contents) {
                     tracing::warn!("{msg}");
                 }
@@ -4178,6 +4224,15 @@ impl Config {
         }
     }
 
+    /// Mirror a successful native xAI login into the live route config.
+    /// Codewhale-owned OAuth storage supersedes any dormant Grok CLI consent.
+    pub(crate) fn mark_codewhale_owned_xai_oauth(&mut self, generation: String) {
+        let entry = self.provider_config_for_mut(ApiProvider::Xai);
+        entry.auth_mode = Some("oauth".to_string());
+        entry.oauth_credential_generation = Some(generation);
+        entry.external_credentials = None;
+    }
+
     /// Refresh only model-provider route material from a newly loaded disk
     /// snapshot. The receiver is the already-effective interactive Config,
     /// including CLI feature toggles and workspace/project permission overlays;
@@ -4679,6 +4734,77 @@ impl Config {
             })
     }
 
+    /// Mint a read capability for the exact external credential path selected
+    /// when consent was granted.
+    ///
+    /// Path resolution itself is side-effect free. The returned capability is
+    /// required by every external credential adapter before it may stat or
+    /// read the selected file. `suggested_path` is used only in disabled-mode
+    /// guidance; an existing grant remains pinned to its persisted path even
+    /// if ambient CLI-home environment variables change later.
+    pub(crate) fn external_credential_read_grant(
+        &self,
+        provider: ApiProvider,
+        source: codewhale_config::ExternalCredentialSource,
+        suggested_path: &Path,
+    ) -> Result<codewhale_config::ExternalCredentialReadGrant> {
+        if provider != self.api_provider() {
+            anyhow::bail!(
+                "external credential access for {} is dormant until that provider is explicitly selected",
+                provider.display_name()
+            );
+        }
+        let kind = provider
+            .metadata()
+            .map(codewhale_config::provider::Provider::kind)
+            .context("external credentials are unsupported for this provider")?;
+        let consent = self
+            .provider_config_for(provider)
+            .and_then(|entry| entry.external_credentials.as_ref())
+            .with_context(|| {
+                format!(
+                    "External credentials owned by {} are disabled for {}. To allow read-only access to this exact file, run:\n  codewhale auth external-consent --provider {} --mode read-only --path {}",
+                    source.as_str(),
+                    provider.display_name(),
+                    kind.as_str(),
+                    codewhale_config::quote_os_path(suggested_path)
+                )
+            })?;
+        consent
+            .read_grant(kind, source, &consent.path)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "external credential consent for {}: {error}",
+                    provider.display_name()
+                )
+            })
+    }
+
+    /// Whether a structurally valid read-only consent record exists for an
+    /// external credential source. This never stats or reads the selected
+    /// file and never mints the capability required to do so.
+    pub(crate) fn external_credential_read_consent_configured(
+        &self,
+        provider: ApiProvider,
+        source: codewhale_config::ExternalCredentialSource,
+    ) -> bool {
+        let Some(kind) = provider
+            .metadata()
+            .map(codewhale_config::provider::Provider::kind)
+        else {
+            return false;
+        };
+        let Some(consent) = self
+            .provider_config_for(provider)
+            .and_then(|entry| entry.external_credentials.as_ref())
+        else {
+            return false;
+        };
+        consent
+            .validate_read_scope(kind, source, &consent.path)
+            .is_ok()
+    }
+
     pub(crate) fn should_skip_secret_store_for_provider(&self, provider: ApiProvider) -> bool {
         // The CLI's durable credential namespace has one compatibility slot
         // named `custom`; it cannot identify an arbitrary named custom route.
@@ -4717,7 +4843,7 @@ impl Config {
 
     /// Read the API key.
     ///
-    /// Precedence: **route-specific imported/OAuth token → source-marked explicit CLI key →
+    /// Precedence: **route-specific explicitly consented OAuth token → source-marked explicit CLI key →
     /// provider/root config → configured custom-provider environment →
     /// secret store → ambient provider environment**.
     ///
@@ -4769,28 +4895,38 @@ impl Config {
                 .provider_config_for(provider)
                 .is_some_and(provider_config_uses_kimi_imported_token)
         {
-            return kimi_imported_access_token();
+            anyhow::bail!(
+                "Kimi CLI credential import is unsupported. Codewhale does not impersonate or reuse Kimi OAuth clients; configure a Kimi API key from https://platform.kimi.ai/console/api-keys instead."
+            );
         }
 
-        // xAI / Grok OAuth reuses ~/.grok/auth.json (Grok CLI) or a device-code
-        // login written in the same shape. Activated by
-        // [providers.xai] auth_mode = "oauth" (#4257 residual).
+        // xAI OAuth prefers Codewhale-owned device-login storage. An existing
+        // Grok CLI file is considered only with provider/path-scoped read-only
+        // consent. Activated by [providers.xai] auth_mode = "oauth".
         if provider == ApiProvider::Xai
             && !custom_endpoint
             && self
                 .provider_config_for(provider)
                 .is_some_and(provider_config_uses_xai_oauth)
+            && crate::xai_oauth::credentials_present(self)
         {
-            return crate::xai_oauth::get_access_token();
+            return crate::xai_oauth::get_access_token(self);
         }
 
-        // OpenAI Codex (ChatGPT) reuses the existing Codex CLI OAuth login.
-        // The access token lives in ~/.codex/auth.json (refreshed on demand)
-        // rather than a stored API key, so resolve it before the config-file
-        // and env slots. Explicit env overrides are handled inside
-        // `get_credentials`.
+        // OpenAI Codex (ChatGPT) can read an existing Codex CLI OAuth login
+        // only after exact read-only consent. Codewhale never refreshes or
+        // rewrites that file. Explicit env overrides remain process-scoped.
         if provider == ApiProvider::OpenaiCodex && !custom_endpoint {
-            return Ok(crate::oauth::get_credentials()?.access_token);
+            if let Some(credentials) = crate::oauth::credentials_from_env() {
+                return Ok(credentials.access_token);
+            }
+            let path = crate::oauth::auth_file_path();
+            let grant = self.external_credential_read_grant(
+                provider,
+                codewhale_config::ExternalCredentialSource::CodexCli,
+                &path,
+            )?;
+            return Ok(crate::oauth::get_credentials(&grant)?.access_token);
         }
 
         // The dispatcher cannot know the effective provider until the TUI
@@ -4924,7 +5060,7 @@ impl Config {
                 if self
                     .provider_config_for(provider)
                     .is_some_and(provider_config_uses_xai_oauth)
-                    || crate::xai_oauth::credentials_present()
+                    || crate::xai_oauth::credentials_present(self)
                 {
                     anyhow::bail!("{}", crate::xai_oauth::missing_auth_message());
                 }
@@ -4932,8 +5068,8 @@ impl Config {
                     "xAI API key not found. Get a key: https://console.x.ai/\n\
                      Run 'codewhale auth set --provider xai', set XAI_API_KEY, or add \
                      [providers.xai] api_key.\n\
-                     OAuth alternative: run `grok login` (or device-code login) and set \
-                     [providers.xai] auth_mode = \"oauth\"."
+                     OAuth alternative: run `codewhale auth xai-device` for \
+                     Codewhale-owned storage and set [providers.xai] auth_mode = \"oauth\"."
                 );
             }
             // Self-hosted deployments commonly run without auth on localhost.
@@ -7279,13 +7415,12 @@ fn load_sibling_exec_policy_engine(config_path: Option<&Path>) -> Result<ExecPol
             permissions_path.display()
         )
     })?;
-    let permissions: codewhale_config::PermissionsToml =
-        toml::from_str(&raw).with_context(|| {
-            format!(
-                "Failed to parse permissions file: {}",
-                permissions_path.display()
-            )
-        })?;
+    let permissions: codewhale_config::PermissionsToml = toml::from_str(&raw).map_err(|_| {
+        anyhow::anyhow!(
+            "Failed to parse permissions file {}; file contents were omitted",
+            codewhale_config::quote_os_path(&permissions_path)
+        )
+    })?;
     if permissions.is_empty() {
         Ok(ExecPolicyEngine::new(Vec::new(), Vec::new()))
     } else {
@@ -7321,6 +7456,9 @@ fn merge_provider_config(base: ProviderConfig, override_cfg: ProviderConfig) -> 
         context_window: override_cfg.context_window.or(base.context_window),
         mode: override_cfg.mode.or(base.mode),
         auth_mode: override_cfg.auth_mode.or(base.auth_mode),
+        oauth_credential_generation: override_cfg
+            .oauth_credential_generation
+            .or(base.oauth_credential_generation),
         insecure_skip_tls_verify: override_cfg
             .insecure_skip_tls_verify
             .or(base.insecure_skip_tls_verify),
@@ -7331,6 +7469,9 @@ fn merge_provider_config(base: ProviderConfig, override_cfg: ProviderConfig) -> 
             .or(base.reasoning_stream_style),
         max_concurrency: override_cfg.max_concurrency.or(base.max_concurrency),
         auth: override_cfg.auth.or(base.auth),
+        external_credentials: override_cfg
+            .external_credentials
+            .or(base.external_credentials),
         kind: override_cfg.kind.or(base.kind),
         api_key_env: override_cfg.api_key_env.or(base.api_key_env),
     }
@@ -7411,8 +7552,12 @@ fn merge_providers(
 fn load_single_config_file(path: &Path) -> Result<Config> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-    let parsed: ConfigFile = toml::from_str(&contents)
-        .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+    let parsed: ConfigFile = toml::from_str(&contents).map_err(|_| {
+        anyhow::anyhow!(
+            "Failed to parse config file {}; file contents were omitted",
+            codewhale_config::quote_os_path(path)
+        )
+    })?;
     Ok(parsed.base)
 }
 
@@ -7471,7 +7616,8 @@ fn apply_managed_overrides(config: &mut Config) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let managed = load_single_config_file(&path)?;
+    let mut managed = load_single_config_file(&path)?;
+    strip_external_credential_consent(&mut managed);
     let prior_route = (
         config.api_provider(),
         config.provider_identity_for(config.api_provider()),
@@ -7490,6 +7636,44 @@ fn apply_managed_overrides(config: &mut Config) -> Result<()> {
     }
     *config = merged;
     Ok(())
+}
+
+/// Organization-managed overlays may constrain routing and policy, but they
+/// cannot consent on a user's behalf to credential files owned by another
+/// CLI. Only the user config/profile loaded before this layer may carry these
+/// grants. A managed `disabled` record is a tightening tombstone and is kept
+/// so a lower-precedence user grant cannot survive an administrator deny.
+fn strip_external_credential_consent(config: &mut Config) {
+    if config.providers.is_none() {
+        return;
+    }
+    for provider in ApiProvider::all()
+        .iter()
+        .copied()
+        .filter(|provider| *provider != ApiProvider::Custom)
+    {
+        let external = &mut config
+            .provider_config_for_mut(provider)
+            .external_credentials;
+        if external.as_ref().is_some_and(|consent| {
+            consent.access != codewhale_config::ExternalCredentialAccess::Disabled
+        }) {
+            *external = None;
+        }
+    }
+    if let Some(providers) = config.providers.as_mut() {
+        for provider in providers.custom.values_mut() {
+            if provider
+                .external_credentials
+                .as_ref()
+                .is_some_and(|consent| {
+                    consent.access != codewhale_config::ExternalCredentialAccess::Disabled
+                })
+            {
+                provider.external_credentials = None;
+            }
+        }
+    }
 }
 
 fn config_defines_base_url_for_effective_route(source: &Config, effective: &Config) -> bool {
@@ -7525,8 +7709,12 @@ fn apply_requirements(config: &mut Config) -> Result<()> {
     }
     let contents = fs::read_to_string(&path)
         .with_context(|| format!("Failed to read requirements file: {}", path.display()))?;
-    let requirements: RequirementsFile = toml::from_str(&contents)
-        .with_context(|| format!("Failed to parse requirements file: {}", path.display()))?;
+    let requirements: RequirementsFile = toml::from_str(&contents).map_err(|_| {
+        anyhow::anyhow!(
+            "Failed to parse requirements file {}; file contents were omitted",
+            codewhale_config::quote_os_path(&path)
+        )
+    })?;
 
     if !requirements.allowed_approval_policies.is_empty()
         && let Some(policy) = config.approval_policy.as_ref()
@@ -7620,39 +7808,7 @@ pub fn ensure_parent_dir(path: &Path) -> Result<()> {
 /// Write content to a config file with restrictive permissions (owner-only read/write).
 /// On Unix this sets mode 0o600 before writing.
 fn write_config_file_secure(path: &Path, content: &str) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(content.as_bytes())?;
-        // The file was already opened with mode 0o600; the explicit
-        // set_permissions re-asserts that on filesystems where mode-at-open
-        // didn't take effect (or where the file already existed with broader
-        // bits). Filesystems that don't accept Unix chmod at all (Docker
-        // bind-mounts of NTFS, network shares — #897) return EPERM. Treat
-        // that as a warning rather than failing the whole save: the file
-        // contents are written, and on Windows/macOS hosts the parent file
-        // system's native ACL model is doing the access control.
-        if let Err(err) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
-            tracing::warn!(
-                target: "codewhale::config",
-                path = %path.display(),
-                error = %err,
-                "could not enforce 0o600 on config file; filesystem may \
-                 not support Unix chmod. File contents written; rely on \
-                 host ACLs for access control."
-            );
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, content)?;
-    }
-    Ok(())
+    codewhale_config::create_config_document(path, content)
 }
 
 /// Where a saved credential ended up. Returned by [`save_api_key`] so
@@ -7723,24 +7879,55 @@ fn save_root_api_key_for_secret_slot(
         .context("Failed to resolve config path: home directory not found.")?;
 
     if let Some(secrets) = credential_secret_store_for_save() {
-        match secrets.set(secret_slot, trimmed) {
-            Ok(()) => {
-                save_root_api_key_metadata_without_plaintext(&path, clear_deepseek_provider_slot)?;
-                codewhale_config::scrub_plaintext_api_keys_from_config_backup(&path)?;
-                let backend = secrets.backend_name().to_string();
-                log_sensitive_event(
-                    "credential.save",
-                    json!({
-                        "backend": backend.clone(),
-                        "config_path": path.display().to_string(),
-                        "plaintext_config_fallback": false,
-                    }),
+        let prior_secret = secrets.get(secret_slot);
+        match prior_secret.as_ref().map_err(|error| error.to_string()) {
+            Ok(_) => match secrets.set(secret_slot, trimmed) {
+                Ok(()) => {
+                    if let Err(error) = save_root_api_key_metadata_without_plaintext(
+                        &path,
+                        clear_deepseek_provider_slot,
+                    ) {
+                        let current = secrets.get(secret_slot).map_err(|rollback| {
+                        anyhow::anyhow!(
+                            "{error}; additionally could not verify secret-store rollback for {secret_slot}: {rollback}"
+                        )
+                    })?;
+                        if current.as_deref() == Some(trimmed) {
+                            match prior_secret.expect("snapshot succeeded before secret write") {
+                            Some(previous) => secrets.set(secret_slot, &previous),
+                            None => secrets.delete(secret_slot),
+                        }
+                        .map_err(|rollback| {
+                            anyhow::anyhow!(
+                                "{error}; additionally failed to restore prior secret-store state for {secret_slot}: {rollback}"
+                            )
+                        })?;
+                        }
+                        return Err(error);
+                    }
+                    codewhale_config::scrub_plaintext_api_keys_from_config_backup(&path)?;
+                    let backend = secrets.backend_name().to_string();
+                    log_sensitive_event(
+                        "credential.save",
+                        json!({
+                            "backend": backend.clone(),
+                            "config_path": path.display().to_string(),
+                            "plaintext_config_fallback": false,
+                        }),
+                    );
+                    return Ok(SavedCredential::KeyringAndConfigFile { backend, path });
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "secret-store write failed; key saved to config.toml only: {err}"
+                    );
+                    // Fall through to the ConfigFile-only outcome below.
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    "secret-store snapshot failed; key saved to config.toml only: {error}"
                 );
-                return Ok(SavedCredential::KeyringAndConfigFile { backend, path });
-            }
-            Err(err) => {
-                tracing::warn!("secret-store write failed; key saved to config.toml only: {err}");
-                // Fall through to the ConfigFile-only outcome below.
             }
         }
     }
@@ -7908,13 +8095,20 @@ pub fn active_provider_has_config_api_key(config: &Config) -> bool {
             .provider_config_for(provider)
             .is_some_and(provider_config_uses_kimi_imported_token)
     {
-        return kimi_imported_access_token_valid();
+        return false;
     }
     if provider == ApiProvider::OpenaiCodex && !custom_endpoint {
         // The persistent Codex login is the OAuth credential file, analogous to
         // a stored config key. Token env overrides are scored separately by
         // active_provider_has_env_api_key.
-        return crate::oauth::stored_credentials_present();
+        let path = crate::oauth::auth_file_path();
+        return config
+            .external_credential_read_grant(
+                provider,
+                codewhale_config::ExternalCredentialSource::CodexCli,
+                &path,
+            )
+            .is_ok_and(|grant| crate::oauth::stored_credentials_present(&grant));
     }
     if !custom_endpoint
         && matches!(provider, ApiProvider::Huggingface)
@@ -7994,16 +8188,23 @@ pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
     }
 
     if provider == ApiProvider::Moonshot && provider_uses_oauth_credentials(config, provider) {
-        return kimi_imported_access_token_valid();
+        return false;
     }
     if provider == ApiProvider::OpenaiCodex && !config.provider_uses_custom_endpoint(provider) {
-        // Token env overrides are checked above; also honor the Codex CLI OAuth
-        // login on disk.
-        return crate::oauth::credentials_present();
+        // Token env overrides are checked above. An external Codex login is
+        // considered only after exact read-only consent has been validated.
+        let path = crate::oauth::auth_file_path();
+        return config
+            .external_credential_read_grant(
+                provider,
+                codewhale_config::ExternalCredentialSource::CodexCli,
+                &path,
+            )
+            .is_ok_and(|grant| crate::oauth::stored_credentials_present(&grant));
     }
     if provider == ApiProvider::Xai
         && !config.provider_uses_custom_endpoint(provider)
-        && crate::xai_oauth::credentials_present()
+        && crate::xai_oauth::credentials_present(config)
     {
         // xAI supports both API keys and OAuth. A Grok-compatible token file is
         // sufficient, but its absence must fall through to the ordinary API-key
@@ -8048,6 +8249,40 @@ pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
     }
 
     false
+}
+
+impl Config {
+    /// Resolve one coherent Codex OAuth snapshot. The bearer and account id
+    /// must come from the same secure file handle; opening the external JSON a
+    /// second time could pair identities across an atomic owner refresh or a
+    /// hostile path swap.
+    pub(crate) fn codex_credentials(&self) -> Result<crate::oauth::CodexCredentials> {
+        if let Some(credentials) = crate::oauth::credentials_from_env() {
+            return Ok(credentials);
+        }
+        anyhow::ensure!(
+            self.api_provider() == ApiProvider::OpenaiCodex
+                && !self.provider_uses_custom_endpoint(ApiProvider::OpenaiCodex),
+            "Codex OAuth credentials are only available on the official OpenAI Codex route"
+        );
+        let path = crate::oauth::auth_file_path();
+        let grant = self.external_credential_read_grant(
+            ApiProvider::OpenaiCodex,
+            codewhale_config::ExternalCredentialSource::CodexCli,
+            &path,
+        )?;
+        crate::oauth::get_credentials(&grant)
+    }
+
+    /// ChatGPT account id for the already-selected Codex route. Environment
+    /// metadata remains independent; the external file is read only when the
+    /// exact provider/source/path consent tuple is valid.
+    #[cfg(test)]
+    pub(crate) fn codex_account_id(&self) -> Option<String> {
+        self.codex_credentials()
+            .ok()
+            .and_then(|credentials| credentials.account_id)
+    }
 }
 
 /// Whether a provider counts as "configured" for the default `/provider`
@@ -8135,6 +8370,8 @@ fn provider_config_is_explicit(entry: &ProviderConfig) -> bool {
         || entry.insecure_skip_tls_verify.is_some()
         || non_empty(entry.kind.as_ref())
         || non_empty(entry.api_key_env.as_ref())
+        || entry.external_credentials.is_some()
+        || non_empty(entry.oauth_credential_generation.as_ref())
 }
 
 /// Save an API key to the appropriate place for the given provider.
@@ -8161,10 +8398,23 @@ pub(crate) fn save_api_key_for_identity(
     route_config: &Config,
     api_key: &str,
 ) -> Result<PathBuf> {
+    if identity.provider == ApiProvider::Xai {
+        return codewhale_config::with_xai_oauth_revocation_transaction(|| {
+            save_api_key_for_identity_unlocked(identity, route_config, api_key)
+        });
+    }
+    save_api_key_for_identity_unlocked(identity, route_config, api_key)
+}
+
+fn save_api_key_for_identity_unlocked(
+    identity: &ProviderIdentity,
+    route_config: &Config,
+    api_key: &str,
+) -> Result<PathBuf> {
     let provider = identity.provider;
     if provider == ApiProvider::OpenaiCodex {
         anyhow::bail!(
-            "OpenAI Codex uses OAuth. Run `codex login` or set OPENAI_CODEX_ACCESS_TOKEN; Codewhale does not store an API key for this provider."
+            "OpenAI Codex uses OAuth. Run `codex login`, then grant exact read-only access with `codewhale auth external-consent --provider openai-codex --mode read-only`, or set OPENAI_CODEX_ACCESS_TOKEN for this process; Codewhale does not store an API key for this provider."
         );
     }
     let is_legacy_literal_custom = provider == ApiProvider::Custom
@@ -8216,44 +8466,86 @@ pub(crate) fn save_api_key_for_identity(
     if !route_config.should_skip_secret_store_for_provider(provider)
         && let Some(secrets) = credential_secret_store_for_save()
     {
-        match secrets.set(provider_secret_store_slot(provider), api_key) {
-            Ok(()) => {
-                crate::config_persistence::mutate_config_document(&config_path, |doc| {
-                    if pin_kimi_code_base_url {
-                        crate::config_persistence::set_document_value(
-                            doc,
-                            &["providers", key_inside, "base_url"],
-                            DEFAULT_KIMI_CODE_BASE_URL,
-                        )?;
+        let secret_slot = provider_secret_store_slot(provider);
+        let prior_secret = secrets.get(secret_slot);
+        match prior_secret.as_ref().map_err(|error| error.to_string()) {
+            Ok(_) => match secrets.set(secret_slot, api_key) {
+                Ok(()) => {
+                    let config_result =
+                        crate::config_persistence::mutate_config_document(&config_path, |doc| {
+                            if pin_kimi_code_base_url {
+                                crate::config_persistence::set_document_value(
+                                    doc,
+                                    &["providers", key_inside, "base_url"],
+                                    DEFAULT_KIMI_CODE_BASE_URL,
+                                )?;
+                            }
+                            crate::config_persistence::set_document_value(
+                                doc,
+                                &["providers", key_inside, "auth_mode"],
+                                "api_key",
+                            )?;
+                            crate::config_persistence::unset_document_value(
+                                doc,
+                                &["providers", key_inside, "external_credentials"],
+                            )?;
+                            if provider == ApiProvider::Xai {
+                                crate::config_persistence::unset_document_value(
+                                    doc,
+                                    &["providers", key_inside, "oauth_credential_generation"],
+                                )?;
+                            }
+                            crate::config_persistence::unset_document_value(
+                                doc,
+                                &["providers", key_inside, "api_key"],
+                            )?;
+                            Ok(())
+                        })
+                        .with_context(|| {
+                            format!("Failed to write config to {}", config_path.display())
+                        });
+                    if let Err(error) = config_result {
+                        let current = secrets.get(secret_slot).map_err(|rollback| {
+                        anyhow::anyhow!(
+                            "{error}; additionally could not verify secret-store rollback for {secret_slot}: {rollback}"
+                        )
+                    })?;
+                        if current.as_deref() == Some(api_key) {
+                            match prior_secret.expect("snapshot succeeded before secret write") {
+                            Some(previous) => secrets.set(secret_slot, &previous),
+                            None => secrets.delete(secret_slot),
+                        }
+                        .map_err(|rollback| {
+                            anyhow::anyhow!(
+                                "{error}; additionally failed to restore prior secret-store state for {secret_slot}: {rollback}"
+                            )
+                        })?;
+                        }
+                        return Err(error);
                     }
-                    crate::config_persistence::set_document_value(
-                        doc,
-                        &["providers", key_inside, "auth_mode"],
-                        "api_key",
-                    )?;
-                    crate::config_persistence::unset_document_value(
-                        doc,
-                        &["providers", key_inside, "api_key"],
-                    )?;
-                    Ok(())
-                })
-                .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
-                codewhale_config::scrub_plaintext_api_keys_from_config_backup(&config_path)?;
-                log_sensitive_event(
-                    "credential.save",
-                    json!({
-                        "backend": secrets.backend_name(),
-                        "provider": identity.key,
-                        "config_path": config_path.display().to_string(),
-                        "plaintext_config_fallback": false,
-                    }),
-                );
-                return Ok(config_path);
-            }
-            Err(err) => {
+                    codewhale_config::scrub_plaintext_api_keys_from_config_backup(&config_path)?;
+                    log_sensitive_event(
+                        "credential.save",
+                        json!({
+                            "backend": secrets.backend_name(),
+                            "provider": identity.key,
+                            "config_path": config_path.display().to_string(),
+                            "plaintext_config_fallback": false,
+                        }),
+                    );
+                    return Ok(config_path);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        provider = %identity.key,
+                        "secret-store write failed; key saved to config.toml only: {err}"
+                    );
+                }
+            },
+            Err(error) => {
                 tracing::warn!(
                     provider = %identity.key,
-                    "secret-store write failed; key saved to config.toml only: {err}"
+                    "secret-store snapshot failed; key saved to config.toml only: {error}"
                 );
             }
         }
@@ -8274,6 +8566,16 @@ pub(crate) fn save_api_key_for_identity(
             &["providers", key_inside, "auth_mode"],
             "api_key",
         )?;
+        crate::config_persistence::unset_document_value(
+            doc,
+            &["providers", key_inside, "external_credentials"],
+        )?;
+        if provider == ApiProvider::Xai {
+            crate::config_persistence::unset_document_value(
+                doc,
+                &["providers", key_inside, "oauth_credential_generation"],
+            )?;
+        }
         crate::config_persistence::set_document_value(
             doc,
             &["providers", key_inside, "api_key"],
@@ -8341,39 +8643,137 @@ pub(crate) fn save_provider_model_for_identity(
     Ok(config_path)
 }
 
-pub fn save_provider_auth_mode_for_at(
-    provider: ApiProvider,
-    auth_mode: &str,
+/// Persist an explicitly confirmed read-only external credential grant and
+/// update the live mirror only after the comment-preserving disk mutation
+/// succeeds. This function never inspects the external path.
+pub(crate) fn persist_external_credential_consent_for_at(
     config_path: Option<&Path>,
+    live_config: &mut Config,
+    provider: ApiProvider,
+    consent_provider: codewhale_config::ProviderKind,
+    source: codewhale_config::ExternalCredentialSource,
+    path: &Path,
 ) -> Result<PathBuf> {
+    let expected = match provider {
+        ApiProvider::OpenaiCodex => (
+            codewhale_config::ProviderKind::OpenaiCodex,
+            codewhale_config::ExternalCredentialSource::CodexCli,
+        ),
+        ApiProvider::Xai => (
+            codewhale_config::ProviderKind::Xai,
+            codewhale_config::ExternalCredentialSource::GrokCli,
+        ),
+        _ => anyhow::bail!(
+            "{} has no supported external credential owner",
+            provider.as_str()
+        ),
+    };
+    anyhow::ensure!(
+        (consent_provider, source) == expected,
+        "external credential owner does not match provider {}",
+        provider.as_str()
+    );
+    let path = codewhale_config::resolve_external_credential_path(path)?;
+    let path_value = path.to_str().context(
+        "external credential path cannot be persisted losslessly because it is not valid UTF-8",
+    )?;
     let config_path = match config_path {
         Some(path) => path.to_path_buf(),
         None => default_config_path()
             .context("Failed to resolve config path: home directory not found.")?,
     };
     ensure_parent_dir(&config_path)?;
-    let key_inside = provider_config_key(provider).context("provider auth mode key")?;
+    let key_inside = provider_config_key(provider).context("external credential provider key")?;
     crate::config_persistence::mutate_config_document(&config_path, |doc| {
         crate::config_persistence::set_document_value(
             doc,
             &["providers", key_inside, "auth_mode"],
-            auth_mode,
+            "oauth",
+        )?;
+        let prefix = &["providers", key_inside, "external_credentials"];
+        crate::config_persistence::set_document_value(
+            doc,
+            &[prefix[0], prefix[1], prefix[2], "access"],
+            "read_only",
+        )?;
+        crate::config_persistence::set_document_value(
+            doc,
+            &[prefix[0], prefix[1], prefix[2], "provider"],
+            consent_provider.as_str(),
+        )?;
+        crate::config_persistence::set_document_value(
+            doc,
+            &[prefix[0], prefix[1], prefix[2], "source"],
+            source.as_str(),
+        )?;
+        crate::config_persistence::set_document_value(
+            doc,
+            &[prefix[0], prefix[1], prefix[2], "path"],
+            path_value,
+        )?;
+        crate::config_persistence::set_document_value(
+            doc,
+            &[prefix[0], prefix[1], prefix[2], "consent_version"],
+            i64::from(codewhale_config::EXTERNAL_CREDENTIAL_CONSENT_VERSION),
         )
     })
-    .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
-    log_sensitive_event(
-        "credential.auth_mode.set",
-        json!({
-            "backend": "config_file",
-            "provider": provider.as_str(),
-            "auth_mode": auth_mode,
-            "config_path": config_path.display().to_string(),
-        }),
-    );
+    .with_context(|| {
+        format!(
+            "Failed to write config to {}",
+            codewhale_config::quote_os_path(&config_path)
+        )
+    })?;
+    live_config
+        .providers
+        .get_or_insert_with(ProvidersConfig::default);
+    let entry = live_config.provider_config_for_mut(provider);
+    entry.auth_mode = Some("oauth".to_string());
+    entry.external_credentials = Some(codewhale_config::ExternalCredentialConsentToml::read_only(
+        consent_provider,
+        source,
+        path,
+    ));
     Ok(config_path)
 }
 
-fn provider_config_key(provider: ApiProvider) -> Result<&'static str> {
+/// Revoke one provider's external-file access without inspecting that file.
+pub(crate) fn revoke_external_credential_consent_for_at(
+    config_path: Option<&Path>,
+    live_config: &mut Config,
+    provider: ApiProvider,
+) -> Result<PathBuf> {
+    anyhow::ensure!(
+        matches!(provider, ApiProvider::OpenaiCodex | ApiProvider::Xai),
+        "{} has no supported external credential owner",
+        provider.as_str()
+    );
+    let config_path = match config_path {
+        Some(path) => path.to_path_buf(),
+        None => default_config_path()
+            .context("Failed to resolve config path: home directory not found.")?,
+    };
+    ensure_parent_dir(&config_path)?;
+    let key_inside = provider_config_key(provider).context("external credential provider key")?;
+    crate::config_persistence::mutate_config_document(&config_path, |doc| {
+        crate::config_persistence::unset_document_value(
+            doc,
+            &["providers", key_inside, "external_credentials"],
+        )?;
+        Ok(())
+    })
+    .with_context(|| {
+        format!(
+            "Failed to write config to {}",
+            codewhale_config::quote_os_path(&config_path)
+        )
+    })?;
+    live_config
+        .provider_config_for_mut(provider)
+        .external_credentials = None;
+    Ok(config_path)
+}
+
+pub(crate) fn provider_config_key(provider: ApiProvider) -> Result<&'static str> {
     if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
         anyhow::bail!("DeepSeek stores auth at the root config level");
     }
@@ -8474,125 +8874,6 @@ fn missing_provider_api_key_message(provider: ApiProvider) -> Result<String> {
     ))
 }
 
-const KIMI_CODE_CREDENTIAL_FILE: &str = "kimi-code.json";
-
-#[derive(Debug, Clone, Deserialize)]
-struct KimiImportedCredential {
-    access_token: Option<String>,
-    expires_at: Option<f64>,
-}
-
-fn kimi_imported_access_token() -> Result<String> {
-    let path = kimi_imported_credential_path()?;
-    let raw = fs::read_to_string(&path).with_context(|| {
-        format!(
-            "Imported Kimi CLI credentials were not found at {}. CodeWhale does not provide \
-             Kimi OAuth login or refresh; configure a Kimi Code API key at \
-             https://api.kimi.com/coding/v1 instead. First-class OAuth remains tracked in #4417.",
-            path.display()
-        )
-    })?;
-    let credential: KimiImportedCredential = serde_json::from_str(&raw).context(
-        "Failed to parse imported Kimi CLI credentials. CodeWhale will not repair or refresh \
-         that file; configure a Kimi Code API key at https://api.kimi.com/coding/v1 instead \
-         (#4417)",
-    )?;
-
-    if kimi_imported_access_token_is_fresh(&credential) {
-        return credential
-            .access_token
-            .filter(|token| !token.trim().is_empty())
-            .context("Imported Kimi CLI access token is empty");
-    }
-
-    anyhow::bail!(
-        "Imported Kimi CLI access token is expired or expires within 60 seconds. CodeWhale \
-         cannot refresh Kimi OAuth without its own vendor-registered client identity. Remove \
-         auth_mode = \"kimi_oauth\" and configure a Kimi Code API key at \
-         https://api.kimi.com/coding/v1; first-class OAuth remains tracked in #4417."
-    )
-}
-
-fn kimi_imported_access_token_is_fresh(credential: &KimiImportedCredential) -> bool {
-    let Some(now) = now_unix_secs() else {
-        return false;
-    };
-
-    credential
-        .access_token
-        .as_deref()
-        .is_some_and(|token| !token.trim().is_empty())
-        && credential
-            .expires_at
-            .is_some_and(|expires_at| expires_at - now > 60.0)
-}
-
-fn kimi_imported_credential_path() -> Result<PathBuf> {
-    if let Some(kimi_code_home) = kimi_code_home_override() {
-        return Ok(kimi_cli_credential_path(kimi_code_home));
-    }
-
-    let modern_path = effective_home_dir()
-        .map(|home| kimi_cli_credential_path(home.join(".kimi-code")))
-        .context("Failed to resolve Kimi Code home directory")?;
-    if modern_path.exists() {
-        return Ok(modern_path);
-    }
-
-    if let Some(legacy_share_dir) = kimi_legacy_share_dir_override() {
-        return Ok(kimi_cli_credential_path(legacy_share_dir));
-    }
-
-    if let Some(legacy_path) = effective_home_dir()
-        .map(|home| kimi_cli_credential_path(home.join(".kimi")))
-        .filter(|path| path.exists())
-    {
-        return Ok(legacy_path);
-    }
-
-    Ok(modern_path)
-}
-
-fn kimi_code_home_override() -> Option<PathBuf> {
-    std::env::var_os("KIMI_CODE_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
-fn kimi_legacy_share_dir_override() -> Option<PathBuf> {
-    std::env::var_os("KIMI_SHARE_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
-fn kimi_cli_credential_path(home: PathBuf) -> PathBuf {
-    home.join("credentials").join(KIMI_CODE_CREDENTIAL_FILE)
-}
-
-fn now_unix_secs() -> Option<f64> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs_f64())
-        .ok()
-}
-
-/// Prompt-free check for an imported Kimi CLI access token that CodeWhale may
-/// use without impersonating or refreshing the official client. Refresh-only,
-/// expired, malformed, and empty credentials are deliberately unusable.
-#[must_use]
-pub fn kimi_imported_access_token_valid() -> bool {
-    let Ok(path) = kimi_imported_credential_path() else {
-        return false;
-    };
-    let Ok(raw) = fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(credential) = serde_json::from_str::<KimiImportedCredential>(&raw) else {
-        return false;
-    };
-    kimi_imported_access_token_is_fresh(&credential)
-}
-
 /// Clear the API key from config-file storage.
 ///
 /// `/logout` calls this to wipe credentials so the next request can't
@@ -8607,6 +8888,10 @@ pub fn kimi_imported_access_token_valid() -> bool {
 /// (Path 0) ensures a freshly-entered key still wins over a stale env
 /// var that lingers from a previous session.
 pub fn clear_api_key() -> Result<()> {
+    codewhale_config::with_xai_oauth_revocation_transaction(clear_api_key_unlocked)
+}
+
+fn clear_api_key_unlocked() -> Result<()> {
     // Strip api_key entries from config.toml, including provider-scoped
     // nested entries. Clearing a config file must not trigger platform
     // credential prompts.
@@ -8619,6 +8904,15 @@ pub fn clear_api_key() -> Result<()> {
 
     crate::config_persistence::mutate_config_document(&config_path, |doc| {
         crate::config_persistence::remove_document_key_recursive(doc.as_table_mut(), "api_key");
+        crate::config_persistence::unset_document_value(
+            doc,
+            &["providers", "xai", "oauth_credential_generation"],
+        )?;
+        crate::config_persistence::unset_document_value(doc, &["providers", "xai", "auth_mode"])?;
+        crate::config_persistence::unset_document_value(
+            doc,
+            &["providers", "xai", "external_credentials"],
+        )?;
         Ok(())
     })
     .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
@@ -8639,6 +8933,15 @@ pub fn clear_api_key() -> Result<()> {
 /// removes only the key for the specified provider section (plus the
 /// legacy root `api_key` when the provider is DeepSeek).
 pub fn clear_active_provider_api_key(provider: &str) -> Result<()> {
+    if provider == ApiProvider::Xai.as_str() {
+        return codewhale_config::with_xai_oauth_revocation_transaction(|| {
+            clear_active_provider_api_key_unlocked(provider)
+        });
+    }
+    clear_active_provider_api_key_unlocked(provider)
+}
+
+fn clear_active_provider_api_key_unlocked(provider: &str) -> Result<()> {
     let config_path = default_config_path()
         .context("Failed to resolve config path: home directory not found.")?;
 
@@ -8651,8 +8954,12 @@ pub fn clear_active_provider_api_key(provider: &str) -> Result<()> {
     // mutation so logout clears exactly one credential scope.
     let persisted = fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config from {}", config_path.display()))?;
-    let persisted_config: Config = toml::from_str(&persisted)
-        .with_context(|| format!("Failed to parse config from {}", config_path.display()))?;
+    let persisted_config: Config = toml::from_str(&persisted).map_err(|_| {
+        anyhow::anyhow!(
+            "Failed to parse config from {}; file contents were omitted",
+            codewhale_config::quote_os_path(&config_path)
+        )
+    })?;
     let exact_literal_custom_table = provider == ApiProvider::Custom.as_str()
         && persisted_config
             .providers
@@ -8676,6 +8983,20 @@ pub fn clear_active_provider_api_key(provider: &str) -> Result<()> {
             crate::config_persistence::unset_document_value(
                 doc,
                 &["providers", provider, "api_key"],
+            )?;
+        }
+        if provider == ApiProvider::Xai.as_str() {
+            crate::config_persistence::unset_document_value(
+                doc,
+                &["providers", "xai", "oauth_credential_generation"],
+            )?;
+            crate::config_persistence::unset_document_value(
+                doc,
+                &["providers", "xai", "auth_mode"],
+            )?;
+            crate::config_persistence::unset_document_value(
+                doc,
+                &["providers", "xai", "external_credentials"],
             )?;
         }
         Ok(())

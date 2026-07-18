@@ -2581,8 +2581,12 @@ pub fn load_config(path: &Path) -> Result<McpConfig> {
     let Some(contents) = read_mcp_config_file(path)? else {
         return Ok(McpConfig::default());
     };
-    serde_json::from_str(&contents)
-        .with_context(|| format!("Failed to parse MCP config {}", path.display()))
+    serde_json::from_str(&contents).map_err(|_| {
+        anyhow::anyhow!(
+            "Failed to parse MCP config {}; file contents were omitted",
+            codewhale_config::quote_os_path(path)
+        )
+    })
 }
 
 fn read_mcp_config_file(path: &Path) -> Result<Option<String>> {

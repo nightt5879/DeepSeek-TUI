@@ -1338,6 +1338,29 @@ enum AuthCommand {
     /// Sign in to xAI/Grok with an SSH-friendly device code.
     #[command(name = "xai-device")]
     XaiDevice,
+    /// Explicitly allow read-only access to one credential file owned by
+    /// another CLI. Managed mutation is currently unsupported and fails closed.
+    #[command(name = "external-consent")]
+    ExternalConsent {
+        #[arg(long, value_enum)]
+        provider: ProviderArg,
+        #[arg(long, value_enum)]
+        mode: ExternalCredentialModeArg,
+        /// Exact credential file path. Defaults to the selected CLI's resolved
+        /// path without probing whether the file exists.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+        /// Confirm the disclosed exact read-only grant without an interactive
+        /// prompt. Required when stdin is not a terminal.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
+    /// Revoke access to another CLI's credential file for one provider.
+    #[command(name = "external-revoke")]
+    ExternalRevoke {
+        #[arg(long, value_enum)]
+        provider: ProviderArg,
+    },
     /// Show current provider and credential source state.
     /// Without `--provider`, shows all known providers.
     /// With `--provider`, shows detailed status for that provider.
@@ -1380,6 +1403,12 @@ enum AuthCommand {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ExternalCredentialModeArg {
+    ReadOnly,
+    Managed,
 }
 
 #[derive(Debug, Args)]
@@ -1848,7 +1877,7 @@ fn run_login_command_with_secrets(
     let destination = if secret_store_saved {
         secrets.backend_name().to_string()
     } else {
-        store.path().display().to_string()
+        codewhale_config::quote_os_path(store.path())
     };
     if provider == ProviderKind::Deepseek {
         println!("logged in using API key mode (deepseek); saved key to {destination}");
@@ -1866,14 +1895,35 @@ fn run_logout_command(store: &mut ConfigStore) -> Result<()> {
 }
 
 fn run_logout_command_with_secrets(store: &mut ConfigStore, secrets: &Secrets) -> Result<()> {
+    codewhale_config::with_xai_oauth_revocation_transaction(|| {
+        run_logout_command_with_secrets_unlocked(store, secrets)
+    })
+}
+
+fn run_logout_command_with_secrets_unlocked(
+    store: &mut ConfigStore,
+    secrets: &Secrets,
+) -> Result<()> {
+    let original_config = store.config.clone();
     let active_provider = store.config.provider;
     store.config.api_key = None;
     for provider in ProviderKind::ALL {
         clear_provider_api_key_from_config(store, provider);
+        store
+            .config
+            .providers
+            .for_provider_mut(provider)
+            .external_credentials = None;
+    }
+    let xai = store.config.providers.for_provider_mut(ProviderKind::Xai);
+    xai.oauth_credential_generation = None;
+    xai.auth_mode = None;
+    store.config.auth_mode = None;
+    if let Err(error) = store.save() {
+        store.config = original_config;
+        return Err(error);
     }
     clear_provider_api_key_from_keyring(secrets, active_provider);
-    store.config.auth_mode = None;
-    store.save()?;
     println!("logged out");
     Ok(())
 }
@@ -1908,7 +1958,12 @@ fn write_provider_api_key_to_config(
 
 fn prepare_provider_api_key_metadata(store: &mut ConfigStore, provider: ProviderKind) {
     store.config.auth_mode = Some("api_key".to_string());
-    store.config.providers.for_provider_mut(provider).auth_mode = Some("api_key".to_string());
+    let provider_config = store.config.providers.for_provider_mut(provider);
+    provider_config.auth_mode = Some("api_key".to_string());
+    provider_config.external_credentials = None;
+    if provider == ProviderKind::Xai {
+        provider_config.oauth_credential_generation = None;
+    }
     if provider == ProviderKind::Deepseek && store.config.default_text_model.is_none() {
         store.config.default_text_model = Some(
             store
@@ -1930,24 +1985,99 @@ fn persist_provider_api_key(
     provider: ProviderKind,
     api_key: &str,
 ) -> Result<bool> {
+    if provider == ProviderKind::Xai {
+        return codewhale_config::with_xai_oauth_revocation_transaction(|| {
+            persist_provider_api_key_unlocked(store, secrets, provider, api_key)
+        });
+    }
+    persist_provider_api_key_unlocked(store, secrets, provider, api_key)
+}
+
+fn persist_provider_api_key_unlocked(
+    store: &mut ConfigStore,
+    secrets: &Secrets,
+    provider: ProviderKind,
+    api_key: &str,
+) -> Result<bool> {
+    let original_config = store.config.clone();
     prepare_provider_api_key_metadata(store, provider);
-    let secret_store_saved = match secrets.set(provider_slot(provider), api_key) {
-        Ok(()) => {
-            clear_provider_api_key_from_config(store, provider);
-            true
-        }
-        Err(err) => {
+    let slot = provider_slot(provider);
+    // A readable prior value is required before a secret-store write so a
+    // later config failure can restore the exact prior state. If the backend
+    // cannot provide that snapshot, use the owner-only config fallback.
+    let prior_secret = secrets.get(slot);
+    let secret_store_saved = match prior_secret.as_ref().map_err(|error| error.to_string()) {
+        Ok(_) => match secrets.set(slot, api_key) {
+            Ok(()) => {
+                clear_provider_api_key_from_config(store, provider);
+                true
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: secret-store write failed for {}; using owner-only config fallback: {err}",
+                    provider_slot(provider)
+                );
+                write_provider_api_key_to_config(store, provider, api_key);
+                false
+            }
+        },
+        Err(error) => {
             eprintln!(
-                "warning: secret-store write failed for {}; using owner-only config fallback: {err}",
-                provider_slot(provider)
+                "warning: secret-store snapshot failed for {slot}; using owner-only config fallback: {error}"
             );
             write_provider_api_key_to_config(store, provider, api_key);
             false
         }
     };
-    store.save()?;
+    if let Err(error) = store.save() {
+        store.config = original_config;
+        if secret_store_saved {
+            let current = secrets
+                .get(slot)
+                .map_err(|rollback| anyhow::anyhow!(
+                    "{error}; additionally could not verify secret-store rollback for {slot}: {rollback}"
+                ))?;
+            if current.as_deref() == Some(api_key) {
+                match prior_secret.expect("snapshot succeeded before secret write") {
+                    Some(previous) => secrets.set(slot, &previous),
+                    None => secrets.delete(slot),
+                }
+                .map_err(|rollback| anyhow::anyhow!(
+                    "{error}; additionally failed to restore prior secret-store state for {slot}: {rollback}"
+                ))?;
+            }
+        }
+        return Err(error);
+    }
     codewhale_config::scrub_plaintext_api_keys_from_config_backup(store.path())?;
     Ok(secret_store_saved)
+}
+
+fn clear_auth_provider(
+    store: &mut ConfigStore,
+    secrets: &Secrets,
+    provider: ProviderKind,
+) -> Result<()> {
+    let slot = provider_slot(provider);
+    let original_config = store.config.clone();
+    clear_provider_api_key_from_config(store, provider);
+    if provider == ProviderKind::Xai {
+        let xai = store.config.providers.for_provider_mut(provider);
+        xai.oauth_credential_generation = None;
+        xai.auth_mode = None;
+        xai.external_credentials = None;
+    }
+    if let Err(error) = store.save() {
+        store.config = original_config;
+        return Err(error);
+    }
+    clear_provider_api_key_from_keyring(secrets, provider);
+    if provider == ProviderKind::Xai {
+        println!("cleared xAI credentials from config, secret store, and owned OAuth storage");
+    } else {
+        println!("cleared API key for {slot} from config and secret store");
+    }
+    Ok(())
 }
 
 fn clear_provider_api_key_from_config(store: &mut ConfigStore, provider: ProviderKind) {
@@ -1978,7 +2108,7 @@ fn openai_codex_auth_file_path() -> PathBuf {
     if let Ok(path) = std::env::var("OPENAI_CODEX_AUTH_FILE") {
         let path = PathBuf::from(path);
         if !path.as_os_str().is_empty() {
-            return path;
+            return codewhale_config::resolve_external_credential_path(&path).unwrap_or(path);
         }
     }
 
@@ -1989,11 +2119,57 @@ fn openai_codex_auth_file_path() -> PathBuf {
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".codex")
         });
-    codex_home.join("auth.json")
+    let path = codex_home.join("auth.json");
+    codewhale_config::resolve_external_credential_path(&path).unwrap_or(path)
 }
 
-fn provider_oauth_file_path(provider: ProviderKind) -> Option<PathBuf> {
-    (provider == ProviderKind::OpenaiCodex).then(openai_codex_auth_file_path)
+fn grok_auth_file_path() -> PathBuf {
+    for key in ["GROK_AUTH_PATH", "XAI_AUTH_PATH"] {
+        if let Ok(path) = std::env::var(key) {
+            let path = PathBuf::from(path.trim());
+            if !path.as_os_str().is_empty() {
+                return codewhale_config::resolve_external_credential_path(&path).unwrap_or(path);
+            }
+        }
+    }
+    if let Ok(home) = std::env::var("GROK_HOME") {
+        let home = PathBuf::from(home.trim());
+        if !home.as_os_str().is_empty() {
+            let path = home.join("auth.json");
+            return codewhale_config::resolve_external_credential_path(&path).unwrap_or(path);
+        }
+    }
+    let path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".grok")
+        .join("auth.json");
+    codewhale_config::resolve_external_credential_path(&path).unwrap_or(path)
+}
+
+fn external_credential_target(
+    provider: ProviderKind,
+    path_override: Option<PathBuf>,
+) -> Result<(codewhale_config::ExternalCredentialSource, PathBuf)> {
+    let (source, default_path) = match provider {
+        ProviderKind::OpenaiCodex => (
+            codewhale_config::ExternalCredentialSource::CodexCli,
+            openai_codex_auth_file_path(),
+        ),
+        ProviderKind::Xai => (
+            codewhale_config::ExternalCredentialSource::GrokCli,
+            grok_auth_file_path(),
+        ),
+        ProviderKind::Moonshot => bail!(
+            "Kimi is API-key-only in Codewhale. Create a key at https://platform.kimi.ai/console/api-keys; Kimi CLI OAuth import is unsupported."
+        ),
+        _ => bail!(
+            "{} has no supported external CLI credential source",
+            provider.as_str()
+        ),
+    };
+    let path =
+        codewhale_config::resolve_external_credential_path(path_override.unwrap_or(default_path))?;
+    Ok((source, path))
 }
 
 fn provider_config_api_key(store: &ConfigStore, provider: ProviderKind) -> Option<&str> {
@@ -2029,6 +2205,64 @@ fn clear_provider_api_key_from_keyring(secrets: &Secrets, provider: ProviderKind
     let _ = secrets.delete(provider_slot(provider));
 }
 
+fn external_consent(
+    store: &ConfigStore,
+    provider: ProviderKind,
+) -> Option<&codewhale_config::ExternalCredentialConsentToml> {
+    store
+        .config
+        .providers
+        .for_provider(provider)
+        .external_credentials
+        .as_ref()
+}
+
+fn external_read_consent(
+    store: &ConfigStore,
+    provider: ProviderKind,
+) -> Option<&codewhale_config::ExternalCredentialConsentToml> {
+    let source = match provider {
+        ProviderKind::OpenaiCodex => codewhale_config::ExternalCredentialSource::CodexCli,
+        ProviderKind::Xai => codewhale_config::ExternalCredentialSource::GrokCli,
+        _ => return None,
+    };
+    external_consent(store, provider)
+        .filter(|consent| consent.read_grant(provider, source, &consent.path).is_ok())
+}
+
+fn external_oauth_selected(store: &ConfigStore, provider: ProviderKind) -> bool {
+    if external_read_consent(store, provider).is_none() {
+        return false;
+    }
+    if provider == ProviderKind::OpenaiCodex {
+        return true;
+    }
+    provider == ProviderKind::Xai
+        && store
+            .config
+            .providers
+            .xai
+            .auth_mode
+            .as_deref()
+            .is_some_and(|mode| {
+                matches!(
+                    mode.trim()
+                        .to_ascii_lowercase()
+                        .replace(['-', ' '], "_")
+                        .as_str(),
+                    "oauth"
+                        | "xai_oauth"
+                        | "xai"
+                        | "grok"
+                        | "grok_oauth"
+                        | "grok_cli"
+                        | "device"
+                        | "device_code"
+                        | "device_auth"
+                )
+            })
+}
+
 fn auth_status_all_providers(store: &ConfigStore, secrets: &Secrets) -> Vec<String> {
     let active_provider = store.config.provider;
     let mut lines = Vec::new();
@@ -2047,7 +2281,7 @@ fn auth_status_all_providers(store: &ConfigStore, secrets: &Secrets) -> Vec<Stri
         let config_key = provider_config_api_key(store, provider);
         let keyring_key = provider_keyring_api_key(secrets, provider);
         let env_key = provider_env_value(provider);
-        let oauth_file_present = provider_oauth_file_path(provider).is_some_and(|p| p.exists());
+        let external_selected = external_oauth_selected(store, provider);
 
         let config_status = config_key.map(|_| "set").unwrap_or("-");
         let keyring_status = keyring_key.as_ref().map(|_| "set").unwrap_or("-");
@@ -2059,19 +2293,19 @@ fn auth_status_all_providers(store: &ConfigStore, secrets: &Secrets) -> Vec<Stri
             // consulted for it.
             if env_key.is_some() {
                 "env"
-            } else if oauth_file_present {
-                "oauth file"
+            } else if external_selected {
+                "external consent (not probed)"
             } else {
                 "unset"
             }
+        } else if external_selected {
+            "external consent (not probed)"
         } else if config_key.is_some() {
             "config"
         } else if keyring_key.is_some() {
             "keyring"
         } else if env_key.is_some() {
             "env"
-        } else if oauth_file_present {
-            "oauth file"
         } else {
             "unset"
         };
@@ -2107,15 +2341,17 @@ fn auth_list_lines(store: &ConfigStore, secrets: &Secrets) -> Vec<String> {
         let file = provider_config_set(store, provider);
         let keyring = (!file).then(|| provider_keyring_set(secrets, provider));
         let env = provider_env_set(provider);
-        let oauth_file = provider_oauth_file_path(provider).is_some_and(|p| p.exists());
+        let external_selected = external_oauth_selected(store, provider);
         let active = if provider == ProviderKind::OpenaiCodex {
             if env {
                 "env"
-            } else if oauth_file {
-                "oauth"
+            } else if external_selected {
+                "external-consent"
             } else {
                 "missing"
             }
+        } else if external_selected {
+            "external-consent"
         } else if file {
             "config"
         } else if keyring == Some(true) {
@@ -2143,17 +2379,19 @@ fn auth_status_lines_for_provider(
     let config_key = provider_config_api_key(store, provider);
     let keyring_key = provider_keyring_api_key(secrets, provider);
     let env_key = provider_env_value(provider);
-    let oauth_file = provider_oauth_file_path(provider);
-    let oauth_file_present = oauth_file.as_ref().is_some_and(|path| path.exists());
+    let external = external_consent(store, provider);
+    let external_selected = external_oauth_selected(store, provider);
 
     let active_source = if provider == ProviderKind::OpenaiCodex {
         if env_key.is_some() {
             "env"
-        } else if oauth_file_present {
-            "Codex OAuth file"
+        } else if external_selected {
+            "external read-only consent (availability not probed)"
         } else {
             "missing"
         }
+    } else if external_selected {
+        "external read-only consent (availability not probed)"
     } else if config_key.is_some() {
         "config"
     } else if keyring_key.is_some() {
@@ -2192,14 +2430,20 @@ fn auth_status_lines_for_provider(
     let model = provider_cfg.model.as_deref().unwrap_or("(default)");
 
     let lookup_order = if provider == ProviderKind::OpenaiCodex {
-        "lookup order: env -> Codex OAuth file".to_string()
+        "lookup order: env -> consent-gated exact Codex CLI file".to_string()
+    } else if provider == ProviderKind::Xai && external_selected {
+        "lookup order: Codewhale-owned OAuth -> consent-gated exact Grok CLI file -> API key fallback".to_string()
     } else {
         "lookup order: config -> secret store -> env".to_string()
     };
     let auth_mode = if provider == ProviderKind::OpenaiCodex {
         "codex_oauth"
     } else {
-        store.config.auth_mode.as_deref().unwrap_or("api_key")
+        provider_cfg
+            .auth_mode
+            .as_deref()
+            .or(store.config.auth_mode.as_deref())
+            .unwrap_or("api_key")
     };
 
     let mut lines = vec![
@@ -2211,7 +2455,7 @@ fn auth_status_lines_for_provider(
         lookup_order,
         format!(
             "config file: {} ({})",
-            store.path().display(),
+            codewhale_config::quote_os_path(store.path()),
             source_status(config_key, "missing")
         ),
         format!(
@@ -2221,9 +2465,33 @@ fn auth_status_lines_for_provider(
         ),
         format!("env var: {env_var_label} ({env_status})"),
     ];
-    if let Some(path) = oauth_file {
-        let status = if path.exists() { "present" } else { "missing" };
-        lines.push(format!("Codex OAuth file: {} ({status})", path.display()));
+    if let Ok((source, expected_path)) = external_credential_target(provider, None) {
+        let status = codewhale_config::external_credential_consent_status(
+            external,
+            provider,
+            source,
+            &expected_path,
+            store.config.provider,
+        );
+        lines.push(format!(
+            "external credentials: {} (provider={}, source={}, owner={}, path={}, consent_version={}, state={}, scope_valid={}, ambient_path_changed={}; file not probed)",
+            status.access.as_str(),
+            status.provider,
+            status.source.as_str(),
+            status.owner,
+            codewhale_config::quote_os_path(&status.path),
+            status.consent_version,
+            status.route_state,
+            status.scope_valid,
+            status.ambient_path_changed,
+        ));
+        lines.push(format!("semantics: {}", status.semantics));
+        lines.push(format!("revoke: {}", status.revoke_command));
+        if let Some(warning) = status.ambient_path_warning() {
+            lines.push(warning);
+        }
+    } else {
+        lines.push("external credentials: disabled (no file was probed)".to_string());
     }
     lines
 }
@@ -2256,6 +2524,99 @@ fn run_auth_command_with_secrets(
     match command {
         AuthCommand::XaiDevice => {
             bail!("xAI device authentication must be delegated to codewhale-tui")
+        }
+        AuthCommand::ExternalConsent {
+            provider,
+            mode,
+            path,
+            yes,
+        } => {
+            let provider: ProviderKind = provider.into();
+            let (source, path) = external_credential_target(provider, path)?;
+            let preview = external_consent_preview_lines(provider, source, &path);
+            for line in &preview {
+                println!("{line}");
+            }
+            if mode == ExternalCredentialModeArg::Managed {
+                bail!(
+                    "managed external credential access is unsupported in v0.9.1: no provider has a reviewed schema-safe preservation adapter. Use --mode read-only, or use Codewhale-owned login/API-key storage."
+                );
+            }
+            confirm_external_consent(yes)?;
+            let path_value = path.to_str().context(
+                "external credential path cannot be persisted losslessly because it is not valid UTF-8",
+            )?;
+            let provider_key = provider.provider().provider_config_key();
+            codewhale_config::mutate_config_document(store.path(), |document| {
+                if matches!(provider, ProviderKind::OpenaiCodex | ProviderKind::Xai) {
+                    codewhale_config::set_config_document_value(
+                        document,
+                        &["providers", provider_key, "auth_mode"],
+                        "oauth",
+                    )?;
+                }
+                let prefix = &["providers", provider_key, "external_credentials"];
+                codewhale_config::set_config_document_value(
+                    document,
+                    &[prefix[0], prefix[1], prefix[2], "access"],
+                    "read_only",
+                )?;
+                codewhale_config::set_config_document_value(
+                    document,
+                    &[prefix[0], prefix[1], prefix[2], "provider"],
+                    provider.as_str(),
+                )?;
+                codewhale_config::set_config_document_value(
+                    document,
+                    &[prefix[0], prefix[1], prefix[2], "source"],
+                    source.as_str(),
+                )?;
+                codewhale_config::set_config_document_value(
+                    document,
+                    &[prefix[0], prefix[1], prefix[2], "path"],
+                    path_value,
+                )?;
+                codewhale_config::set_config_document_value(
+                    document,
+                    &[prefix[0], prefix[1], prefix[2], "consent_version"],
+                    i64::from(codewhale_config::EXTERNAL_CREDENTIAL_CONSENT_VERSION),
+                )
+            })?;
+            store
+                .reload()
+                .context("external consent was saved, but config reload failed")?;
+            println!(
+                "saved read-only external credential consent: provider={}, owner={}, path={}, consent_version={} ({})",
+                provider.as_str(),
+                source.as_str(),
+                codewhale_config::quote_os_path(&path),
+                codewhale_config::EXTERNAL_CREDENTIAL_CONSENT_VERSION,
+                codewhale_config::EXTERNAL_CREDENTIAL_READ_ONLY_SEMANTICS,
+            );
+            println!(
+                "revoke with: codewhale auth external-revoke --provider {}",
+                provider.as_str()
+            );
+            Ok(())
+        }
+        AuthCommand::ExternalRevoke { provider } => {
+            let provider: ProviderKind = provider.into();
+            let provider_key = provider.provider().provider_config_key();
+            codewhale_config::mutate_config_document(store.path(), |document| {
+                codewhale_config::unset_config_document_value(
+                    document,
+                    &["providers", provider_key, "external_credentials"],
+                )?;
+                Ok(())
+            })?;
+            store
+                .reload()
+                .context("external consent was revoked, but config reload failed")?;
+            println!(
+                "external credential access disabled for {}",
+                provider.as_str()
+            );
+            Ok(())
         }
         AuthCommand::Status { provider } => {
             match provider {
@@ -2333,12 +2694,13 @@ fn run_auth_command_with_secrets(
         }
         AuthCommand::Clear { provider } => {
             let provider: ProviderKind = provider.into();
-            let slot = provider_slot(provider);
-            clear_provider_api_key_from_config(store, provider);
-            clear_provider_api_key_from_keyring(secrets, provider);
-            store.save()?;
-            println!("cleared API key for {slot} from config and secret store");
-            Ok(())
+            if provider == ProviderKind::Xai {
+                codewhale_config::with_xai_oauth_revocation_transaction(|| {
+                    clear_auth_provider(store, secrets, provider)
+                })
+            } else {
+                clear_auth_provider(store, secrets, provider)
+            }
         }
         AuthCommand::List => {
             for line in auth_list_lines(store, secrets) {
@@ -2348,6 +2710,65 @@ fn run_auth_command_with_secrets(
         }
         AuthCommand::Migrate { dry_run } => run_auth_migrate(store, secrets, dry_run),
     }
+}
+
+fn external_consent_preview_lines(
+    provider: ProviderKind,
+    source: codewhale_config::ExternalCredentialSource,
+    path: &Path,
+) -> Vec<String> {
+    vec![
+        "External credential consent preview (nothing has been saved):".to_string(),
+        format!("  provider: {}", provider.as_str()),
+        format!(
+            "  owning CLI: {} ({})",
+            source.owner_label(),
+            source.as_str()
+        ),
+        format!(
+            "  exact resolved path: {}",
+            codewhale_config::quote_os_path(path)
+        ),
+        format!(
+            "  access: read_only ({})",
+            codewhale_config::EXTERNAL_CREDENTIAL_READ_ONLY_SEMANTICS
+        ),
+        "  managed: unavailable (no reviewed schema-safe preservation adapter)".to_string(),
+        format!(
+            "  revoke: codewhale auth external-revoke --provider {}",
+            provider.as_str()
+        ),
+    ]
+}
+
+fn confirm_external_consent(yes: bool) -> Result<()> {
+    use std::io::IsTerminal;
+
+    if yes {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "external credential consent was not saved: non-interactive use requires explicit --yes after reviewing the preview"
+        );
+    }
+    confirm_external_consent_answer(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())
+}
+
+fn confirm_external_consent_answer(
+    reader: &mut impl std::io::BufRead,
+    writer: &mut impl std::io::Write,
+) -> Result<()> {
+    write!(writer, "Type 'yes' to grant this exact read-only access: ")?;
+    writer.flush()?;
+    let mut answer = String::new();
+    reader
+        .read_line(&mut answer)
+        .context("reading external credential consent confirmation")?;
+    if answer.trim() != "yes" {
+        bail!("external credential consent cancelled; no configuration was changed");
+    }
+    Ok(())
 }
 
 fn yes_no(b: bool) -> &'static str {
@@ -2754,10 +3175,13 @@ fn parse_mcp_server_definitions(raw: &str) -> Result<Vec<McpServerDefinition>> {
         return Ok(parsed);
     }
 
-    let unwrapped: String = serde_json::from_str(raw)
-        .with_context(|| format!("invalid JSON payload at key {MCP_SERVER_DEFINITIONS_KEY}"))?;
-    serde_json::from_str::<Vec<McpServerDefinition>>(&unwrapped).with_context(|| {
-        format!("invalid MCP server definition list in key {MCP_SERVER_DEFINITIONS_KEY}")
+    let unwrapped: String = serde_json::from_str(raw).map_err(|_| {
+        anyhow!("invalid JSON payload at key {MCP_SERVER_DEFINITIONS_KEY}; contents were omitted")
+    })?;
+    serde_json::from_str::<Vec<McpServerDefinition>>(&unwrapped).map_err(|_| {
+        anyhow!(
+            "invalid MCP server definition list in key {MCP_SERVER_DEFINITIONS_KEY}; contents were omitted"
+        )
     })
 }
 
@@ -3548,6 +3972,18 @@ mod tests {
         // What the `for cause in err.chain().skip(1)` loop iterates over.
         let causes: Vec<String> = err.chain().skip(1).map(ToString::to_string).collect();
         assert_eq!(causes, vec!["TOML parse error at line 1, column 20"]);
+    }
+
+    #[test]
+    fn malformed_persisted_mcp_json_omits_secret_contents_and_keys() {
+        let secret = "sentinel";
+        let raw =
+            format!(r#"[{{"name":"private","env":{{"PRIVATE_TOKEN":"{secret}"}} trailing-junk}}]"#);
+        let error = parse_mcp_server_definitions(&raw).expect_err("malformed JSON must fail");
+        let diagnostic = format!("{error:#}");
+        assert!(!diagnostic.contains(secret), "{diagnostic}");
+        assert!(!diagnostic.contains("PRIVATE_TOKEN"), "{diagnostic}");
+        assert!(diagnostic.contains("contents were omitted"), "{diagnostic}");
     }
 
     #[test]
@@ -4473,6 +4909,40 @@ model = "qwen-2.5-7b"
             }))
         ));
 
+        let cli = parse_ok(&[
+            "deepseek",
+            "auth",
+            "external-consent",
+            "--provider",
+            "openai-codex",
+            "--mode",
+            "read-only",
+            "--path",
+            "/tmp/codex-auth.json",
+            "--yes",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth(AuthArgs {
+                command: AuthCommand::ExternalConsent {
+                    provider: ProviderArg::OpenaiCodex,
+                    mode: ExternalCredentialModeArg::ReadOnly,
+                    path: Some(_),
+                    yes: true,
+                }
+            }))
+        ));
+
+        let cli = parse_ok(&["deepseek", "auth", "external-revoke", "--provider", "xai"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth(AuthArgs {
+                command: AuthCommand::ExternalRevoke {
+                    provider: ProviderArg::Xai,
+                }
+            }))
+        ));
+
         let cli = parse_ok(&["deepseek", "auth", "set", "--provider", "deepseek"]);
         assert!(matches!(
             cli.command,
@@ -5031,7 +5501,7 @@ model = "qwen-2.5-7b"
     }
 
     #[test]
-    fn auth_status_openai_codex_reports_codex_oauth_file() {
+    fn auth_status_never_probes_codex_file_and_reports_exact_consent() {
         use codewhale_secrets::InMemoryKeyringStore;
         use std::sync::Arc;
 
@@ -5056,17 +5526,56 @@ model = "qwen-2.5-7b"
 
         assert!(output.contains("provider: openai-codex"));
         assert!(output.contains("auth mode: codex_oauth"));
-        assert!(output.contains("active source: Codex OAuth file"));
-        assert!(output.contains("lookup order: env -> Codex OAuth file"));
-        assert!(output.contains(&format!(
-            "Codex OAuth file: {} (present)",
-            auth_path.display()
-        )));
+        assert!(output.contains("active source: missing"));
+        assert!(output.contains("lookup order: env -> consent-gated exact Codex CLI file"));
+        assert!(output.contains("external credentials: disabled"));
+        assert!(output.contains("scope_valid=false"));
+        assert!(output.contains("disabled; no external-credential probing, reading"));
+        assert!(output.contains("file not probed"));
         assert!(!output.contains("secret-token"));
+
+        store.config.providers.openai_codex.external_credentials =
+            Some(codewhale_config::ExternalCredentialConsentToml::read_only(
+                ProviderKind::OpenaiCodex,
+                codewhale_config::ExternalCredentialSource::CodexCli,
+                auth_path.clone(),
+            ));
+        let output =
+            auth_status_lines_for_provider(&store, &secrets, ProviderKind::OpenaiCodex).join("\n");
+        assert!(
+            output.contains("active source: external read-only consent (availability not probed)")
+        );
+        assert!(output.contains("external credentials: read_only"));
+        assert!(output.contains("provider=openai-codex"));
+        assert!(output.contains("source=codex_cli"));
+        assert!(output.contains(&format!(
+            "path={}",
+            codewhale_config::quote_os_path(&auth_path)
+        )));
+        assert!(output.contains(&format!(
+            "consent_version={}",
+            codewhale_config::EXTERNAL_CREDENTIAL_CONSENT_VERSION
+        )));
+        assert!(output.contains("file not probed"));
+        assert!(!output.contains("secret-token"));
+
+        let ambient_path = dir.path().join("new-ambient-auth.json");
+        let ambient_path_str = ambient_path.to_string_lossy().into_owned();
+        let _ambient_file = ScopedEnvVar::set("OPENAI_CODEX_AUTH_FILE", &ambient_path_str);
+        let changed =
+            auth_status_lines_for_provider(&store, &secrets, ProviderKind::OpenaiCodex).join("\n");
+        assert!(changed.contains("state=active"), "{changed}");
+        assert!(changed.contains("ambient_path_changed=true"), "{changed}");
+        assert!(changed.contains("consent remains pinned"), "{changed}");
+        assert!(
+            changed.contains(&codewhale_config::quote_os_path(&auth_path)),
+            "{changed}"
+        );
+        assert!(!changed.contains(&ambient_path_str), "{changed}");
     }
 
     #[test]
-    fn auth_list_treats_openai_codex_oauth_file_as_active() {
+    fn auth_list_uses_persisted_consent_without_probing_codex_file() {
         use codewhale_secrets::InMemoryKeyringStore;
         use std::sync::Arc;
 
@@ -5084,6 +5593,12 @@ model = "qwen-2.5-7b"
 
         let mut store = ConfigStore::load(Some(config_path)).expect("store should load");
         store.config.provider = ProviderKind::OpenaiCodex;
+        store.config.providers.openai_codex.external_credentials =
+            Some(codewhale_config::ExternalCredentialConsentToml::read_only(
+                ProviderKind::OpenaiCodex,
+                codewhale_config::ExternalCredentialSource::CodexCli,
+                auth_path,
+            ));
         let secrets = Secrets::new(Arc::new(InMemoryKeyringStore::new()));
 
         let output = auth_list_lines(&store, &secrets).join("\n");
@@ -5091,8 +5606,295 @@ model = "qwen-2.5-7b"
             .lines()
             .find(|line| line.starts_with("openai-codex"))
             .unwrap_or_else(|| panic!("missing openai-codex row:\n{output}"));
-        assert!(row.ends_with("oauth"), "{row}");
+        assert!(row.ends_with("external-consent"), "{row}");
         assert!(!output.contains("secret-token"));
+    }
+
+    #[test]
+    fn external_consent_persists_exact_scope_and_api_key_or_revoke_disables_it() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let home = dir
+            .path()
+            .canonicalize()
+            .expect("canonical temp root")
+            .join("codewhale-home");
+        let _home = ScopedEnvVar::set("CODEWHALE_HOME", &home.to_string_lossy());
+        let config_path = dir.path().join("config.toml");
+        let external_path = dir.path().join("grok-auth.json");
+        let external_raw = r#"{"secret":"must-never-be-read-or-written"}"#;
+        std::fs::write(&external_path, external_raw).expect("external auth trap");
+        let mut store = ConfigStore::load(Some(config_path.clone())).expect("store should load");
+        let secrets = no_keyring_secrets();
+
+        let preview = external_consent_preview_lines(
+            ProviderKind::Xai,
+            codewhale_config::ExternalCredentialSource::GrokCli,
+            &external_path,
+        )
+        .join("\n");
+        assert!(preview.contains("owning CLI: Grok CLI"), "{preview}");
+        assert!(
+            preview.contains(&format!(
+                "exact resolved path: {}",
+                codewhale_config::quote_os_path(&external_path)
+            )),
+            "{preview}"
+        );
+        assert!(preview.contains("no refresh, identity-provider or discovery requests"));
+        assert!(preview.contains("normal requests to the explicitly selected provider"));
+        assert!(preview.contains("managed: unavailable"));
+
+        let mut prompt = Vec::new();
+        confirm_external_consent_answer(&mut "yes\n".as_bytes(), &mut prompt)
+            .expect("exact yes confirms");
+        assert!(
+            String::from_utf8(prompt)
+                .unwrap()
+                .contains("exact read-only")
+        );
+        let cancelled = confirm_external_consent_answer(&mut "YES\n".as_bytes(), &mut Vec::new())
+            .expect_err("confirmation is deliberate and case-sensitive");
+        assert!(cancelled.to_string().contains("cancelled"));
+
+        let unconfirmed = run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::ExternalConsent {
+                provider: ProviderArg::Xai,
+                mode: ExternalCredentialModeArg::ReadOnly,
+                path: Some(external_path.clone()),
+                yes: false,
+            },
+            &secrets,
+        )
+        .expect_err("non-interactive consent requires --yes");
+        assert!(unconfirmed.to_string().contains("requires explicit --yes"));
+        assert!(store.config.providers.xai.external_credentials.is_none());
+        assert!(
+            !config_path.exists(),
+            "unconfirmed consent must not persist"
+        );
+
+        run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::ExternalConsent {
+                provider: ProviderArg::Xai,
+                mode: ExternalCredentialModeArg::ReadOnly,
+                path: Some(external_path.clone()),
+                yes: true,
+            },
+            &secrets,
+        )
+        .expect("read-only consent should persist");
+
+        let consent = store
+            .config
+            .providers
+            .xai
+            .external_credentials
+            .as_ref()
+            .expect("persisted consent");
+        assert_eq!(
+            consent.access,
+            codewhale_config::ExternalCredentialAccess::ReadOnly
+        );
+        assert_eq!(consent.provider, ProviderKind::Xai.as_str());
+        assert_eq!(
+            consent.source,
+            codewhale_config::ExternalCredentialSource::GrokCli
+        );
+        assert_eq!(consent.path, external_path);
+        assert_eq!(
+            consent.consent_version,
+            codewhale_config::EXTERNAL_CREDENTIAL_CONSENT_VERSION
+        );
+        assert_eq!(
+            store.config.providers.xai.auth_mode.as_deref(),
+            Some("oauth")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&consent.path).expect("external file unchanged"),
+            external_raw
+        );
+
+        let reloaded = ConfigStore::load(Some(config_path.clone())).expect("reload consent");
+        let reloaded_consent = reloaded
+            .config
+            .providers
+            .xai
+            .external_credentials
+            .as_ref()
+            .expect("reloaded exact consent");
+        assert_eq!(reloaded_consent.provider, ProviderKind::Xai.as_str());
+        assert_eq!(
+            reloaded_consent.source,
+            codewhale_config::ExternalCredentialSource::GrokCli
+        );
+        assert_eq!(reloaded_consent.path, external_path);
+        assert_eq!(
+            reloaded_consent.consent_version,
+            codewhale_config::EXTERNAL_CREDENTIAL_CONSENT_VERSION
+        );
+
+        run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::Set {
+                provider: ProviderArg::Xai,
+                api_key: Some("xai-codewhale-owned-key".to_string()),
+                api_key_stdin: false,
+            },
+            &secrets,
+        )
+        .expect("Codewhale-owned API key should supersede external consent");
+        assert!(store.config.providers.xai.external_credentials.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&external_path).expect("external file still unchanged"),
+            external_raw
+        );
+
+        run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::ExternalConsent {
+                provider: ProviderArg::Xai,
+                mode: ExternalCredentialModeArg::ReadOnly,
+                path: Some(external_path.clone()),
+                yes: true,
+            },
+            &secrets,
+        )
+        .expect("consent can be granted again");
+        run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::ExternalRevoke {
+                provider: ProviderArg::Xai,
+            },
+            &secrets,
+        )
+        .expect("revoke should persist");
+        assert!(store.config.providers.xai.external_credentials.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&external_path).expect("revoke never touches external file"),
+            external_raw
+        );
+    }
+
+    #[test]
+    fn unsupported_managed_and_kimi_external_consent_fail_closed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let external_path = dir.path().join("external-auth.json");
+        std::fs::write(&external_path, "must remain unchanged").expect("external fixture");
+        let mut store = ConfigStore::load(Some(config_path.clone())).expect("store should load");
+        let secrets = no_keyring_secrets();
+
+        let managed = run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::ExternalConsent {
+                provider: ProviderArg::OpenaiCodex,
+                mode: ExternalCredentialModeArg::Managed,
+                path: Some(external_path.clone()),
+                yes: true,
+            },
+            &secrets,
+        )
+        .expect_err("managed access must fail without a preservation adapter");
+        assert!(
+            managed
+                .to_string()
+                .contains("schema-safe preservation adapter")
+        );
+
+        let kimi = run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::ExternalConsent {
+                provider: ProviderArg::Moonshot,
+                mode: ExternalCredentialModeArg::ReadOnly,
+                path: Some(external_path.clone()),
+                yes: true,
+            },
+            &secrets,
+        )
+        .expect_err("Kimi must remain API-key-only");
+        assert!(kimi.to_string().contains("API-key-only"));
+        assert!(
+            kimi.to_string()
+                .contains("https://platform.kimi.ai/console/api-keys")
+        );
+        assert!(
+            store
+                .config
+                .providers
+                .openai_codex
+                .external_credentials
+                .is_none()
+        );
+        assert!(
+            store
+                .config
+                .providers
+                .moonshot
+                .external_credentials
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read_to_string(external_path).expect("external fixture unchanged"),
+            "must remain unchanged"
+        );
+        assert!(
+            !config_path.exists(),
+            "rejected consent must not write config"
+        );
+    }
+
+    #[test]
+    fn api_key_config_failure_restores_absent_and_existing_secret_state() {
+        let _lock = env_lock();
+        for prior in [None, Some("prior-xai-key")] {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let home = dir
+                .path()
+                .canonicalize()
+                .expect("canonical temp root")
+                .join("codewhale-home");
+            let _home = ScopedEnvVar::set("CODEWHALE_HOME", &home.to_string_lossy());
+            let config_path = dir.path().join("config.toml");
+            let mut store = ConfigStore::load(Some(config_path.clone())).expect("load store");
+            store.config.providers.xai.auth_mode = Some("oauth".to_string());
+            store.config.providers.xai.external_credentials =
+                Some(codewhale_config::ExternalCredentialConsentToml::read_only(
+                    ProviderKind::Xai,
+                    codewhale_config::ExternalCredentialSource::GrokCli,
+                    dir.path().join("external.json"),
+                ));
+            std::fs::create_dir(&config_path).expect("turn config target into a directory");
+            let secrets = no_keyring_secrets();
+            if let Some(prior) = prior {
+                secrets.set("xai", prior).expect("seed prior secret");
+            }
+
+            let error = run_auth_command_with_secrets(
+                &mut store,
+                AuthCommand::Set {
+                    provider: ProviderArg::Xai,
+                    api_key: Some("new-xai-key".to_string()),
+                    api_key_stdin: false,
+                },
+                &secrets,
+            )
+            .expect_err("config write must fail");
+            assert!(error.to_string().contains("config"), "{error:#}");
+            assert_eq!(
+                secrets.get("xai").expect("restored secret"),
+                prior.map(str::to_string)
+            );
+            assert_eq!(
+                store.config.providers.xai.auth_mode.as_deref(),
+                Some("oauth")
+            );
+            assert!(store.config.providers.xai.external_credentials.is_some());
+            assert!(store.config.providers.xai.api_key.is_none());
+            assert!(config_path.is_dir());
+        }
     }
 
     #[test]
@@ -5177,16 +5979,35 @@ model = "qwen-2.5-7b"
 
     #[test]
     fn logout_removes_plaintext_provider_keys() {
-        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
-        let path = std::env::temp_dir().join(format!(
-            "deepseek-cli-logout-test-{}-{nanos}.toml",
-            std::process::id()
-        ));
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let home = dir
+            .path()
+            .canonicalize()
+            .expect("canonical temp root")
+            .join("codewhale-home");
+        let _home = ScopedEnvVar::set("CODEWHALE_HOME", &home.to_string_lossy());
+        let path = home.join("config.toml");
         let mut store = ConfigStore::load(Some(path.clone())).expect("store should load");
         store.config.api_key = Some("sk-stale".to_string());
         store.config.providers.deepseek.api_key = Some("sk-stale".to_string());
         store.config.providers.fireworks.api_key = Some("fw-stale".to_string());
+        store.config.providers.xai.auth_mode = Some("oauth".to_string());
+        let generation = "xai-auth-0123456789abcdef0123456789abcdef.json";
+        store.config.providers.xai.oauth_credential_generation = Some(generation.to_string());
         store.save().unwrap();
+        let credentials = home.join("credentials");
+        codewhale_config::with_xai_oauth_lifecycle_lock(|owned| {
+            owned.write(generation, b"xai-generation", false)?;
+            owned.write(
+                codewhale_config::LEGACY_XAI_OAUTH_FILE_NAME,
+                b"legacy-xai",
+                false,
+            )?;
+            Ok(())
+        })
+        .expect("seed Codewhale-owned xAI credentials");
+        std::fs::write(credentials.join("other-provider.json"), "preserve").unwrap();
 
         let secrets = no_keyring_secrets();
 
@@ -5195,6 +6016,18 @@ model = "qwen-2.5-7b"
         assert!(store.config.api_key.is_none());
         assert!(store.config.providers.deepseek.api_key.is_none());
         assert!(store.config.providers.fireworks.api_key.is_none());
+        assert!(store.config.providers.xai.auth_mode.is_none());
+        assert!(
+            store
+                .config
+                .providers
+                .xai
+                .oauth_credential_generation
+                .is_none()
+        );
+        assert!(!credentials.join(generation).exists());
+        assert!(!credentials.join("xai-auth.json").exists());
+        assert!(credentials.join("other-provider.json").exists());
 
         let _ = std::fs::remove_file(path);
     }

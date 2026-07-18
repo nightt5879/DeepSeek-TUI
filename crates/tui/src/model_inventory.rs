@@ -278,6 +278,7 @@ fn auth_source_for_provider(config: &Config, provider: ApiProvider) -> Option<Mo
         }
         crate::provider_readiness::CredentialState::MissingKey
         | crate::provider_readiness::CredentialState::MissingLogin
+        | crate::provider_readiness::CredentialState::ExternalConsent
         | crate::provider_readiness::CredentialState::Legacy => return None,
         crate::provider_readiness::CredentialState::Saved => {}
     }
@@ -399,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn inventory_labels_explicit_unexpired_kimi_cli_import_separately() {
+    fn inventory_never_admits_kimi_cli_oauth_import() {
         let _env_lock = crate::test_support::lock_test_env();
         let temp = tempfile::tempdir().expect("Kimi import fixture root");
         let kimi_home = temp.path().join("kimi-code");
@@ -409,16 +410,14 @@ mod tests {
             .expect("clock after epoch")
             .as_secs_f64()
             + 3600.0;
-        std::fs::write(
-            kimi_home.join("credentials/kimi-code.json"),
-            serde_json::json!({
-                "access_token": "unexpired-user-owned-token",
-                "refresh_token": "must-not-be-used",
-                "expires_at": expires_at,
-            })
-            .to_string(),
-        )
-        .expect("write Kimi import fixture");
+        let credential_path = kimi_home.join("credentials/kimi-code.json");
+        let credential_raw = serde_json::json!({
+            "access_token": "unexpired-user-owned-token",
+            "refresh_token": "must-not-be-used",
+            "expires_at": expires_at,
+        })
+        .to_string();
+        std::fs::write(&credential_path, &credential_raw).expect("write Kimi import fixture");
         let _kimi_home = crate::test_support::EnvVarGuard::set(
             "KIMI_CODE_HOME",
             kimi_home.to_str().expect("utf8 path"),
@@ -436,12 +435,17 @@ mod tests {
         };
 
         let inventory = ModelInventory::from_config(&config);
-        assert!(inventory.candidates.iter().any(|candidate| {
-            candidate.provider == ApiProvider::Moonshot
-                && candidate.auth_source == ModelAuthSource::ImportedToken
-                && candidate.readiness
-                    == crate::provider_readiness::ResolvedProviderReadiness::ImportedTokenUnchecked
-        }));
+        assert!(
+            inventory
+                .candidates
+                .iter()
+                .all(|candidate| candidate.provider != ApiProvider::Moonshot),
+            "unsupported Kimi CLI OAuth must not enter the routing inventory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(credential_path).expect("Kimi file remains untouched"),
+            credential_raw
+        );
     }
 
     #[test]

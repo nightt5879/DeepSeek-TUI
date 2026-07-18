@@ -90,7 +90,7 @@ impl DeepSeekClient {
         // so it must not be set again here or it would be duplicated. The
         // ChatGPT backend additionally requires the account id and the
         // experimental Responses beta opt-in.
-        let account_id = crate::oauth::codex_account_id();
+        let account_id = self.codex_account_id.clone();
         let request_body =
             serde_json::to_vec(&body).context("Failed to serialize Responses API request body")?;
         let response = self

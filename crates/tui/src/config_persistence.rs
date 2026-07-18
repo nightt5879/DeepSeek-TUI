@@ -8,7 +8,6 @@
 //! ordering, and formatting survive, and the result is replaced atomically
 //! (same-directory temp file + rename) with owner-only permissions.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -25,68 +24,14 @@ pub(crate) fn mutate_config_document<F>(path: &Path, mutate: F) -> anyhow::Resul
 where
     F: FnOnce(&mut toml_edit::DocumentMut) -> anyhow::Result<()>,
 {
-    let raw = if path.exists() {
-        Some(
-            fs::read_to_string(path)
-                .with_context(|| format!("failed to read config at {}", path.display()))?,
-        )
-    } else {
-        None
-    };
-    let mut document = match raw.as_deref() {
-        Some(raw) if !raw.trim().is_empty() => raw
-            .parse::<toml_edit::DocumentMut>()
-            .with_context(|| format!("failed to parse config at {}", path.display()))?,
-        _ => toml_edit::DocumentMut::new(),
-    };
-    mutate(&mut document)?;
-    write_config_toml_atomic(path, &document.to_string())
+    codewhale_config::mutate_config_document(path, mutate)
 }
 
 /// Atomically replace `path` with `body` via a same-directory temp file and
 /// rename. On Unix the file lands with 0o600 permissions: config.toml can
 /// hold API keys, so this matches `ConfigStore::save` and the auth save path.
 pub(crate) fn write_config_toml_atomic(path: &Path, body: &str) -> anyhow::Result<()> {
-    use std::io::Write as _;
-
-    let parent = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create config directory {}", parent.display()))?;
-
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).with_context(|| {
-        format!(
-            "failed to create temporary config file in {}",
-            parent.display()
-        )
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        temporary
-            .as_file()
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .with_context(|| {
-                format!(
-                    "failed to secure temporary config file for {}",
-                    path.display()
-                )
-            })?;
-    }
-    temporary
-        .write_all(body.as_bytes())
-        .with_context(|| format!("failed to write config at {}", path.display()))?;
-    temporary
-        .as_file()
-        .sync_all()
-        .with_context(|| format!("failed to sync config at {}", path.display()))?;
-    temporary
-        .persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("failed to replace config at {}", path.display()))?;
-    Ok(())
+    codewhale_config::create_config_document(path, body)
 }
 
 /// Set the value at `segments` (parent tables plus the final key), creating
@@ -100,24 +45,7 @@ pub(crate) fn set_document_value(
     segments: &[&str],
     value: impl Into<toml_edit::Value>,
 ) -> anyhow::Result<()> {
-    let (key, parents) = segments
-        .split_last()
-        .context("config value path must not be empty")?;
-    let table = table_like_at_path_mut(doc.as_table_mut(), parents, PathLookup::Create)?
-        .expect("Create lookups always yield a table");
-    match table.get_mut(key) {
-        Some(item) => {
-            let mut value = value.into();
-            if let Some(existing) = item.as_value() {
-                *value.decor_mut() = existing.decor().clone();
-            }
-            *item = toml_edit::Item::Value(value);
-        }
-        None => {
-            table.insert(key, toml_edit::value(value));
-        }
-    }
-    Ok(())
+    codewhale_config::set_config_document_value(doc, segments, value)
 }
 
 /// Remove the value at `segments`. Returns `Ok(true)` when an entry was
@@ -126,32 +54,7 @@ pub(crate) fn unset_document_value(
     doc: &mut toml_edit::DocumentMut,
     segments: &[&str],
 ) -> anyhow::Result<bool> {
-    let (key, parents) = segments
-        .split_last()
-        .context("config value path must not be empty")?;
-    let orphaned_root_prefix = (parents.is_empty() && doc.as_table().len() == 1)
-        .then(|| leading_prefix_for_key(doc.as_table(), key))
-        .flatten();
-    let removed = {
-        let Some(table) =
-            table_like_at_path_mut(doc.as_table_mut(), parents, PathLookup::Existing)?
-        else {
-            return Ok(false);
-        };
-        remove_key_preserving_leading_decor(table, key)
-    };
-    if removed
-        && let Some(prefix) = orphaned_root_prefix
-        && prefix.as_str().is_some_and(|prefix| !prefix.is_empty())
-    {
-        let trailing = format!(
-            "{}{}",
-            prefix.as_str().unwrap_or_default(),
-            doc.trailing().as_str().unwrap_or_default()
-        );
-        doc.set_trailing(trailing);
-    }
-    Ok(removed)
+    codewhale_config::unset_config_document_value(doc, segments)
 }
 
 /// Remove every entry named `key` from `table` and, recursively, from nested
@@ -221,50 +124,6 @@ fn leading_prefix_for_key(
                 .and_then(|item| item.as_value())
                 .and_then(|value| value.decor().prefix().cloned())
         })
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PathLookup {
-    /// Create missing intermediate tables; error when a segment exists but is
-    /// not table-like.
-    Create,
-    /// Return `None` when a segment is missing or not table-like.
-    Existing,
-}
-
-fn table_like_at_path_mut<'a>(
-    root: &'a mut toml_edit::Table,
-    segments: &[&str],
-    lookup: PathLookup,
-) -> anyhow::Result<Option<&'a mut dyn toml_edit::TableLike>> {
-    let mut current: &mut dyn toml_edit::TableLike = root;
-    for segment in segments {
-        if current.get(segment).is_none() {
-            match lookup {
-                PathLookup::Create => {
-                    // Implicit, so creating `providers.foo.base_url` does not
-                    // emit an empty `[providers]` header.
-                    let mut table = toml_edit::Table::new();
-                    table.set_implicit(true);
-                    current.insert(segment, toml_edit::Item::Table(table));
-                }
-                PathLookup::Existing => return Ok(None),
-            }
-        }
-        let item = current
-            .get_mut(segment)
-            .expect("segment exists or was inserted above");
-        match item.as_table_like_mut() {
-            Some(table) => current = table,
-            None => match lookup {
-                PathLookup::Create => {
-                    anyhow::bail!("`{segment}` in config.toml must be a table")
-                }
-                PathLookup::Existing => return Ok(None),
-            },
-        }
-    }
-    Ok(Some(current))
 }
 
 pub(crate) fn persist_status_items(items: &[StatusItem]) -> anyhow::Result<PathBuf> {

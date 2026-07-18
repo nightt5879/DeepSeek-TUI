@@ -2840,7 +2840,7 @@ fn config_store_save_revalidates_path_before_parent_creation() {
         .join("..")
         .join("outside")
         .join(CONFIG_FILE_NAME);
-    let store = ConfigStore {
+    let mut store = ConfigStore {
         path: traversal_path,
         config: ConfigToml::default(),
         permissions: PermissionsToml::default(),
@@ -3006,14 +3006,14 @@ fn save_clamps_existing_config_permissions() {
     fs::write(&path, "api_key = \"old\"\n").expect("seed config");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod seed");
 
-    let store = ConfigStore {
+    let mut store = ConfigStore {
         path: path.clone(),
         config: ConfigToml {
             api_key: Some("new-secret".to_string()),
             ..ConfigToml::default()
         },
         permissions: PermissionsToml::default(),
-        original_raw: None,
+        original_raw: Some("api_key = \"old\"\n".to_string()),
     };
     store.save().expect("save");
 
@@ -3046,11 +3046,11 @@ fn config_store_save_skips_identical_serialized_body() {
     #[cfg(unix)]
     fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).expect("chmod seed");
 
-    let store = ConfigStore {
+    let mut store = ConfigStore {
         path: path.clone(),
         config,
         permissions: PermissionsToml::default(),
-        original_raw: None,
+        original_raw: Some(body.clone()),
     };
     store.save().expect("identical save should not rewrite");
 
@@ -3082,14 +3082,14 @@ fn config_store_save_creates_one_time_backup_before_changed_write() {
     let original = "model = \"deepseek-v4-flash\"\n";
     fs::write(&path, original).expect("seed config");
 
-    let store = ConfigStore {
+    let mut store = ConfigStore {
         path: path.clone(),
         config: ConfigToml {
             model: Some("deepseek-v4-pro".to_string()),
             ..ConfigToml::default()
         },
         permissions: PermissionsToml::default(),
-        original_raw: None,
+        original_raw: Some(original.to_string()),
     };
     store.save().expect("changed save");
 
@@ -3291,15 +3291,21 @@ fn config_store_load_fails_on_malformed_config_without_touching_file() {
     // leaves the file bytes untouched for the user (or doctor) to repair.
     let dir = tempfile::tempdir().expect("tempdir");
     let config_path = dir.path().join(CONFIG_FILE_NAME);
-    let malformed = "# half-edited config\nmodel = \"deepseek-v4-flash\n";
-    fs::write(&config_path, malformed).expect("write config");
+    let secret = "cw-secret-store-load-4507";
+    let malformed =
+        format!("# half-edited config\n[providers.xai]\napi_key = \"{secret}\" trailing-junk\n");
+    fs::write(&config_path, &malformed).expect("write config");
 
     let err = ConfigStore::load(Some(config_path.clone())).expect_err("malformed must not parse");
+    let diagnostic = format!("{err:#}");
 
     assert!(
-        format!("{err:#}").contains("failed to parse config"),
+        diagnostic.contains("failed to parse config"),
         "error should name the parse failure: {err:#}"
     );
+    assert!(!diagnostic.contains(secret), "{diagnostic}");
+    assert!(!diagnostic.contains("api_key"), "{diagnostic}");
+    assert!(diagnostic.contains("file contents were omitted"));
     let body = fs::read_to_string(&config_path).expect("read config");
     assert_eq!(body, malformed, "malformed config left untouched");
 }
@@ -3335,35 +3341,48 @@ fn config_store_rendered_body_preserves_comments_at_legacy_deepseek_path() {
 
 #[test]
 fn merge_and_preserve_comments_returns_err_on_invalid_serialized() {
-    let err = merge_and_preserve_comments("{{{ not toml", "model = 1\n")
-        .expect_err("invalid serialized should fail");
+    let secret = "sentinel";
+    let err = merge_and_preserve_comments(
+        &format!("api_key = \"{secret}\" trailing-junk\n"),
+        "model = 1\n",
+    )
+    .expect_err("invalid serialized should fail");
+    let diagnostic = format!("{err:#}");
     assert!(
-        format!("{err:#}").contains("failed to parse serialized"),
+        diagnostic.contains("failed to parse serialized"),
         "unexpected error: {err:#}"
     );
+    assert!(!diagnostic.contains(secret), "{diagnostic}");
+    assert!(!diagnostic.contains("api_key"), "{diagnostic}");
 }
 
 #[test]
 fn merge_and_preserve_comments_returns_err_on_invalid_original() {
-    let err = merge_and_preserve_comments("model = 1\n", "{{{ not toml")
-        .expect_err("invalid original should fail");
+    let secret = "cw-secret-original-4507";
+    let err = merge_and_preserve_comments(
+        "model = 1\n",
+        &format!("api_key = \"{secret}\" trailing-junk\n"),
+    )
+    .expect_err("invalid original should fail");
+    let diagnostic = format!("{err:#}");
     assert!(
-        format!("{err:#}").contains("failed to parse original"),
+        diagnostic.contains("failed to parse original"),
         "unexpected error: {err:#}"
     );
+    assert!(!diagnostic.contains(secret), "{diagnostic}");
+    assert!(!diagnostic.contains("api_key"), "{diagnostic}");
 }
 
 #[test]
-fn config_store_save_falls_back_when_comment_merge_fails() {
+fn config_store_save_rejects_a_stale_or_corrupt_original_snapshot() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config_path = dir.path().join(CONFIG_FILE_NAME);
-    // Valid TOML so load succeeds, but the raw is corrupt so the merge
-    // will fail inside save() — save must still succeed and write the
-    // plain serialized config.
+    // A full typed writer must never overwrite bytes that differ from its
+    // original snapshot, even when that snapshot is corrupt.
     fs::write(&config_path, "model = \"deepseek-v4-flash\"\n").expect("write config");
 
     // Bypass ConfigStore::load to inject a deliberately broken original_raw.
-    let store = ConfigStore {
+    let mut store = ConfigStore {
         path: config_path.clone(),
         config: ConfigToml {
             model: Some("deepseek-v4-pro".to_string()),
@@ -3372,15 +3391,44 @@ fn config_store_save_falls_back_when_comment_merge_fails() {
         permissions: PermissionsToml::default(),
         original_raw: Some("{ broken".to_string()),
     };
-    store
+    let error = store
         .save()
-        .expect("save should succeed even when merge fails");
+        .expect_err("stale original bytes must fail instead of overwriting");
+    assert!(
+        error.to_string().contains("reload") && error.to_string().contains("retry"),
+        "{error:#}"
+    );
 
     let body = fs::read_to_string(&config_path).expect("read config");
-    assert!(
-        body.contains("deepseek-v4-pro"),
-        "config should be written: {body}"
-    );
+    assert_eq!(body, "model = \"deepseek-v4-flash\"\n");
+}
+
+#[test]
+fn sequential_config_stores_cannot_resurrect_a_concurrent_change() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join(CONFIG_FILE_NAME);
+    fs::write(
+        &config_path,
+        "model = \"before\"\n[providers.xai.external_credentials]\naccess = \"read_only\"\nprovider = \"xai\"\nsource = \"grok_cli\"\npath = \"/external/auth.json\"\nconsent_version = 1\n",
+    )
+    .expect("seed config");
+    let mut stale = ConfigStore::load(Some(config_path.clone())).expect("load stale store");
+
+    mutate_config_document(&config_path, |document| {
+        unset_config_document_value(document, &["providers", "xai", "external_credentials"])?;
+        set_config_document_value(document, &["tui", "low_motion"], true)
+    })
+    .expect("concurrent targeted update");
+    stale.config.model = Some("stale-writer".to_string());
+    let error = stale
+        .save()
+        .expect_err("stale typed snapshot must not overwrite revocation");
+    assert!(error.to_string().contains("config changed"), "{error:#}");
+
+    let saved = fs::read_to_string(config_path).expect("read final config");
+    assert!(!saved.contains("external_credentials"), "{saved}");
+    assert!(saved.contains("low_motion = true"), "{saved}");
+    assert!(!saved.contains("stale-writer"), "{saved}");
 }
 
 #[test]

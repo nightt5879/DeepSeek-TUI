@@ -119,25 +119,35 @@ fn list_policy() -> anyhow::Result<String> {
 
 fn update_host(edit: NetworkEdit, host: &str) -> anyhow::Result<String> {
     let path = crate::config_persistence::config_toml_path(None)?;
-    let mut doc = load_config_doc(&path)?;
-    let network = network_table_mut(&mut doc)?;
-
-    match edit {
-        NetworkEdit::Allow => {
-            remove_host(network, "deny", host)?;
-            add_host(network, "allow", host)?;
+    crate::config_persistence::mutate_config_document(&path, |doc| {
+        ensure_network_defaults(doc)?;
+        let mut allow = document_string_array(doc, "allow")?;
+        let mut deny = document_string_array(doc, "deny")?;
+        match edit {
+            NetworkEdit::Allow => {
+                remove_host(&mut deny, host);
+                add_host(&mut allow, host);
+            }
+            NetworkEdit::Deny => {
+                remove_host(&mut allow, host);
+                add_host(&mut deny, host);
+            }
+            NetworkEdit::Remove => {
+                remove_host(&mut allow, host);
+                remove_host(&mut deny, host);
+            }
         }
-        NetworkEdit::Deny => {
-            remove_host(network, "allow", host)?;
-            add_host(network, "deny", host)?;
-        }
-        NetworkEdit::Remove => {
-            remove_host(network, "allow", host)?;
-            remove_host(network, "deny", host)?;
-        }
-    }
-
-    save_config_doc(&path, &doc)?;
+        crate::config_persistence::set_document_value(
+            doc,
+            &["network", "allow"],
+            string_array_value(&allow),
+        )?;
+        crate::config_persistence::set_document_value(
+            doc,
+            &["network", "deny"],
+            string_array_value(&deny),
+        )
+    })?;
     let action = match edit {
         NetworkEdit::Allow => "allowed",
         NetworkEdit::Deny => "denied",
@@ -158,10 +168,10 @@ fn update_default(value: &str) -> anyhow::Result<String> {
     };
 
     let path = crate::config_persistence::config_toml_path(None)?;
-    let mut doc = load_config_doc(&path)?;
-    let network = network_table_mut(&mut doc)?;
-    network.insert("default".to_string(), Value::String(normalized.to_string()));
-    save_config_doc(&path, &doc)?;
+    crate::config_persistence::mutate_config_document(&path, |doc| {
+        ensure_network_defaults(doc)?;
+        crate::config_persistence::set_document_value(doc, &["network", "default"], normalized)
+    })?;
 
     Ok(format!(
         "Network default set to {normalized}\nSaved to {}.",
@@ -175,35 +185,58 @@ fn load_config_doc(path: &Path) -> anyhow::Result<Value> {
     }
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read config at {}", path.display()))?;
-    toml::from_str(&raw).with_context(|| format!("failed to parse config at {}", path.display()))
+    toml::from_str(&raw).map_err(|_| {
+        anyhow::anyhow!(
+            "failed to parse config at {}; file contents were omitted",
+            codewhale_config::quote_os_path(path)
+        )
+    })
 }
 
-fn save_config_doc(path: &Path, doc: &Value) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+fn ensure_network_defaults(doc: &mut toml_edit::DocumentMut) -> anyhow::Result<()> {
+    if doc
+        .get("network")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|table| table.get("default"))
+        .is_none()
+    {
+        crate::config_persistence::set_document_value(doc, &["network", "default"], "prompt")?;
     }
-    let body = toml::to_string_pretty(doc).context("failed to serialize config.toml")?;
-    fs::write(path, body).with_context(|| format!("failed to write config at {}", path.display()))
+    if doc
+        .get("network")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|table| table.get("audit"))
+        .is_none()
+    {
+        crate::config_persistence::set_document_value(doc, &["network", "audit"], true)?;
+    }
+    Ok(())
 }
 
-fn network_table_mut(doc: &mut Value) -> anyhow::Result<&mut toml::value::Table> {
-    let root = doc
-        .as_table_mut()
-        .context("config.toml root must be a table")?;
-    let entry = root
-        .entry("network".to_string())
-        .or_insert_with(|| Value::Table(toml::value::Table::new()));
-    let table = entry
-        .as_table_mut()
-        .context("`network` section in config.toml must be a table")?;
-    table
-        .entry("default".to_string())
-        .or_insert_with(|| Value::String("prompt".to_string()));
-    table
-        .entry("audit".to_string())
-        .or_insert_with(|| Value::Boolean(true));
-    Ok(table)
+fn document_string_array(doc: &toml_edit::DocumentMut, key: &str) -> anyhow::Result<Vec<String>> {
+    let Some(item) = doc
+        .get("network")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|table| table.get(key))
+    else {
+        return Ok(Vec::new());
+    };
+    let array = item
+        .as_array()
+        .with_context(|| format!("`network.{key}` must be an array of strings"))?;
+    array
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .with_context(|| format!("`network.{key}` must be an array of strings"))
+        })
+        .collect()
+}
+
+fn string_array_value(values: &[String]) -> toml_edit::Array {
+    values.iter().map(String::as_str).collect()
 }
 
 fn string_array(table: &toml::value::Table, key: &str) -> Vec<String> {
@@ -217,38 +250,17 @@ fn string_array(table: &toml::value::Table, key: &str) -> Vec<String> {
         .collect()
 }
 
-fn string_array_mut<'a>(
-    table: &'a mut toml::value::Table,
-    key: &str,
-) -> anyhow::Result<&'a mut Vec<Value>> {
-    let value = table
-        .entry(key.to_string())
-        .or_insert_with(|| Value::Array(Vec::new()));
-    value
-        .as_array_mut()
-        .with_context(|| format!("`network.{key}` must be an array of strings"))
-}
-
-fn add_host(table: &mut toml::value::Table, key: &str, host: &str) -> anyhow::Result<()> {
-    let list = string_array_mut(table, key)?;
+fn add_host(list: &mut Vec<String>, host: &str) {
     if !list
         .iter()
-        .filter_map(Value::as_str)
         .any(|existing| normalize_host_for_compare(existing) == host)
     {
-        list.push(Value::String(host.to_string()));
+        list.push(host.to_string());
     }
-    Ok(())
 }
 
-fn remove_host(table: &mut toml::value::Table, key: &str, host: &str) -> anyhow::Result<()> {
-    let list = string_array_mut(table, key)?;
-    list.retain(|value| {
-        value
-            .as_str()
-            .is_none_or(|existing| normalize_host_for_compare(existing) != host)
-    });
-    Ok(())
+fn remove_host(list: &mut Vec<String>, host: &str) {
+    list.retain(|existing| normalize_host_for_compare(existing) != host);
 }
 
 fn normalize_host_arg(input: &str) -> anyhow::Result<String> {
@@ -433,6 +445,27 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("/network default <allow|deny|prompt>")
+        );
+    }
+
+    #[test]
+    fn network_config_parse_error_omits_secret_contents_and_keys() {
+        let home = temp_home("parse-redaction");
+        let path = home.join("config.toml");
+        let secret = "cw-secret-network-config-4507";
+        fs::write(
+            &path,
+            format!("[providers.xai]\napi_key = \"{secret}\" trailing-junk\n"),
+        )
+        .unwrap();
+
+        let error = load_config_doc(&path).expect_err("malformed config must fail");
+        let diagnostic = format!("{error:#}");
+        assert!(!diagnostic.contains(secret), "{diagnostic}");
+        assert!(!diagnostic.contains("api_key"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("file contents were omitted"),
+            "{diagnostic}"
         );
     }
 }

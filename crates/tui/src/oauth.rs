@@ -1,8 +1,7 @@
-//! OpenAI Codex / ChatGPT OAuth credential loading and token refresh.
+//! OpenAI Codex / ChatGPT OAuth credential loading.
 //!
-//! Reads existing Codex CLI credentials from `~/.codex/auth.json` (or
-//! `$CODEX_HOME/auth.json`) and transparently refreshes expired access tokens
-//! using the OpenAI auth endpoint.
+//! External Codex CLI credentials are read only after an exact, provider-scoped
+//! consent grant. Codewhale never refreshes or rewrites that external file.
 //!
 //! # Security
 //!
@@ -15,31 +14,28 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde::{Deserialize, Serialize};
+use codewhale_config::ExternalCredentialReadGrant;
+use serde::Deserialize;
 
 /// OAuth token payload stored in `auth.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct AuthTokens {
     access_token: Option<String>,
-    refresh_token: Option<String>,
-    id_token: Option<String>,
     account_id: Option<String>,
 }
 
 /// Top-level structure of Codex CLI's `auth.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct CodexAuthFile {
     tokens: Option<AuthTokens>,
-    last_refresh: Option<String>,
 }
 
 /// Resolved OAuth credentials ready for API use.
 #[derive(Debug, Clone)]
 pub struct CodexCredentials {
     pub access_token: String,
-    pub refresh_token: Option<String>,
     pub account_id: Option<String>,
 }
 
@@ -59,7 +55,7 @@ pub fn auth_file_path() -> PathBuf {
     if let Ok(path) = std::env::var("OPENAI_CODEX_AUTH_FILE") {
         let p = PathBuf::from(&path);
         if !p.as_os_str().is_empty() {
-            return p;
+            return codewhale_config::resolve_external_credential_path(&p).unwrap_or(p);
         }
     }
     let codex_home = std::env::var("CODEX_HOME")
@@ -69,7 +65,8 @@ pub fn auth_file_path() -> PathBuf {
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".codex")
         });
-    codex_home.join("auth.json")
+    let path = codex_home.join("auth.json");
+    codewhale_config::resolve_external_credential_path(&path).unwrap_or(path)
 }
 
 /// Try to extract `exp` (epoch seconds) from a JWT without verifying
@@ -96,7 +93,8 @@ fn token_is_expired(access_token: &str) -> bool {
             // 60-second safety margin
             now + 60 >= exp
         }
-        // If we can't parse expiry, assume it might be expired — try refresh.
+        // If we can't prove freshness, fail closed. External credentials are
+        // never refreshed by Codewhale.
         None => true,
     }
 }
@@ -105,15 +103,16 @@ fn token_is_expired(access_token: &str) -> bool {
 ///
 /// Returns `Ok(None)` if the file doesn't exist or has no usable tokens.
 /// Returns `Err` only on parse/IO errors that aren't "file not found".
-pub fn load_credentials() -> Result<Option<CodexCredentials>> {
-    let path = auth_file_path();
-    if !path.exists() {
+fn load_credentials(grant: &ExternalCredentialReadGrant) -> Result<Option<CodexCredentials>> {
+    let Some(contents) = crate::external_credentials::read_to_string(grant)? else {
         return Ok(None);
-    }
-    let contents = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading Codex auth file: {}", path.display()))?;
-    let auth: CodexAuthFile = serde_json::from_str(&contents)
-        .with_context(|| format!("parsing Codex auth file: {}", path.display()))?;
+    };
+    let auth: CodexAuthFile = serde_json::from_str(&contents).map_err(|_| {
+        anyhow::anyhow!(
+            "Codex credential file {} is not valid credential JSON",
+            codewhale_config::quote_os_path(grant.path())
+        )
+    })?;
     let tokens = match auth.tokens {
         Some(t) => t,
         None => return Ok(None),
@@ -124,223 +123,64 @@ pub fn load_credentials() -> Result<Option<CodexCredentials>> {
     };
     Ok(Some(CodexCredentials {
         access_token,
-        refresh_token: tokens.refresh_token,
         account_id: tokens.account_id,
     }))
 }
 
 /// Prompt-free, non-refreshing readiness check for picker/onboarding surfaces.
-/// It validates stored structure and requires either an unexpired access token
-/// or a nonblank refresh token; no network request is made.
+/// It reads process-level token variables only; no file or network access occurs.
 #[must_use]
-pub fn credentials_present() -> bool {
-    if ["OPENAI_CODEX_ACCESS_TOKEN", "CODEX_ACCESS_TOKEN"]
+pub fn credentials_from_env() -> Option<CodexCredentials> {
+    ["OPENAI_CODEX_ACCESS_TOKEN", "CODEX_ACCESS_TOKEN"]
         .iter()
-        .any(|name| std::env::var(name).is_ok_and(|token| !token.trim().is_empty()))
-    {
-        return true;
-    }
-
-    stored_credentials_present()
+        .find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .filter(|token| !token.trim().is_empty())
+        })
+        .map(|access_token| CodexCredentials {
+            access_token,
+            account_id: codex_account_id_env(),
+        })
 }
 
 /// Validate only the stored OAuth file, excluding token environment
 /// overrides so config-vs-env provenance remains truthful.
 #[must_use]
-pub fn stored_credentials_present() -> bool {
-    load_credentials()
+pub fn stored_credentials_present(grant: &ExternalCredentialReadGrant) -> bool {
+    load_credentials(grant)
         .ok()
         .flatten()
-        .is_some_and(|credentials| {
-            !token_is_expired(&credentials.access_token)
-                || credentials
-                    .refresh_token
-                    .as_deref()
-                    .is_some_and(|token| !token.trim().is_empty())
-        })
+        .is_some_and(|credentials| !token_is_expired(&credentials.access_token))
 }
 
-/// Refresh an expired access token using the refresh token.
-///
-/// Calls the OpenAI token endpoint and returns new credentials.
-/// On success, updates the auth file on disk. Synchronous (blocking) so it can
-/// run inside the prompt-free, sync config credential-resolution path, matching
-/// the Kimi OAuth refresh flow.
-fn refresh_access_token(refresh_token: &str) -> Result<CodexCredentials> {
-    let client = crate::tls::reqwest_blocking_client_builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("building token refresh client")?;
-    let params = [
-        ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token),
-        ("client_id", CODEX_CLIENT_ID),
-    ];
-    let response = client
-        .post(TOKEN_URL)
-        .form(&params)
-        .send()
-        .context("sending token refresh request")?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().unwrap_or_default();
-        bail!("Token refresh failed (HTTP {status}): {body}");
-    }
-    let body: serde_json::Value = response.json().context("parsing token refresh response")?;
-    let new_access = body["access_token"]
-        .as_str()
-        .context("missing access_token in refresh response")?
-        .to_string();
-    let new_refresh = body["refresh_token"].as_str().map(ToOwned::to_owned);
-    let new_id = body["id_token"].as_str().map(ToOwned::to_owned);
-
-    // Extract account_id from id_token if available.
-    let account_id = new_id.as_deref().and_then(extract_account_id_from_id_token);
-
-    let creds = CodexCredentials {
-        access_token: new_access,
-        refresh_token: new_refresh.or_else(|| Some(refresh_token.to_string())),
-        account_id,
-    };
-
-    // Persist refreshed credentials.
-    if let Err(e) = save_credentials(&creds, new_id.as_deref()) {
-        tracing::warn!("Failed to persist refreshed Codex credentials: {e}");
-    }
-
-    Ok(creds)
-}
-
-/// Extract `chatgpt_account_id` from the `https://api.openai.com/auth`
-/// JWT claim namespace.
-fn extract_account_id_from_id_token(id_token: &str) -> Option<String> {
-    let parts: Vec<&str> = id_token.split('.').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let decoded = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    value
-        .get("https://api.openai.com/auth")?
-        .get("chatgpt_account_id")?
-        .as_str()
-        .map(ToOwned::to_owned)
-}
-
-/// Save credentials back to the auth file, preserving file permissions.
-fn save_credentials(creds: &CodexCredentials, id_token: Option<&str>) -> Result<()> {
-    let path = auth_file_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating Codex auth dir: {}", parent.display()))?;
-    }
-    let auth = CodexAuthFile {
-        tokens: Some(AuthTokens {
-            access_token: Some(creds.access_token.clone()),
-            refresh_token: creds.refresh_token.clone(),
-            id_token: id_token.map(ToOwned::to_owned),
-            account_id: creds.account_id.clone(),
-        }),
-        last_refresh: Some(chrono_humanize_if_available()),
-    };
-    let json = serde_json::to_string_pretty(&auth).context("serializing credentials")?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true).mode(0o600);
-        let mut file = opts
-            .open(&path)
-            .with_context(|| format!("writing Codex auth file: {}", path.display()))?;
-        std::io::Write::write_all(&mut file, json.as_bytes())?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&path, &json)
-            .with_context(|| format!("writing Codex auth file: {}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn chrono_humanize_if_available() -> String {
-    // Simple ISO-ish timestamp without adding a chrono dependency.
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| format!("{} seconds since epoch", d.as_secs()))
-        .unwrap_or_else(|_| "unknown".to_string())
-}
-
-/// Load or refresh Codex credentials.
-///
-/// 1. Try env overrides first (`OPENAI_CODEX_ACCESS_TOKEN` / `CODEX_ACCESS_TOKEN`).
-/// 2. Load from auth file.
-/// 3. If access token is expired and refresh token is available, refresh.
-///
-/// Synchronous so it can be called from the prompt-free config credential
-/// resolution path (mirrors the Kimi OAuth flow).
-pub fn get_credentials() -> Result<CodexCredentials> {
-    // Env override takes priority.
-    if let Ok(token) = std::env::var("OPENAI_CODEX_ACCESS_TOKEN")
-        && !token.trim().is_empty()
-    {
-        return Ok(CodexCredentials {
-            access_token: token,
-            refresh_token: None,
-            account_id: codex_account_id_env(),
-        });
-    }
-    if let Ok(token) = std::env::var("CODEX_ACCESS_TOKEN")
-        && !token.trim().is_empty()
-    {
-        return Ok(CodexCredentials {
-            access_token: token,
-            refresh_token: None,
-            account_id: codex_account_id_env(),
-        });
-    }
-
-    let creds = load_credentials()?.with_context(missing_auth_message)?;
+/// Load read-only credentials from the exact external path authorized by
+/// `grant`. Expired tokens fail with guidance; they are never refreshed.
+pub fn get_credentials(grant: &ExternalCredentialReadGrant) -> Result<CodexCredentials> {
+    let creds = load_credentials(grant)?.with_context(missing_auth_message)?;
 
     // Check if the access token is still valid.
     if !token_is_expired(&creds.access_token) {
         return Ok(creds);
     }
 
-    // Try refreshing.
-    match creds.refresh_token {
-        Some(ref rt) if !rt.trim().is_empty() => {
-            tracing::info!("Codex access token expired, refreshing...");
-            refresh_access_token(rt)
-        }
-        _ => bail!(
-            "Codex access token expired and no refresh token available.\n\
-             Run `codex login` to re-authenticate."
-        ),
-    }
+    bail!(
+        "Codex access token in {} is expired. Read-only consent never refreshes or rewrites another CLI's credentials. Run `codex login`, or provide OPENAI_CODEX_ACCESS_TOKEN for this process.",
+        codewhale_config::quote_os_path(grant.path())
+    )
 }
 
 #[must_use]
 pub fn missing_auth_message() -> String {
     format!(
-        "OpenAI Codex OAuth credentials not found.\n\
+        "OpenAI Codex OAuth credentials are unavailable.\n\
          \n\
-         Codewhale checked OPENAI_CODEX_ACCESS_TOKEN, CODEX_ACCESS_TOKEN, and {}.\n\
-         Run `codex login` to authenticate with ChatGPT/Codex OAuth, or set OPENAI_CODEX_ACCESS_TOKEN for this process.",
-        auth_file_path().display()
+         Codewhale checks OPENAI_CODEX_ACCESS_TOKEN and CODEX_ACCESS_TOKEN automatically.\n\
+         Access to the Codex CLI file is disabled by default. After `codex login`, grant read-only access explicitly with:\n\
+         `codewhale auth external-consent --provider openai-codex --mode read-only --path {}`\n\
+         Read-only access never refreshes or rewrites the Codex CLI file.",
+        codewhale_config::quote_os_path(&auth_file_path())
     )
-}
-
-/// Best-effort ChatGPT account id for the `chatgpt-account-id` request header.
-///
-/// Resolves from env overrides first, then the on-disk auth file. Never
-/// refreshes and never errors — a missing account id just means the header is
-/// omitted.
-pub fn codex_account_id() -> Option<String> {
-    if let Some(id) = codex_account_id_env() {
-        return Some(id);
-    }
-    load_credentials().ok().flatten().and_then(|c| c.account_id)
 }
 
 /// Read a ChatGPT account id from env overrides only.
@@ -356,13 +196,23 @@ fn codex_account_id_env() -> Option<String> {
     None
 }
 
-/// OpenAI OAuth constants (from Codex CLI reference implementation).
-const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn grant(path: &std::path::Path) -> ExternalCredentialReadGrant {
+        codewhale_config::ExternalCredentialConsentToml::read_only(
+            codewhale_config::ProviderKind::OpenaiCodex,
+            codewhale_config::ExternalCredentialSource::CodexCli,
+            path.to_path_buf(),
+        )
+        .read_grant(
+            codewhale_config::ProviderKind::OpenaiCodex,
+            codewhale_config::ExternalCredentialSource::CodexCli,
+            path,
+        )
+        .expect("test read grant")
+    }
 
     #[test]
     fn jwt_expiry_parses_valid_token() {
@@ -399,15 +249,34 @@ mod tests {
     fn credential_presence_rejects_empty_and_malformed_files_without_refresh() {
         let _lock = crate::test_support::lock_test_env();
         let home = tempfile::tempdir().expect("temp Codex home");
-        let auth_path = home.path().join("auth.json");
+        let auth_path = home
+            .path()
+            .canonicalize()
+            .expect("canonical temp root")
+            .join("auth.json");
         let _auth = crate::test_support::EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &auth_path);
         let _access = crate::test_support::EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
         let _legacy_access = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+        let grant = grant(&auth_path);
 
         std::fs::write(&auth_path, "{}").expect("empty auth");
-        assert!(!credentials_present());
+        crate::external_credentials::reset_side_effect_trap();
+        assert!(!stored_credentials_present(&grant));
+        assert_eq!(
+            crate::external_credentials::side_effect_trap_counts(),
+            (1, 1)
+        );
+        assert_eq!(
+            crate::external_credentials::complete_side_effect_trap_counts(),
+            (1, 1, 0, 0, 0)
+        );
         std::fs::write(&auth_path, "{not-json").expect("malformed auth");
-        assert!(!credentials_present());
+        crate::external_credentials::reset_side_effect_trap();
+        assert!(!stored_credentials_present(&grant));
+        assert_eq!(
+            crate::external_credentials::side_effect_trap_counts(),
+            (1, 1)
+        );
 
         let payload = URL_SAFE_NO_PAD.encode(b"{\"exp\":9999999999}");
         let access_token = format!("header.{payload}.signature");
@@ -419,7 +288,49 @@ mod tests {
             .expect("valid auth json"),
         )
         .expect("valid auth");
-        assert!(credentials_present());
+        crate::external_credentials::reset_side_effect_trap();
+        assert!(stored_credentials_present(&grant));
+        assert_eq!(
+            crate::external_credentials::side_effect_trap_counts(),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn expired_external_token_fails_without_refresh_or_rewrite() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("temp Codex home");
+        let auth_path = home
+            .path()
+            .canonicalize()
+            .expect("canonical temp root")
+            .join("auth.json");
+        let payload = URL_SAFE_NO_PAD.encode(b"{\"exp\":1000000000}");
+        let access_token = format!("header.{payload}.signature");
+        let raw = serde_json::to_string_pretty(&serde_json::json!({
+            "tokens": {
+                "access_token": access_token,
+                "refresh_token": "must-never-be-used",
+                "account_id": "acct-test",
+                "future_field": {"preserve": true}
+            },
+            "future_top_level": [1, 2, 3]
+        }))
+        .expect("auth fixture");
+        std::fs::write(&auth_path, &raw).expect("expired auth fixture");
+
+        crate::external_credentials::reset_side_effect_trap();
+        let error = get_credentials(&grant(&auth_path))
+            .expect_err("read-only external tokens must not refresh");
+        assert!(error.to_string().contains("never refreshes or rewrites"));
+        assert_eq!(
+            crate::external_credentials::side_effect_trap_counts(),
+            (1, 1)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&auth_path).expect("unchanged auth file"),
+            raw
+        );
     }
 
     #[test]
@@ -430,14 +341,34 @@ mod tests {
     }
 
     #[test]
-    fn missing_auth_message_mentions_oauth_checked_locations() {
+    fn missing_auth_message_explains_disabled_default_and_explicit_consent() {
         let _lock = crate::test_support::lock_test_env();
         let message = missing_auth_message();
 
-        assert!(message.contains("OpenAI Codex OAuth credentials not found"));
+        assert!(message.contains("OpenAI Codex OAuth credentials are unavailable"));
         assert!(message.contains("OPENAI_CODEX_ACCESS_TOKEN"));
         assert!(message.contains("CODEX_ACCESS_TOKEN"));
-        assert!(message.contains(&auth_file_path().display().to_string()));
+        assert!(message.contains(&codewhale_config::quote_os_path(&auth_file_path())));
         assert!(message.contains("codex login"));
+        assert!(message.contains("external-consent"));
+        assert!(message.contains("disabled by default"));
+    }
+
+    #[test]
+    fn malformed_codex_credential_errors_never_echo_file_contents() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("temp Codex home");
+        let path = home.path().canonicalize().unwrap().join("auth.json");
+        let sentinel = "must-not-appear-in-diagnostics";
+        std::fs::write(
+            &path,
+            format!(r#"{{"tokens":{{"access_token":{{"secret":"{sentinel}"}}}}}}"#),
+        )
+        .unwrap();
+
+        let error = load_credentials(&grant(&path)).expect_err("malformed schema");
+        let message = format!("{error:#}");
+        assert!(message.contains("not valid credential JSON"), "{message}");
+        assert!(!message.contains(sentinel), "{message}");
     }
 }

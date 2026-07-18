@@ -625,10 +625,17 @@ fn load_oauth_tokens(server_name: &str, url: &str) -> Result<Option<StoredMcpOAu
     else {
         return Ok(None);
     };
-    let mut tokens: StoredMcpOAuthTokens = serde_json::from_str(&serialized)
-        .with_context(|| format!("parsing stored MCP OAuth token for '{server_name}'"))?;
+    let mut tokens = parse_stored_oauth_tokens(&serialized, server_name)?;
     refresh_expires_in_from_timestamp(&mut tokens);
     Ok(Some(tokens))
+}
+
+fn parse_stored_oauth_tokens(serialized: &str, server_name: &str) -> Result<StoredMcpOAuthTokens> {
+    serde_json::from_str(serialized).map_err(|_| {
+        anyhow!(
+            "stored MCP OAuth token for '{server_name}' is not valid credential JSON; contents were omitted"
+        )
+    })
 }
 
 fn save_oauth_tokens(tokens: &StoredMcpOAuthTokens) -> Result<()> {
@@ -1103,6 +1110,19 @@ mod tests {
         assert!(key.starts_with("mcp_oauth_"));
         assert!(!key.contains("github"));
         assert!(!key.contains("example.com"));
+    }
+
+    #[test]
+    fn malformed_stored_oauth_diagnostic_omits_secret_contents_and_keys() {
+        let secret = "cw-secret-mcp-oauth-4507";
+        let serialized =
+            format!(r#"{{"token_response":{{"access_token":"{secret}"}} trailing-junk}}"#);
+        let error = parse_stored_oauth_tokens(&serialized, "private")
+            .expect_err("malformed credential JSON must fail");
+        let diagnostic = format!("{error:#}");
+        assert!(!diagnostic.contains(secret), "{diagnostic}");
+        assert!(!diagnostic.contains("access_token"), "{diagnostic}");
+        assert!(diagnostic.contains("contents were omitted"), "{diagnostic}");
     }
 
     #[test]

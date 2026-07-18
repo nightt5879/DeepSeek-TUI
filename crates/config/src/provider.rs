@@ -264,7 +264,7 @@ pub const fn credential_help(kind: ProviderKind) -> CredentialHelp {
             acquisition: OAuth,
             credential_url: None,
             docs_url: Some("https://developers.openai.com/codex/"),
-            guidance: "Run `codex login`; Codewhale reuses the Codex OAuth file and does not store an API key.",
+            guidance: "Run `codex login`, then explicitly grant Codewhale read-only access to that exact Codex credential file; or use a process-scoped token environment variable.",
         },
         ProviderKind::Anthropic => CredentialHelp {
             acquisition: ApiKey,
@@ -332,7 +332,7 @@ pub const fn credential_help(kind: ProviderKind) -> CredentialHelp {
             acquisition: ApiKeyOrOAuth,
             credential_url: Some("https://console.x.ai/"),
             docs_url: None,
-            guidance: "Use an xAI Console API key, or deliberately select the supported Grok OAuth mode.",
+            guidance: "Use an xAI Console API key or Codewhale's native device login. Reading an existing Grok CLI file requires explicit provider-scoped read-only consent.",
         },
         ProviderKind::Custom => CredentialHelp {
             acquisition: Configuration,

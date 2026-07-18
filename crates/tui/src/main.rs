@@ -47,6 +47,7 @@ mod dependencies;
 mod error_taxonomy;
 mod eval;
 mod execpolicy;
+mod external_credentials;
 mod fast_hash;
 mod features;
 mod fleet;
@@ -3011,6 +3012,8 @@ enum ApiKeySource {
     Env,
     Config,
     Keyring,
+    OAuth,
+    ExternalConsent,
     NoAuth,
     Missing,
 }
@@ -3022,6 +3025,26 @@ fn resolve_api_key_source(config: &Config) -> ApiKeySource {
         return ApiKeySource::NoAuth;
     }
     let custom_endpoint = config.provider_uses_custom_endpoint(provider);
+    if !custom_endpoint && provider == crate::config::ApiProvider::OpenaiCodex {
+        if crate::oauth::credentials_from_env().is_some() {
+            return ApiKeySource::Env;
+        }
+        return config
+            .external_credential_consent_status(provider)
+            .filter(|status| status.route_state == "active")
+            .map_or(ApiKeySource::Missing, |_| ApiKeySource::ExternalConsent);
+    }
+    if !custom_endpoint
+        && provider == crate::config::ApiProvider::Xai
+        && auth_mode
+            .as_deref()
+            .is_some_and(crate::xai_oauth::auth_mode_uses_xai_oauth)
+    {
+        return config
+            .external_credential_consent_status(provider)
+            .filter(|status| status.route_state == "active")
+            .map_or(ApiKeySource::OAuth, |_| ApiKeySource::ExternalConsent);
+    }
     if std::env::var("DEEPSEEK_API_KEY")
         .ok()
         .filter(|k| !k.trim().is_empty())
@@ -3155,6 +3178,14 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
         ApiKeySource::Config => println!(
             "  {} api_key: set via config",
             "✓".truecolor(aqua_r, aqua_g, aqua_b)
+        ),
+        ApiKeySource::OAuth => println!(
+            "  {} oauth: Codewhale-owned storage selected (availability not probed)",
+            "✓".truecolor(aqua_r, aqua_g, aqua_b)
+        ),
+        ApiKeySource::ExternalConsent => println!(
+            "  {} oauth: external read-only consent configured (credential file not probed)",
+            "·".dimmed()
         ),
         ApiKeySource::NoAuth => println!(
             "  {} api_key: disabled for this route",
@@ -3362,6 +3393,30 @@ fn doctor_should_probe_api(
     !local || probe_local
 }
 
+/// Doctor must never turn credential inspection into a refresh/write path.
+/// OAuth connectivity is exercised by an ordinary user request instead;
+/// doctor limits itself to non-mutating readiness inspection.
+fn doctor_should_probe_auth(config: &Config) -> bool {
+    let provider = config.api_provider();
+    if provider == crate::config::ApiProvider::OpenaiCodex
+        && !config.provider_uses_custom_endpoint(provider)
+    {
+        return false;
+    }
+    let auth_mode = config.auth_mode_for_provider(provider);
+    if provider == crate::config::ApiProvider::Xai
+        && auth_mode
+            .as_deref()
+            .is_some_and(crate::xai_oauth::auth_mode_uses_xai_oauth)
+    {
+        return false;
+    }
+    !(provider == crate::config::ApiProvider::Moonshot
+        && auth_mode
+            .as_deref()
+            .is_some_and(crate::config::auth_mode_uses_kimi_imported_token))
+}
+
 /// Run system diagnostics
 async fn run_doctor(
     config: &Config,
@@ -3548,13 +3603,26 @@ async fn run_doctor(
         );
     }
     println!("  · credential precedence: ~/.codewhale/config.toml, OS keyring, then env");
+    println!();
+    println!(
+        "{}",
+        "External credential consent (configuration only):".bold()
+    );
+    for line in doctor_external_credential_consent_lines(config) {
+        println!("  {line}");
+    }
 
     let api_key_source = resolve_api_key_source(config);
-    let has_api_key = if config.deepseek_api_key().is_ok() {
+    let has_api_key = if !matches!(
+        api_key_source,
+        ApiKeySource::Missing | ApiKeySource::ExternalConsent
+    ) {
         let source_label = match api_key_source {
             ApiKeySource::Config => "config.toml",
             ApiKeySource::Keyring => "OS keyring",
             ApiKeySource::Env => "environment",
+            ApiKeySource::OAuth => "non-mutating OAuth readiness",
+            ApiKeySource::ExternalConsent => "external consent (not probed)",
             ApiKeySource::NoAuth => "no-auth route",
             ApiKeySource::Missing
                 if matches!(
@@ -3620,6 +3688,7 @@ async fn run_doctor(
         );
     }
     if has_api_key
+        && doctor_should_probe_auth(config)
         && doctor_should_probe_api(config.api_provider(), &api_target.base_url, probe_local)
     {
         print!("  {} Testing connection...", "·".dimmed());
@@ -3675,6 +3744,14 @@ async fn run_doctor(
                 }
             }
         }
+    } else if has_api_key && !doctor_should_probe_auth(config) {
+        println!(
+            "  {} Live OAuth connectivity not checked by non-mutating doctor",
+            "·".dimmed()
+        );
+        println!(
+            "    Doctor never refreshes or rewrites credentials; exercise the route with a normal request."
+        );
     } else if has_api_key {
         println!(
             "  {} Live connectivity not checked for this local endpoint",
@@ -4741,7 +4818,10 @@ fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_
     use serde_json::json;
 
     let provider = config.api_provider();
-    let has_credentials_or_local = crate::config::has_api_key_for(config, provider);
+    // Doctor reports configured routing posture only. In particular it must
+    // never consume an external-file grant merely to label Fleet readiness.
+    let auth_source = resolve_api_key_source(config);
+    let has_credentials_or_local = doctor_auth_present_or_local(provider, auth_source);
     let subagents_enabled = config.subagents_enabled_for_provider(provider);
     let disabled_reason = if subagents_enabled {
         None
@@ -4781,7 +4861,7 @@ fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_
             "id": config.provider_identity_for(provider),
             "auth": {
                 "present_or_local": has_credentials_or_local,
-                "source": doctor_api_key_source_label(resolve_api_key_source(config)),
+                "source": doctor_api_key_source_label(auth_source),
             },
         },
         "worker_runtime": {
@@ -4819,7 +4899,7 @@ fn doctor_provider_model_report_json(config: &Config) -> serde_json::Value {
 
     let provider = config.api_provider();
     let auth_source = resolve_api_key_source(config);
-    let auth_present_or_local = crate::config::has_api_key_for(config, provider);
+    let auth_present_or_local = doctor_auth_present_or_local(provider, auth_source);
     let credential_help = provider.credential_help();
 
     json!({
@@ -4850,6 +4930,85 @@ fn doctor_provider_model_report_json(config: &Config) -> serde_json::Value {
             },
         },
     })
+}
+
+fn doctor_auth_present_or_local(
+    provider: crate::config::ApiProvider,
+    auth_source: ApiKeySource,
+) -> bool {
+    !matches!(
+        auth_source,
+        ApiKeySource::Missing | ApiKeySource::ExternalConsent
+    ) || matches!(
+        provider,
+        crate::config::ApiProvider::Sglang
+            | crate::config::ApiProvider::Vllm
+            | crate::config::ApiProvider::Ollama
+    )
+}
+
+fn doctor_external_credential_consent_statuses(
+    config: &Config,
+) -> Vec<codewhale_config::ExternalCredentialConsentStatus> {
+    [
+        crate::config::ApiProvider::OpenaiCodex,
+        crate::config::ApiProvider::Xai,
+    ]
+    .into_iter()
+    .filter_map(|provider| config.external_credential_consent_status(provider))
+    .collect()
+}
+
+fn doctor_external_credential_consent_lines(config: &Config) -> Vec<String> {
+    doctor_external_credential_consent_statuses(config)
+        .into_iter()
+        .flat_map(|status| {
+            let mut lines = vec![
+                format!(
+                    "{}: access={}, provider={}, source={}, owner={}, path={}, version={}, state={}, ambient_path_changed={}",
+                    status.provider,
+                    status.access.as_str(),
+                    status.provider,
+                    status.source.as_str(),
+                    status.owner,
+                    codewhale_config::quote_os_path(&status.path),
+                    status.consent_version,
+                    status.route_state,
+                    status.ambient_path_changed,
+                ),
+                format!("  semantics: {}", status.semantics),
+                format!("  revoke: {}", status.revoke_command),
+            ];
+            if let Some(warning) = status.ambient_path_warning() {
+                lines.push(format!("  {warning}"));
+            }
+            lines
+        })
+        .collect()
+}
+
+fn doctor_external_credential_consent_json(config: &Config) -> serde_json::Value {
+    serde_json::Value::Array(
+        doctor_external_credential_consent_statuses(config)
+            .into_iter()
+            .map(|status| {
+                serde_json::json!({
+                    "provider": status.provider,
+                    "access": status.access.as_str(),
+                    "source": status.source.as_str(),
+                    "owner": status.owner,
+                    "path": codewhale_config::quote_os_path(&status.path),
+                    "consent_version": status.consent_version,
+                    "scope_valid": status.scope_valid,
+                    "ambient_path_changed": status.ambient_path_changed,
+                    "ambient_path_warning": status.ambient_path_warning(),
+                    "route_state": status.route_state,
+                    "semantics": status.semantics,
+                    "revoke_command": status.revoke_command,
+                })
+            })
+            .collect(),
+    )
 }
 
 fn doctor_setup_report_json(config: &Config, workspace: &Path) -> serde_json::Value {
@@ -5050,6 +5209,8 @@ fn run_doctor_json(
         ApiKeySource::Env => "env",
         ApiKeySource::Config => "config",
         ApiKeySource::Keyring => "keyring",
+        ApiKeySource::OAuth => "oauth",
+        ApiKeySource::ExternalConsent => "external_consent",
         ApiKeySource::NoAuth => "none",
         ApiKeySource::Missing => "missing",
     };
@@ -5170,6 +5331,7 @@ fn run_doctor_json(
         "api_key": {
             "source": api_key_state,
         },
+        "external_credentials": doctor_external_credential_consent_json(config),
         "base_url": crate::client::redact_url_for_display(&api_target.base_url),
         "default_text_model": api_target.model,
         "route": doctor_route_report(config),
@@ -5427,6 +5589,8 @@ fn doctor_api_key_source_label(source: ApiKeySource) -> &'static str {
         ApiKeySource::Env => "env",
         ApiKeySource::Config => "config",
         ApiKeySource::Keyring => "keyring",
+        ApiKeySource::OAuth => "oauth",
+        ApiKeySource::ExternalConsent => "external_consent",
         ApiKeySource::NoAuth => "none",
         ApiKeySource::Missing => "missing",
     }
@@ -6084,12 +6248,12 @@ fn run_logout() -> Result<()> {
 }
 
 async fn run_xai_device_auth(config_path: Option<&Path>) -> Result<()> {
-    let _credentials = xai_oauth::device_code_login().await?;
-    let saved =
-        config::save_provider_auth_mode_for_at(config::ApiProvider::Xai, "oauth", config_path)?;
+    let pending = xai_oauth::device_code_login().await?;
+    let activation = xai_oauth::activate_device_login(pending, config_path, None)?;
     println!(
-        "xAI OAuth is ready; saved [providers.xai] auth_mode = \"oauth\" to {}",
-        saved.display()
+        "xAI OAuth is ready; activated {} via {}",
+        codewhale_config::quote_os_path(&activation.auth_path),
+        codewhale_config::quote_os_path(&activation.config_path)
     );
     Ok(())
 }
@@ -7074,8 +7238,12 @@ fn load_mcp_config(path: &Path) -> Result<McpConfig> {
     }
     let contents = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("Failed to read MCP config {}: {}", path.display(), e))?;
-    let cfg: McpConfig = serde_json::from_str(&contents)
-        .map_err(|e| anyhow::anyhow!("Failed to parse MCP config: {e}"))?;
+    let cfg: McpConfig = serde_json::from_str(&contents).map_err(|_| {
+        anyhow::anyhow!(
+            "Failed to parse MCP config {}; file contents were omitted",
+            codewhale_config::quote_os_path(path)
+        )
+    })?;
     Ok(cfg)
 }
 
@@ -10275,6 +10443,19 @@ mod doctor_setup_state_tests {
         let _deepseek_source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
         let _codex_key = crate::test_support::EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
         let _codex_legacy_key = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+        let codex_auth_path = tmp.path().join("external-codex-auth.json");
+        let codex_auth_raw = serde_json::json!({
+            "tokens": {
+                "access_token": crate::test_support::future_test_jwt("doctor"),
+                "account_id": "acct-doctor-read-only",
+                "refresh_token": "must-never-be-used",
+                "unknown": {"preserve": true}
+            }
+        })
+        .to_string();
+        fs::write(&codex_auth_path, &codex_auth_raw).expect("Codex auth trap fixture");
+        let _codex_auth =
+            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &codex_auth_path);
         let workspace = tmp.path().join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
 
@@ -10306,6 +10487,7 @@ mod doctor_setup_state_tests {
             provider: Some("openai-codex".to_string()),
             ..Config::default()
         };
+        crate::external_credentials::reset_side_effect_trap();
         let codex_report = doctor_setup_report_json(&codex_config, &workspace);
         assert_eq!(
             codex_report["provider_model"]["provider"]["id"],
@@ -10320,6 +10502,110 @@ mod doctor_setup_state_tests {
         assert_eq!(
             codex_report["provider_model"]["health"]["next_action"],
             "/setup provider or /provider setup <name>"
+        );
+        assert_eq!(
+            crate::external_credentials::side_effect_trap_counts(),
+            (0, 0),
+            "doctor must not stat or read external credentials without consent"
+        );
+
+        let mut consent = codewhale_config::ExternalCredentialConsentToml::read_only(
+            codewhale_config::ProviderKind::OpenaiCodex,
+            codewhale_config::ExternalCredentialSource::CodexCli,
+            codex_auth_path.clone(),
+        );
+        let codex_read_only = Config {
+            provider: Some("openai-codex".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                openai_codex: crate::config::ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    external_credentials: Some(consent.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let changed_ambient_path = tmp.path().join("new-ambient-codex-auth.json");
+        let _changed_codex_auth =
+            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &changed_ambient_path);
+        crate::external_credentials::reset_side_effect_trap();
+        let codex_read_only_report = doctor_setup_report_json(&codex_read_only, &workspace);
+        assert_eq!(
+            codex_read_only_report["provider_model"]["auth"]["present_or_local"],
+            false
+        );
+        assert_eq!(
+            codex_read_only_report["provider_model"]["auth"]["source"],
+            "external_consent"
+        );
+        let status_json = doctor_external_credential_consent_json(&codex_read_only);
+        let codex_status = status_json
+            .as_array()
+            .and_then(|rows| rows.first())
+            .expect("Codex structural status");
+        assert_eq!(codex_status["access"], "read_only");
+        assert_eq!(codex_status["provider"], "openai-codex");
+        assert_eq!(codex_status["source"], "codex_cli");
+        assert_eq!(codex_status["route_state"], "active");
+        assert_eq!(codex_status["ambient_path_changed"], true);
+        assert!(
+            codex_status["ambient_path_warning"]
+                .as_str()
+                .is_some_and(|warning| warning.contains("remains pinned"))
+        );
+        assert_eq!(
+            codex_status["revoke_command"],
+            "codewhale auth external-revoke --provider openai-codex"
+        );
+        let human = doctor_external_credential_consent_lines(&codex_read_only).join("\n");
+        assert!(human.contains("path="), "{human}");
+        assert!(human.contains("version=1"), "{human}");
+        assert!(human.contains("no refresh, identity-provider or discovery requests"));
+        assert!(human.contains("normal requests to the explicitly selected provider"));
+        assert!(human.contains("consent remains pinned"), "{human}");
+        assert!(
+            human.contains(&codewhale_config::quote_os_path(&codex_auth_path)),
+            "{human}"
+        );
+        assert!(!human.contains(&changed_ambient_path.display().to_string()));
+        assert_eq!(
+            crate::external_credentials::complete_side_effect_trap_counts(),
+            (0, 0, 0, 0, 0),
+            "doctor consent status is structural and must not inspect the file"
+        );
+        assert_eq!(
+            fs::read_to_string(&codex_auth_path).expect("unchanged Codex auth fixture"),
+            codex_auth_raw
+        );
+
+        consent.access = codewhale_config::ExternalCredentialAccess::Managed;
+        let codex_managed = Config {
+            provider: Some("openai-codex".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                openai_codex: crate::config::ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    external_credentials: Some(consent),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        crate::external_credentials::reset_side_effect_trap();
+        let codex_managed_report = doctor_setup_report_json(&codex_managed, &workspace);
+        assert_eq!(
+            codex_managed_report["provider_model"]["auth"]["present_or_local"],
+            false
+        );
+        assert_eq!(
+            crate::external_credentials::side_effect_trap_counts(),
+            (0, 0),
+            "unsupported managed mode must fail before external I/O"
+        );
+        assert_eq!(
+            fs::read_to_string(&codex_auth_path).expect("unchanged managed auth fixture"),
+            codex_auth_raw
         );
 
         let local_config = Config {
@@ -13844,6 +14130,29 @@ mod doctor_live_probe_tests {
             "https://api.deepseek.com/beta",
             false,
         ));
+    }
+
+    #[test]
+    fn oauth_routes_skip_live_probe_to_keep_doctor_non_mutating() {
+        let codex = Config {
+            provider: Some("openai-codex".to_string()),
+            ..Config::default()
+        };
+        assert!(!doctor_should_probe_auth(&codex));
+
+        let xai = Config {
+            provider: Some("xai".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                xai: crate::config::ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        assert!(!doctor_should_probe_auth(&xai));
+        assert!(doctor_should_probe_auth(&Config::default()));
     }
 }
 
