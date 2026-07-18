@@ -104,10 +104,9 @@ fn token_is_expired(access_token: &str) -> bool {
 /// Returns `Ok(None)` if the file doesn't exist or has no usable tokens.
 /// Returns `Err` only on parse/IO errors that aren't "file not found".
 fn load_credentials(grant: &ExternalCredentialReadGrant) -> Result<Option<CodexCredentials>> {
-    if !crate::external_credentials::exists(grant) {
+    let Some(contents) = crate::external_credentials::read_to_string(grant)? else {
         return Ok(None);
-    }
-    let contents = crate::external_credentials::read_to_string(grant)?;
+    };
     let auth: CodexAuthFile = serde_json::from_str(&contents)
         .with_context(|| format!("parsing Codex auth file: {}", grant.path().display()))?;
     let tokens = match auth.tokens {
@@ -180,20 +179,6 @@ pub fn missing_auth_message() -> String {
     )
 }
 
-/// Best-effort ChatGPT account id for the `chatgpt-account-id` request header.
-///
-/// Resolves from env overrides first, then the on-disk auth file. Never
-/// refreshes and never errors — a missing account id just means the header is
-/// omitted.
-pub fn codex_account_id(grant: Option<&ExternalCredentialReadGrant>) -> Option<String> {
-    if let Some(id) = codex_account_id_env() {
-        return Some(id);
-    }
-    grant
-        .and_then(|grant| load_credentials(grant).ok().flatten())
-        .and_then(|c| c.account_id)
-}
-
 /// Read a ChatGPT account id from env overrides only.
 fn codex_account_id_env() -> Option<String> {
     for var in ["OPENAI_CODEX_ACCOUNT_ID", "CODEX_ACCOUNT_ID"] {
@@ -260,7 +245,11 @@ mod tests {
     fn credential_presence_rejects_empty_and_malformed_files_without_refresh() {
         let _lock = crate::test_support::lock_test_env();
         let home = tempfile::tempdir().expect("temp Codex home");
-        let auth_path = home.path().join("auth.json");
+        let auth_path = home
+            .path()
+            .canonicalize()
+            .expect("canonical temp root")
+            .join("auth.json");
         let _auth = crate::test_support::EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &auth_path);
         let _access = crate::test_support::EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
         let _legacy_access = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
@@ -303,7 +292,11 @@ mod tests {
     fn expired_external_token_fails_without_refresh_or_rewrite() {
         let _lock = crate::test_support::lock_test_env();
         let home = tempfile::tempdir().expect("temp Codex home");
-        let auth_path = home.path().join("auth.json");
+        let auth_path = home
+            .path()
+            .canonicalize()
+            .expect("canonical temp root")
+            .join("auth.json");
         let payload = URL_SAFE_NO_PAD.encode(b"{\"exp\":1000000000}");
         let access_token = format!("header.{payload}.signature");
         let raw = serde_json::to_string_pretty(&serde_json::json!({

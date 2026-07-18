@@ -39,6 +39,7 @@ use crate::config::{
     ApiProvider, Config, base_url_uses_local_host, has_api_key_for, provider_is_configured,
 };
 use crate::core::ops::ProviderRuntimeStatus;
+use crate::localization::{Locale, MessageId, tr};
 use crate::model_profile::{SupportState, resolved_capability_profile};
 use crate::models_dev_live::{self, ModelsDevFreshness};
 use crate::palette;
@@ -58,17 +59,29 @@ use codewhale_config::route::{
     LogicalModelRef, PricingSku, RequestProtocol, RouteRequest, RouteResolver,
 };
 use serde_json::Value;
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
     List,
     KeyEntry,
+    /// Explicit disabled/read-only/managed external-credential policy choice.
+    ExternalConsentChoice,
+    /// Full owner/path/side-effect disclosure before a read grant is saved.
+    ExternalConsentConfirm,
     /// Default model pick after a key has been live-validated (#3875).
     ModelPick,
     /// Confirmation summary before any secret or model is persisted (#3875).
     Confirm,
     CustomForm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalConsentChoice {
+    Disabled,
+    ReadOnly,
+    ManagedUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +112,8 @@ pub struct ProviderPickerView {
     /// An error surfaced after a failed key verification, shown inline
     /// in the key-entry stage. Cleared when the user edits the input.
     key_entry_error: Option<String>,
+    locale: Locale,
+    external_consent_choice: ExternalConsentChoice,
     /// Validated key held only in memory until the confirm stage persists it.
     pending_api_key: Option<String>,
     /// Catalog models offered during the model-pick stage.
@@ -133,6 +148,7 @@ pub struct ProviderDashboardRow {
     pub(crate) readiness: ResolvedProviderReadiness,
     pub maturity: ProviderMaturity,
     pub messages: Vec<String>,
+    external_credential_status: Option<codewhale_config::ExternalCredentialConsentStatus>,
     pub is_active: bool,
     has_key: bool,
     credential_state: CredentialState,
@@ -487,6 +503,7 @@ impl ProviderDashboardRow {
                     "legacy DeepSeek China alias; routing maps through DeepSeek compatibility"
                         .to_string(),
                 ],
+                external_credential_status: None,
                 is_active,
                 has_key,
                 credential_state: CredentialState::Legacy,
@@ -599,6 +616,7 @@ impl ProviderDashboardRow {
         );
         let reasoning = ProviderReasoningSummary::for_route(provider, &default_route, config);
         let capabilities = ProviderCapabilityBadges::for_route(provider, &default_route.wire_model);
+        let external_credential_status = config.external_credential_consent_status(provider);
 
         Self {
             provider,
@@ -623,6 +641,7 @@ impl ProviderDashboardRow {
             readiness,
             maturity: ProviderMaturity::for_provider(provider),
             messages,
+            external_credential_status,
             is_active,
             has_key,
             credential_state,
@@ -1291,6 +1310,8 @@ impl ProviderPickerView {
             query: String::new(),
             api_key_input: String::new(),
             key_entry_error: None,
+            locale: Locale::En,
+            external_consent_choice: ExternalConsentChoice::Disabled,
             pending_api_key: None,
             model_options: Vec::new(),
             model_selected_idx: 0,
@@ -1303,6 +1324,16 @@ impl ProviderPickerView {
         };
         picker.restore_memory(memory);
         picker
+    }
+
+    #[must_use]
+    pub(crate) fn with_locale(mut self, locale: Locale) -> Self {
+        self.locale = locale;
+        self
+    }
+
+    fn tr(&self, id: MessageId) -> Cow<'static, str> {
+        tr(self.locale, id)
     }
 
     /// Apply session-local request evidence after the static catalog rows are
@@ -1504,6 +1535,60 @@ impl ProviderPickerView {
         self.model_options.clear();
         self.model_selected_idx = 0;
         self.selected_model = None;
+    }
+
+    fn selected_external_consent_target(
+        &self,
+    ) -> Option<(
+        codewhale_config::ProviderKind,
+        codewhale_config::ExternalCredentialSource,
+        std::path::PathBuf,
+    )> {
+        let (provider, source, path) = match self.selected_provider() {
+            ApiProvider::OpenaiCodex => (
+                codewhale_config::ProviderKind::OpenaiCodex,
+                codewhale_config::ExternalCredentialSource::CodexCli,
+                crate::oauth::auth_file_path(),
+            ),
+            ApiProvider::Xai => (
+                codewhale_config::ProviderKind::Xai,
+                codewhale_config::ExternalCredentialSource::GrokCli,
+                crate::xai_oauth::auth_file_path(),
+            ),
+            _ => return None,
+        };
+        let path = codewhale_config::resolve_external_credential_path(path).ok()?;
+        Some((provider, source, path))
+    }
+
+    fn enter_external_consent_choice(&mut self) {
+        if self.selected_external_consent_target().is_some() {
+            self.external_consent_choice = ExternalConsentChoice::Disabled;
+            self.stage = Stage::ExternalConsentChoice;
+        }
+    }
+
+    fn move_external_consent_choice(&mut self, delta: isize) {
+        let index = match self.external_consent_choice {
+            ExternalConsentChoice::Disabled => 0,
+            ExternalConsentChoice::ReadOnly => 1,
+            ExternalConsentChoice::ManagedUnavailable => 2,
+        };
+        self.external_consent_choice = match (index as isize + delta).rem_euclid(3) {
+            0 => ExternalConsentChoice::Disabled,
+            1 => ExternalConsentChoice::ReadOnly,
+            _ => ExternalConsentChoice::ManagedUnavailable,
+        };
+    }
+
+    fn build_external_consent_event(&self) -> Option<ViewEvent> {
+        let (provider, source, path) = self.selected_external_consent_target()?;
+        Some(ViewEvent::ProviderPickerExternalConsentConfirmed {
+            provider: self.selected_provider(),
+            consent_provider: provider,
+            source,
+            path,
+        })
     }
 
     /// Open the picker already focused on `target` in its key-entry stage
@@ -1790,6 +1875,7 @@ impl ProviderPickerView {
                     ActionHint::new("A", view_action),
                     ActionHint::new("C", "custom"),
                     ActionHint::new("R", "edit key"),
+                    ActionHint::new("X", self.tr(MessageId::ProviderExternalActionRevoke)),
                     ActionHint::new("M", "models"),
                     ActionHint::new("Esc", "cancel"),
                 ],
@@ -1977,6 +2063,51 @@ impl ProviderPickerView {
                 Style::default().fg(palette::STATUS_WARNING),
             )));
         }
+        if let Some(status) = row.external_credential_status.as_ref() {
+            let state = if status.route_state == "active" {
+                self.tr(MessageId::CtxInspActive)
+            } else {
+                self.tr(MessageId::ProviderExternalDormant)
+            };
+            let scope = self
+                .tr(MessageId::ProviderExternalDetailScope)
+                .replace("{access}", status.access.as_str())
+                .replace("{provider}", &status.provider)
+                .replace("{source}", status.source.as_str())
+                .replace("{version}", &status.consent_version.to_string())
+                .replace("{state}", &state);
+            lines.push(Line::from(Span::styled(
+                scope,
+                Style::default().fg(palette::TEXT_MUTED),
+            )));
+            let owner_path = self
+                .tr(MessageId::ProviderExternalOwnerPath)
+                .replace("{owner}", status.owner)
+                .replace("{path}", &status.path.to_string_lossy());
+            lines.push(Line::from(Span::styled(
+                owner_path,
+                Style::default().fg(palette::TEXT_MUTED),
+            )));
+            let semantics = match status.access {
+                codewhale_config::ExternalCredentialAccess::Disabled => {
+                    self.tr(MessageId::ProviderExternalDisabledDetail)
+                }
+                codewhale_config::ExternalCredentialAccess::ReadOnly => {
+                    self.tr(MessageId::ProviderExternalReadOnlySemantics)
+                }
+                codewhale_config::ExternalCredentialAccess::Managed => {
+                    self.tr(MessageId::ProviderExternalManagedDetail)
+                }
+            };
+            let semantics_revoke = self
+                .tr(MessageId::ProviderExternalSemanticsRevoke)
+                .replace("{semantics}", &semantics)
+                .replace("{revoke}", &status.revoke_command);
+            lines.push(Line::from(Span::styled(
+                semantics_revoke,
+                Style::default().fg(palette::TEXT_MUTED),
+            )));
+        }
         Paragraph::new(lines)
             .wrap(Wrap { trim: true })
             .render(inner, buf);
@@ -2007,14 +2138,22 @@ impl ProviderPickerView {
         // The action footer moves into the body so it wraps instead of clipping
         // at narrow widths (#3732); the key-entry fields render above it.
         let content = if codex_oauth {
-            render_modal_footer(inner, buf, &[ActionHint::new("Esc", "back")])
+            render_modal_footer(
+                inner,
+                buf,
+                &[
+                    ActionHint::new("Enter", self.tr(MessageId::ProviderExternalActionChoices)),
+                    ActionHint::new("Esc", self.tr(MessageId::SetupActionBack)),
+                ],
+            )
         } else if xai_oauth {
             render_modal_footer(
                 inner,
                 buf,
                 &[
                     ActionHint::new("Enter", "device login"),
-                    ActionHint::new("Esc", "back"),
+                    ActionHint::new("E", self.tr(MessageId::ProviderExternalActionReuseGrok)),
+                    ActionHint::new("Esc", self.tr(MessageId::SetupActionBack)),
                 ],
             )
         } else {
@@ -2058,7 +2197,8 @@ impl ProviderPickerView {
         let mut hint_lines = if codex_oauth {
             vec![
                 Line::from(Span::styled(
-                    "After `codex login`, run `codewhale auth external-consent --provider openai-codex --mode read-only`.",
+                    self.tr(MessageId::ProviderExternalHintCodexReview)
+                        .replace("{login}", "codex login"),
                     Style::default().fg(palette::TEXT_MUTED),
                 )),
                 Line::from(Span::styled(
@@ -2069,15 +2209,21 @@ impl ProviderPickerView {
                     Style::default().fg(palette::TEXT_MUTED),
                 )),
                 Line::from(Span::styled(
-                    "Read-only access checks the selected external file; no token is stored here.",
+                    "CLI: codewhale auth external-consent --provider openai-codex; no token is stored here.",
                     Style::default().fg(palette::TEXT_MUTED),
                 )),
             ]
         } else if xai_oauth {
-            vec![Line::from(Span::styled(
-                "Press Enter for xAI device login, or use XAI_API_KEY and re-open this picker.",
-                Style::default().fg(palette::TEXT_MUTED),
-            ))]
+            vec![
+                Line::from(Span::styled(
+                    self.tr(MessageId::ProviderExternalHintXaiReview),
+                    Style::default().fg(palette::TEXT_MUTED),
+                )),
+                Line::from(Span::styled(
+                    self.tr(MessageId::ProviderExternalHintXaiApiKey),
+                    Style::default().fg(palette::TEXT_MUTED),
+                )),
+            ]
         } else {
             vec![Line::from(Span::styled(
                 format!(
@@ -2117,6 +2263,123 @@ impl ProviderPickerView {
 
         Paragraph::new(key_lines).render(layout[0], buf);
         Paragraph::new(hint_lines).render(layout[1], buf);
+    }
+
+    fn render_external_consent_choice(&self, area: Rect, buf: &mut Buffer) {
+        let provider_name = self.rows[self.selected_idx].display_name.clone();
+        let outer = Block::default()
+            .title(Line::from(Span::styled(
+                self.tr(MessageId::ProviderExternalChoiceTitle)
+                    .replace("{provider}", &provider_name),
+                Style::default()
+                    .fg(palette::WHALE_INFO)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette::BORDER_COLOR))
+            .style(Style::default().bg(palette::WHALE_BG));
+        let inner = outer.inner(area);
+        outer.render(area, buf);
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("↑↓", self.tr(MessageId::ProviderExternalActionChoose)),
+                ActionHint::new("Enter", self.tr(MessageId::SetupActionContinue)),
+                ActionHint::new("Esc", self.tr(MessageId::SetupActionBack)),
+            ],
+        );
+        let selected = self.external_consent_choice;
+        let row = |choice, label: Cow<'static, str>, detail: Cow<'static, str>| {
+            let marker = if selected == choice { "▸" } else { " " };
+            Line::from(vec![
+                Span::styled(
+                    format!("{marker} {label}"),
+                    Style::default().fg(if selected == choice {
+                        palette::WHALE_INFO
+                    } else {
+                        palette::TEXT_PRIMARY
+                    }),
+                ),
+                Span::styled(
+                    format!(" · {detail}"),
+                    Style::default().fg(palette::TEXT_MUTED),
+                ),
+            ])
+        };
+        Paragraph::new(vec![
+            Line::from(self.tr(MessageId::ProviderExternalChoiceIntro)),
+            Line::from(""),
+            row(
+                ExternalConsentChoice::Disabled,
+                self.tr(MessageId::ProviderExternalDisabledLabel),
+                self.tr(MessageId::ProviderExternalDisabledDetail),
+            ),
+            row(
+                ExternalConsentChoice::ReadOnly,
+                self.tr(MessageId::ProviderExternalReadOnlyLabel),
+                self.tr(MessageId::ProviderExternalReadOnlyDetail),
+            ),
+            row(
+                ExternalConsentChoice::ManagedUnavailable,
+                self.tr(MessageId::ProviderExternalManagedLabel),
+                self.tr(MessageId::ProviderExternalManagedDetail),
+            ),
+        ])
+        .wrap(Wrap { trim: false })
+        .render(content, buf);
+    }
+
+    fn render_external_consent_confirm(&self, area: Rect, buf: &mut Buffer) {
+        let Some((provider, source, path)) = self.selected_external_consent_target() else {
+            return;
+        };
+        let outer = Block::default()
+            .title(Line::from(Span::styled(
+                self.tr(MessageId::ProviderExternalConfirmTitle),
+                Style::default()
+                    .fg(palette::WHALE_INFO)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette::BORDER_COLOR))
+            .style(Style::default().bg(palette::WHALE_BG));
+        let inner = outer.inner(area);
+        outer.render(area, buf);
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("Enter", self.tr(MessageId::ProviderExternalActionGrant)),
+                ActionHint::new("Esc", self.tr(MessageId::SetupActionCancel)),
+            ],
+        );
+        let provider_label = self.tr(MessageId::RouteProviderLabel);
+        let owner_label = self.tr(MessageId::ProviderExternalOwnerLabel);
+        let exact_path_label = self.tr(MessageId::ProviderExternalExactPathLabel);
+        let semantics_label = self.tr(MessageId::ProviderExternalSemanticsLabel);
+        let revoke_label = self.tr(MessageId::ProviderExternalRevokeLabel);
+        Paragraph::new(vec![
+            Line::from(format!("{provider_label}: {}", provider.as_str())),
+            Line::from(format!(
+                "{owner_label}: {} ({})",
+                source.owner_label(),
+                source.as_str()
+            )),
+            Line::from(format!("{exact_path_label}: {}", path.display())),
+            Line::from(""),
+            Line::from(format!(
+                "{semantics_label}: {}.",
+                self.tr(MessageId::ProviderExternalReadOnlySemantics)
+            )),
+            Line::from(self.tr(MessageId::ProviderExternalRejectUnsafe)),
+            Line::from(format!(
+                "{revoke_label}: codewhale auth external-revoke --provider {}",
+                provider.as_str()
+            )),
+        ])
+        .wrap(Wrap { trim: false })
+        .render(content, buf);
     }
 
     fn render_model_pick(&self, area: Rect, buf: &mut Buffer) {
@@ -2438,7 +2701,11 @@ impl ModalView for ProviderPickerView {
                 self.custom_form_field_mut().push_str(sanitized.trim());
                 true
             }
-            Stage::List | Stage::ModelPick | Stage::Confirm => false,
+            Stage::List
+            | Stage::ExternalConsentChoice
+            | Stage::ExternalConsentConfirm
+            | Stage::ModelPick
+            | Stage::Confirm => false,
         }
     }
 
@@ -2482,6 +2749,18 @@ impl ModalView for ProviderPickerView {
                         self.enter_key_entry();
                         ViewAction::None
                     }
+                }
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty()
+                        && self.query.is_empty()
+                        && c.eq_ignore_ascii_case(&'x')
+                        && self.row_visible(self.selected_idx)
+                        && self.rows[self.selected_idx].credential_state
+                            == CredentialState::ExternalConsent =>
+                {
+                    ViewAction::EmitAndClose(ViewEvent::ProviderPickerExternalConsentRevoked {
+                        provider: self.selected_provider(),
+                    })
                 }
                 KeyCode::Char(c)
                     if key.modifiers.is_empty()
@@ -2580,6 +2859,7 @@ impl ModalView for ProviderPickerView {
                 }
                 KeyCode::Enter => {
                     if self.selected_provider() == ApiProvider::OpenaiCodex {
+                        self.enter_external_consent_choice();
                         return ViewAction::None;
                     }
                     if self.selected_provider() == ApiProvider::Xai {
@@ -2601,6 +2881,14 @@ impl ModalView for ProviderPickerView {
                         })
                     }
                 }
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty()
+                        && c.eq_ignore_ascii_case(&'e')
+                        && self.selected_provider() == ApiProvider::Xai =>
+                {
+                    self.enter_external_consent_choice();
+                    ViewAction::None
+                }
                 KeyCode::Char(c) => {
                     if matches!(
                         self.selected_provider(),
@@ -2617,6 +2905,56 @@ impl ModalView for ProviderPickerView {
                     }
                     ViewAction::None
                 }
+                _ => ViewAction::None,
+            },
+            Stage::ExternalConsentChoice => match key.code {
+                KeyCode::Esc => {
+                    self.stage = Stage::KeyEntry;
+                    ViewAction::None
+                }
+                KeyCode::Up => {
+                    self.move_external_consent_choice(-1);
+                    ViewAction::None
+                }
+                KeyCode::Down => {
+                    self.move_external_consent_choice(1);
+                    ViewAction::None
+                }
+                KeyCode::Char('1') => {
+                    self.external_consent_choice = ExternalConsentChoice::Disabled;
+                    ViewAction::None
+                }
+                KeyCode::Char('2') => {
+                    self.external_consent_choice = ExternalConsentChoice::ReadOnly;
+                    ViewAction::None
+                }
+                KeyCode::Char('3') => {
+                    self.external_consent_choice = ExternalConsentChoice::ManagedUnavailable;
+                    ViewAction::None
+                }
+                KeyCode::Enter => match self.external_consent_choice {
+                    ExternalConsentChoice::Disabled => {
+                        ViewAction::EmitAndClose(ViewEvent::ProviderPickerExternalConsentRevoked {
+                            provider: self.selected_provider(),
+                        })
+                    }
+                    ExternalConsentChoice::ReadOnly => {
+                        self.stage = Stage::ExternalConsentConfirm;
+                        ViewAction::None
+                    }
+                    ExternalConsentChoice::ManagedUnavailable => ViewAction::None,
+                },
+                _ => ViewAction::None,
+            },
+            Stage::ExternalConsentConfirm => match key.code {
+                KeyCode::Esc => {
+                    self.stage = Stage::ExternalConsentChoice;
+                    ViewAction::None
+                }
+                KeyCode::Enter => self
+                    .build_external_consent_event()
+                    .map(ViewAction::EmitAndClose)
+                    .unwrap_or(ViewAction::None),
                 _ => ViewAction::None,
             },
             Stage::ModelPick => match key.code {
@@ -2713,7 +3051,11 @@ impl ModalView for ProviderPickerView {
                 MouseEventKind::ScrollDown => self.move_model_selection(1),
                 _ => {}
             },
-            Stage::KeyEntry | Stage::Confirm | Stage::CustomForm => {}
+            Stage::KeyEntry
+            | Stage::ExternalConsentChoice
+            | Stage::ExternalConsentConfirm
+            | Stage::Confirm
+            | Stage::CustomForm => {}
         }
         ViewAction::None
     }
@@ -2722,6 +3064,8 @@ impl ModalView for ProviderPickerView {
         let preferred_height = match self.stage {
             Stage::List => (self.rows.len() as u16).saturating_add(2),
             Stage::KeyEntry => 10,
+            Stage::ExternalConsentChoice => 12,
+            Stage::ExternalConsentConfirm => 13,
             Stage::ModelPick => 12,
             Stage::Confirm => 10,
             Stage::CustomForm => 12,
@@ -2733,6 +3077,8 @@ impl ModalView for ProviderPickerView {
         match self.stage {
             Stage::List => self.render_list(popup_area, buf),
             Stage::KeyEntry => self.render_key_entry(popup_area, buf),
+            Stage::ExternalConsentChoice => self.render_external_consent_choice(popup_area, buf),
+            Stage::ExternalConsentConfirm => self.render_external_consent_confirm(popup_area, buf),
             Stage::ModelPick => self.render_model_pick(popup_area, buf),
             Stage::Confirm => self.render_confirm(popup_area, buf),
             Stage::CustomForm => self.render_custom_form(popup_area, buf),
@@ -4770,6 +5116,52 @@ mod tests {
             picker.handle_key(key(KeyCode::Enter)),
             ViewAction::None
         ));
+        assert_eq!(picker.stage, Stage::ExternalConsentChoice);
+        let choices = render_text(&picker, 100, 20);
+        assert!(choices.contains("Disabled (default)"), "{choices}");
+        assert!(choices.contains("Read-only"), "{choices}");
+        assert!(choices.contains("Managed (unavailable)"), "{choices}");
+
+        picker.handle_key(key(KeyCode::Char('2')));
+        picker.handle_key(key(KeyCode::Enter));
+        assert_eq!(picker.stage, Stage::ExternalConsentConfirm);
+        let confirm = render_text(&picker, 120, 22);
+        assert!(confirm.contains("Owning CLI: Codex CLI"), "{confirm}");
+        assert!(confirm.contains("Exact resolved path:"), "{confirm}");
+        assert!(confirm.contains("no refresh, network requests, writes, or rewrites"));
+        assert!(confirm.contains("external-revoke --provider openai-codex"));
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Enter)),
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerExternalConsentConfirmed {
+                provider: ApiProvider::OpenaiCodex,
+                consent_provider: codewhale_config::ProviderKind::OpenaiCodex,
+                source: codewhale_config::ExternalCredentialSource::CodexCli,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn external_consent_surface_uses_the_selected_locale() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new_for_missing_auth(
+            ApiProvider::Deepseek,
+            ApiProvider::OpenaiCodex,
+            &config,
+            None,
+        )
+        .expect("OpenAI Codex has a picker row")
+        .with_locale(crate::localization::Locale::ZhHans);
+
+        picker.handle_key(key(KeyCode::Enter));
+        let choices = render_text(&picker, 100, 20);
+        let compact = choices
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>();
+        assert!(compact.contains("外部凭据访问"), "{choices}");
+        assert!(compact.contains("禁用（默认）"), "{choices}");
+        assert!(compact.contains("托管（不可用）"), "{choices}");
     }
 
     #[test]
@@ -4796,6 +5188,21 @@ mod tests {
             picker.handle_key(key(KeyCode::Enter)),
             ViewAction::EmitAndClose(ViewEvent::ProviderPickerXaiOAuthRequested)
         ));
+
+        let mut external = ProviderPickerView::new_for_missing_auth(
+            ApiProvider::Deepseek,
+            ApiProvider::Xai,
+            &config,
+            None,
+        )
+        .expect("xAI has a picker row");
+        assert!(matches!(
+            external.handle_key(key(KeyCode::Char('e'))),
+            ViewAction::None
+        ));
+        assert_eq!(external.stage, Stage::ExternalConsentChoice);
+        let rendered = render_text(&external, 100, 20);
+        assert!(rendered.contains("Managed (unavailable)"), "{rendered}");
     }
 
     #[test]
@@ -4892,12 +5299,23 @@ mod tests {
             let row = &picker.rows[index];
             assert_eq!(row.credential_state, CredentialState::ExternalConsent);
             assert_eq!(row.auth_status, ProviderAuthStatus::OAuthConsented);
+            let structural = row
+                .external_credential_status
+                .as_ref()
+                .expect("external status");
+            assert_eq!(structural.access.as_str(), "read_only");
+            assert_eq!(structural.route_state, "dormant");
+            assert!(structural.revoke_command.contains(provider.as_str()));
             assert_eq!(
                 row.readiness,
                 ResolvedProviderReadiness::ExternalConsentPendingSelection
             );
             assert!(!row.readiness.can_attempt());
             picker.selected_idx = index;
+            let visible = render_text(&picker, 140, 32);
+            assert!(visible.contains("External: access=read_only"), "{visible}");
+            assert!(visible.contains("Owner/path:"), "{visible}");
+            assert!(visible.contains("revoke: codewhale auth external-revoke"));
             assert!(
                 picker.selected_has_key(),
                 "selecting {provider:?} should activate the consented route before checking it"
@@ -4910,6 +5328,12 @@ mod tests {
                 }) if selected == provider
             ));
         }
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Char('x'))),
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerExternalConsentRevoked {
+                provider: ApiProvider::Xai
+            })
+        ));
 
         let inventory = crate::model_inventory::ModelInventory::from_config(&config);
         assert!(

@@ -44,8 +44,10 @@ use codewhale_execpolicy::{ExecPolicyEngine, Ruleset};
 use codewhale_secrets::SecretSource;
 pub use codewhale_secrets::Secrets;
 pub use external_credentials::{
-    EXTERNAL_CREDENTIAL_CONSENT_VERSION, ExternalCredentialAccess, ExternalCredentialConsentToml,
-    ExternalCredentialReadGrant, ExternalCredentialSource, resolve_external_credential_path,
+    EXTERNAL_CREDENTIAL_CONSENT_VERSION, EXTERNAL_CREDENTIAL_READ_ONLY_SEMANTICS,
+    ExternalCredentialAccess, ExternalCredentialConsentStatus, ExternalCredentialConsentToml,
+    ExternalCredentialReadGrant, ExternalCredentialSource, external_credential_consent_status,
+    resolve_external_credential_path,
 };
 use serde::{Deserialize, Serialize};
 

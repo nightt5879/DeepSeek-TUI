@@ -54,7 +54,8 @@ use crate::commands;
 use crate::compaction::estimate_input_tokens_conservative;
 use crate::config::{
     ApiProvider, Config, ProviderConfig, ProviderIdentity, ProvidersConfig, StatusItem,
-    UpdateConfig, finalize_xai_device_login_for_at,
+    UpdateConfig, finalize_xai_device_login_for_at, persist_external_credential_consent_for_at,
+    revoke_external_credential_consent_for_at,
 };
 use crate::config_ui::{self, ConfigUiMode, WebConfigSession, WebConfigSessionEvent};
 use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
@@ -8672,7 +8673,11 @@ async fn switch_provider(
                         config,
                         runtime_status,
                     )
-                    .map(|picker| picker.with_provider_health(&app.provider_health))
+                    .map(|picker| {
+                        picker
+                            .with_locale(app.ui_locale)
+                            .with_provider_health(&app.provider_health)
+                    })
                 {
                     *config = previous_config;
                     app.view_stack.push(picker);
@@ -9581,6 +9586,7 @@ async fn apply_command_result(
                             runtime_status,
                             app.provider_picker_memory.as_ref(),
                         )
+                        .with_locale(app.ui_locale)
                         .with_provider_health(&app.provider_health),
                     );
                 }
@@ -9595,6 +9601,7 @@ async fn apply_command_result(
                             config,
                             runtime_status,
                         )
+                        .with_locale(app.ui_locale)
                         .with_provider_health(&app.provider_health),
                     );
                     app.status_message = Some("Provider setup catalog opened.".to_string());
@@ -12063,6 +12070,7 @@ async fn handle_view_events(
                             config,
                             runtime_status,
                         )
+                        .with_locale(app.ui_locale)
                         .with_provider_health(&app.provider_health),
                     );
                     app.status_message =
@@ -12258,6 +12266,57 @@ async fn handle_view_events(
             }
             ViewEvent::ProviderPickerXaiOAuthRequested => {
                 run_xai_device_login_from_tui(terminal, app, engine_handle, config).await?;
+            }
+            ViewEvent::ProviderPickerExternalConsentConfirmed {
+                provider,
+                consent_provider,
+                source,
+                path,
+            } => match persist_external_credential_consent_for_at(
+                app.config_path.as_deref(),
+                config,
+                provider,
+                consent_provider,
+                source,
+                &path,
+            ) {
+                Ok(_) => {
+                    let toast = app
+                        .tr(MessageId::ProviderExternalGrantedToast)
+                        .replace("{owner}", source.owner_label())
+                        .replace("{provider}", provider.as_str());
+                    app.push_status_toast(toast, StatusToastLevel::Success, Some(8_000));
+                    let model_override = provider_picker_model_override(app, config, provider);
+                    switch_provider(app, engine_handle, config, provider, model_override).await;
+                    refresh_config_view_if_open(app, "provider");
+                }
+                Err(error) => app.push_status_toast(
+                    app.tr(MessageId::ProviderExternalSaveFailedToast)
+                        .replace("{error}", &error.to_string()),
+                    StatusToastLevel::Error,
+                    None,
+                ),
+            },
+            ViewEvent::ProviderPickerExternalConsentRevoked { provider } => {
+                match revoke_external_credential_consent_for_at(
+                    app.config_path.as_deref(),
+                    config,
+                    provider,
+                ) {
+                    Ok(_) => app.push_status_toast(
+                        app.tr(MessageId::ProviderExternalRevokedToast)
+                            .replace("{provider}", provider.as_str()),
+                        StatusToastLevel::Success,
+                        Some(5_000),
+                    ),
+                    Err(error) => app.push_status_toast(
+                        app.tr(MessageId::ProviderExternalRevokeFailedToast)
+                            .replace("{error}", &error.to_string()),
+                        StatusToastLevel::Error,
+                        None,
+                    ),
+                }
+                refresh_config_view_if_open(app, "provider");
             }
             ViewEvent::ProviderPickerOpenModels {
                 provider,
@@ -13027,7 +13086,11 @@ async fn apply_provider_picker_api_key_with_verifier(
                     runtime_status,
                     api_key,
                 )
-                .map(|picker| picker.with_provider_health(&app.provider_health))
+                .map(|picker| {
+                    picker
+                        .with_locale(app.ui_locale)
+                        .with_provider_health(&app.provider_health)
+                })
             {
                 app.view_stack.push(picker);
                 app.status_message = Some(format!(
@@ -13055,7 +13118,11 @@ async fn apply_provider_picker_api_key_with_verifier(
                     runtime_status,
                     reason,
                 )
-                .map(|picker| picker.with_provider_health(&app.provider_health))
+                .map(|picker| {
+                    picker
+                        .with_locale(app.ui_locale)
+                        .with_provider_health(&app.provider_health)
+                })
             {
                 app.view_stack.push(picker);
                 app.status_message = Some(format!(

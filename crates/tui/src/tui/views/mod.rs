@@ -749,6 +749,18 @@ pub enum ViewEvent {
     },
     /// Emitted by provider/setup UI when xAI device-code OAuth is requested.
     ProviderPickerXaiOAuthRequested,
+    /// Emitted only after the picker showed owner, exact path, and the full
+    /// read-only side-effect contract and the user explicitly confirmed it.
+    ProviderPickerExternalConsentConfirmed {
+        provider: crate::config::ApiProvider,
+        consent_provider: codewhale_config::ProviderKind,
+        source: codewhale_config::ExternalCredentialSource,
+        path: std::path::PathBuf,
+    },
+    /// One-step revocation from a provider row that currently has consent.
+    ProviderPickerExternalConsentRevoked {
+        provider: crate::config::ApiProvider,
+    },
     /// Emitted by the `/provider` picker (the `M` action) to jump straight to
     /// the `/model` picker pre-filtered to the highlighted provider (#3083).
     ProviderPickerOpenModels {
@@ -1601,6 +1613,51 @@ impl ConfigView {
                 scope: ConfigScope::Saved,
             },
         ];
+        let external_status_rows = [ApiProvider::OpenaiCodex, ApiProvider::Xai]
+            .into_iter()
+            .filter_map(|provider| {
+                config
+                    .external_credential_consent_status(provider)
+                    .map(|status| {
+                        let state = if status.route_state == "active" {
+                            tr(app.ui_locale, MessageId::CtxInspActive)
+                        } else {
+                            tr(app.ui_locale, MessageId::ProviderExternalDormant)
+                        };
+                        let scope = tr(app.ui_locale, MessageId::ProviderExternalDetailScope)
+                            .replace("{access}", status.access.as_str())
+                            .replace("{provider}", &status.provider)
+                            .replace("{source}", status.source.as_str())
+                            .replace("{version}", &status.consent_version.to_string())
+                            .replace("{state}", &state);
+                        let owner_path = tr(app.ui_locale, MessageId::ProviderExternalOwnerPath)
+                            .replace("{owner}", status.owner)
+                            .replace("{path}", &status.path.to_string_lossy());
+                        let semantics = match status.access {
+                            codewhale_config::ExternalCredentialAccess::Disabled => {
+                                tr(app.ui_locale, MessageId::ProviderExternalDisabledDetail)
+                            }
+                            codewhale_config::ExternalCredentialAccess::ReadOnly => {
+                                tr(app.ui_locale, MessageId::ProviderExternalReadOnlySemantics)
+                            }
+                            codewhale_config::ExternalCredentialAccess::Managed => {
+                                tr(app.ui_locale, MessageId::ProviderExternalManagedDetail)
+                            }
+                        };
+                        let semantics_revoke =
+                            tr(app.ui_locale, MessageId::ProviderExternalSemanticsRevoke)
+                                .replace("{semantics}", &semantics)
+                                .replace("{revoke}", &status.revoke_command);
+                        ConfigRow {
+                            section: ConfigSection::Provider,
+                            key: format!("external_credentials.{}", provider.as_str()),
+                            value: format!("{scope} · {owner_path} · {semantics_revoke}"),
+                            editable: false,
+                            scope: ConfigScope::Saved,
+                        }
+                    })
+            });
+        rows.splice(2..2, external_status_rows);
         rows.extend(experimental_config_rows(&config));
 
         Self {
@@ -3849,9 +3906,10 @@ mod tests {
         for (w, h) in BLOCKER_SIZES {
             let area = Rect::new(0, 0, w, h);
             let mut buf = Buffer::empty(area);
+            let sentinel_style = Style::default().fg(Color::Magenta).bg(Color::Green);
             for y in 0..h {
                 for x in 0..w {
-                    buf[(x, y)].set_symbol("X");
+                    buf[(x, y)].set_symbol("X").set_style(sentinel_style);
                 }
             }
             let mut stack = ViewStack::new();
@@ -3870,9 +3928,16 @@ mod tests {
             for label in required_labels {
                 assert!(text.contains(label), "{w}x{h}: missing '{label}'");
             }
+            let unpainted = (0..h).find_map(|y| {
+                (0..w).find_map(|x| {
+                    let cell = &buf[(x, y)];
+                    (cell.symbol() == "X" && cell.fg == Color::Magenta && cell.bg == Color::Green)
+                        .then_some((x, y))
+                })
+            });
             assert!(
-                !text.contains('X'),
-                "{w}x{h}: background bleed-through into modal surface"
+                unpainted.is_none(),
+                "{w}x{h}: background bleed-through at {unpainted:?}"
             );
             assert_eq!(
                 buf[(w / 2, h / 2)].bg,
@@ -4328,6 +4393,8 @@ mod tests {
         assert!(keys.contains(&"model"));
         assert!(keys.contains(&"reasoning_effort"));
         assert!(keys.contains(&"base_url"));
+        assert!(keys.contains(&"external_credentials.openai-codex"));
+        assert!(keys.contains(&"external_credentials.xai"));
         assert!(keys.contains(&"approval_mode"));
         assert!(keys.contains(&"permission_posture"));
         assert!(keys.contains(&"allow_shell"));
@@ -4359,7 +4426,12 @@ mod tests {
         assert!(!keys.contains(&"whaleflow"));
         // Diagnostic-only model rows and managed permission rows are not
         // editable; everything else outside Experimental/Fleet should be.
-        const DIAGNOSTIC_ONLY: &[&str] = &["fast_model", "default_model"];
+        const DIAGNOSTIC_ONLY: &[&str] = &[
+            "fast_model",
+            "default_model",
+            "external_credentials.openai-codex",
+            "external_credentials.xai",
+        ];
         assert!(
             view.rows
                 .iter()
@@ -4389,6 +4461,54 @@ mod tests {
                 "{key} must remain diagnostic-only"
             );
         }
+    }
+
+    #[test]
+    fn config_view_surfaces_structural_external_consent_without_io() {
+        let _env = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("config view fixture");
+        let config_path = temp.path().join("config.toml");
+        let auth_path = temp.path().join("codex-auth.json");
+        fs::write(&auth_path, "external-secret-must-not-be-read").expect("auth trap");
+        fs::write(
+            &config_path,
+            format!(
+                r#"provider = "openai-codex"
+[providers.openai_codex]
+auth_mode = "oauth"
+[providers.openai_codex.external_credentials]
+access = "read_only"
+provider = "openai-codex"
+source = "codex_cli"
+path = {:?}
+consent_version = 1
+"#,
+                auth_path.display().to_string()
+            ),
+        )
+        .expect("config fixture");
+        let _path = crate::test_support::EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &auth_path);
+        let mut app = create_test_app();
+        app.config_path = Some(config_path);
+        crate::external_credentials::reset_side_effect_trap();
+        let view = ConfigView::new_for_app(&app);
+        let row = view
+            .rows
+            .iter()
+            .find(|row| row.key == "external_credentials.openai-codex")
+            .expect("structural consent row");
+        assert!(row.value.contains("access=read_only"), "{}", row.value);
+        assert!(row.value.contains("source=codex_cli"), "{}", row.value);
+        assert!(row.value.contains("version=1"), "{}", row.value);
+        assert!(row.value.contains("active"), "{}", row.value);
+        assert!(
+            row.value
+                .contains("external-revoke --provider openai-codex")
+        );
+        assert_eq!(
+            crate::external_credentials::complete_side_effect_trap_counts(),
+            (0, 0, 0, 0, 0)
+        );
     }
 
     #[test]

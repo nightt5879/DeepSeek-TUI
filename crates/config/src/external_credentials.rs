@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -8,18 +8,52 @@ use crate::ProviderKind;
 /// Schema version for informed consent to another CLI's credential file.
 pub const EXTERNAL_CREDENTIAL_CONSENT_VERSION: u32 = 1;
 
+/// The complete side-effect contract for read-only external credentials.
+pub const EXTERNAL_CREDENTIAL_READ_ONLY_SEMANTICS: &str =
+    "read only; no refresh, network requests, writes, or rewrites";
+
 /// Resolve a user-selected path without touching the filesystem.
 ///
 /// Consent is bound to the exact logical path, so this intentionally avoids
 /// canonicalization (which would stat the candidate before consent exists).
 pub fn resolve_external_credential_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     let path = path.as_ref();
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| anyhow::anyhow!("resolving external credential path: {err}"))?
+            .join(path)
+    };
+
+    // Normalize only lexical `.` / `..` components. Canonicalization would
+    // inspect a credential path before consent exists and would also silently
+    // bless a symlink target. The secure reader rejects symlink/reparse-point
+    // components when the granted capability is actually consumed.
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    bail!(
+                        "external credential path escapes its absolute root: {}",
+                        absolute.display()
+                    );
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
     }
-    Ok(std::env::current_dir()
-        .map_err(|err| anyhow::anyhow!("resolving external credential path: {err}"))?
-        .join(path))
+    if !normalized.is_absolute() {
+        bail!(
+            "external credential path must resolve to an absolute path: {}",
+            normalized.display()
+        );
+    }
+    Ok(normalized)
 }
 
 /// The side-effect envelope Codewhale may use for an external credential.
@@ -63,6 +97,90 @@ impl ExternalCredentialSource {
             Self::KimiCodeCli => "kimi_code_cli",
             Self::GrokCli => "grok_cli",
         }
+    }
+
+    /// Human-facing owner name used in informed-consent disclosures.
+    #[must_use]
+    pub const fn owner_label(self) -> &'static str {
+        match self {
+            Self::CodexCli => "Codex CLI",
+            Self::KimiCodeCli => "Kimi Code CLI",
+            Self::GrokCli => "Grok CLI",
+        }
+    }
+}
+
+/// Side-effect-free projection used by picker, config, and doctor surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExternalCredentialConsentStatus {
+    pub access: ExternalCredentialAccess,
+    pub provider: String,
+    pub source: ExternalCredentialSource,
+    pub owner: &'static str,
+    pub path: PathBuf,
+    pub consent_version: u32,
+    pub configured: bool,
+    pub scope_valid: bool,
+    pub route_state: &'static str,
+    pub semantics: &'static str,
+    pub revoke_command: String,
+}
+
+/// Describe persisted external-credential policy without filesystem or network
+/// access. `expected_path` is resolved lexically by the caller.
+#[must_use]
+pub fn external_credential_consent_status(
+    consent: Option<&ExternalCredentialConsentToml>,
+    provider: ProviderKind,
+    source: ExternalCredentialSource,
+    expected_path: &Path,
+    active_provider: ProviderKind,
+) -> ExternalCredentialConsentStatus {
+    let configured = consent.is_some();
+    let access = consent.map_or(ExternalCredentialAccess::Disabled, |value| value.access);
+    let reported_provider = consent
+        .map(|value| value.provider.clone())
+        .unwrap_or_else(|| provider.as_str().to_string());
+    let reported_source = consent.map_or(source, |value| value.source);
+    let reported_path = consent
+        .map(|value| value.path.clone())
+        .unwrap_or_else(|| expected_path.to_path_buf());
+    let consent_version = consent.map_or(EXTERNAL_CREDENTIAL_CONSENT_VERSION, |value| {
+        value.consent_version
+    });
+    let scope_valid = consent.is_some_and(|value| {
+        value
+            .validate_read_scope(provider, source, expected_path)
+            .is_ok()
+    });
+    let active =
+        provider == active_provider && access == ExternalCredentialAccess::ReadOnly && scope_valid;
+    let route_state = if active { "active" } else { "dormant" };
+    let semantics = match access {
+        ExternalCredentialAccess::Disabled => {
+            "disabled; no probing, reading, refreshing, network requests, writes, or rewrites"
+        }
+        ExternalCredentialAccess::ReadOnly => EXTERNAL_CREDENTIAL_READ_ONLY_SEMANTICS,
+        ExternalCredentialAccess::Managed => {
+            "managed access unavailable; no schema-safe preservation adapter"
+        }
+    };
+
+    ExternalCredentialConsentStatus {
+        access,
+        provider: reported_provider,
+        source: reported_source,
+        owner: reported_source.owner_label(),
+        path: reported_path,
+        consent_version,
+        configured,
+        scope_valid,
+        route_state,
+        semantics,
+        revoke_command: format!(
+            "codewhale auth external-revoke --provider {}",
+            provider.as_str()
+        ),
     }
 }
 
@@ -216,6 +334,59 @@ mod tests {
         } else {
             PathBuf::from(format!("/tmp/{file}"))
         }
+    }
+
+    #[test]
+    fn disclosed_paths_are_absolute_and_lexically_normalized_without_io() {
+        let resolved =
+            resolve_external_credential_path("one/./two/../auth.json").expect("lexical resolution");
+        assert!(resolved.is_absolute());
+        assert!(
+            resolved.ends_with(Path::new("one/auth.json")),
+            "{}",
+            resolved.display()
+        );
+        assert!(!resolved.to_string_lossy().contains("/./"));
+        assert!(!resolved.to_string_lossy().contains("/../"));
+    }
+
+    #[test]
+    fn structural_status_reports_full_scope_without_io() {
+        let path = absolute_test_path("codex-auth.json");
+        let consent = ExternalCredentialConsentToml::read_only(
+            ProviderKind::OpenaiCodex,
+            ExternalCredentialSource::CodexCli,
+            path.clone(),
+        );
+        let active = external_credential_consent_status(
+            Some(&consent),
+            ProviderKind::OpenaiCodex,
+            ExternalCredentialSource::CodexCli,
+            &path,
+            ProviderKind::OpenaiCodex,
+        );
+        assert_eq!(active.access, ExternalCredentialAccess::ReadOnly);
+        assert_eq!(active.owner, "Codex CLI");
+        assert_eq!(active.path, path);
+        assert_eq!(active.route_state, "active");
+        assert!(active.scope_valid);
+        assert!(active.semantics.contains("no refresh"));
+        assert_eq!(
+            active.revoke_command,
+            "codewhale auth external-revoke --provider openai-codex"
+        );
+
+        let changed_path = absolute_test_path("moved-auth.json");
+        let stale = external_credential_consent_status(
+            Some(&consent),
+            ProviderKind::OpenaiCodex,
+            ExternalCredentialSource::CodexCli,
+            &changed_path,
+            ProviderKind::OpenaiCodex,
+        );
+        assert!(!stale.scope_valid);
+        assert_eq!(stale.route_state, "dormant");
+        assert_eq!(stale.path, path, "report the stale persisted grant path");
     }
 
     #[test]

@@ -1350,6 +1350,10 @@ enum AuthCommand {
         /// path without probing whether the file exists.
         #[arg(long, value_name = "PATH")]
         path: Option<PathBuf>,
+        /// Confirm the disclosed exact read-only grant without an interactive
+        /// prompt. Required when stdin is not a terminal.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
     },
     /// Revoke access to another CLI's credential file for one provider.
     #[command(name = "external-revoke")]
@@ -1962,22 +1966,56 @@ fn persist_provider_api_key(
     provider: ProviderKind,
     api_key: &str,
 ) -> Result<bool> {
+    let original_config = store.config.clone();
     prepare_provider_api_key_metadata(store, provider);
-    let secret_store_saved = match secrets.set(provider_slot(provider), api_key) {
-        Ok(()) => {
-            clear_provider_api_key_from_config(store, provider);
-            true
-        }
-        Err(err) => {
+    let slot = provider_slot(provider);
+    // A readable prior value is required before a secret-store write so a
+    // later config failure can restore the exact prior state. If the backend
+    // cannot provide that snapshot, use the owner-only config fallback.
+    let prior_secret = secrets.get(slot);
+    let secret_store_saved = match prior_secret.as_ref().map_err(|error| error.to_string()) {
+        Ok(_) => match secrets.set(slot, api_key) {
+            Ok(()) => {
+                clear_provider_api_key_from_config(store, provider);
+                true
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: secret-store write failed for {}; using owner-only config fallback: {err}",
+                    provider_slot(provider)
+                );
+                write_provider_api_key_to_config(store, provider, api_key);
+                false
+            }
+        },
+        Err(error) => {
             eprintln!(
-                "warning: secret-store write failed for {}; using owner-only config fallback: {err}",
-                provider_slot(provider)
+                "warning: secret-store snapshot failed for {slot}; using owner-only config fallback: {error}"
             );
             write_provider_api_key_to_config(store, provider, api_key);
             false
         }
     };
-    store.save()?;
+    if let Err(error) = store.save() {
+        store.config = original_config;
+        if secret_store_saved {
+            let current = secrets
+                .get(slot)
+                .map_err(|rollback| anyhow::anyhow!(
+                    "{error}; additionally could not verify secret-store rollback for {slot}: {rollback}"
+                ))?;
+            if current.as_deref() == Some(api_key) {
+                match prior_secret.expect("snapshot succeeded before secret write") {
+                    Some(previous) => secrets.set(slot, &previous),
+                    None => secrets.delete(slot),
+                }
+                .map_err(|rollback| anyhow::anyhow!(
+                    "{error}; additionally failed to restore prior secret-store state for {slot}: {rollback}"
+                ))?;
+            }
+        }
+        return Err(error);
+    }
     codewhale_config::scrub_plaintext_api_keys_from_config_backup(store.path())?;
     Ok(secret_store_saved)
 }
@@ -2069,10 +2107,8 @@ fn external_credential_target(
             provider.as_str()
         ),
     };
-    let path = match path_override {
-        Some(path) => codewhale_config::resolve_external_credential_path(path)?,
-        None => default_path,
-    };
+    let path =
+        codewhale_config::resolve_external_credential_path(path_override.unwrap_or(default_path))?;
     Ok((source, path))
 }
 
@@ -2369,19 +2405,27 @@ fn auth_status_lines_for_provider(
         ),
         format!("env var: {env_var_label} ({env_status})"),
     ];
-    if let Some(consent) = external {
+    if let Ok((source, expected_path)) = external_credential_target(provider, None) {
+        let status = codewhale_config::external_credential_consent_status(
+            external,
+            provider,
+            source,
+            &expected_path,
+            store.config.provider,
+        );
         lines.push(format!(
-            "external credentials: {} (provider={}, source={}, path={}, consent_version={}; file not probed)",
-            consent.access.as_str(),
-            consent.provider,
-            consent.source.as_str(),
-            consent.path.display(),
-            consent.consent_version,
+            "external credentials: {} (provider={}, source={}, owner={}, path={}, consent_version={}, state={}, scope_valid={}; file not probed)",
+            status.access.as_str(),
+            status.provider,
+            status.source.as_str(),
+            status.owner,
+            status.path.display(),
+            status.consent_version,
+            status.route_state,
+            status.scope_valid,
         ));
-        lines.push(format!(
-            "revoke: codewhale auth external-revoke --provider {}",
-            provider.as_str()
-        ));
+        lines.push(format!("semantics: {}", status.semantics));
+        lines.push(format!("revoke: {}", status.revoke_command));
     } else {
         lines.push("external credentials: disabled (no file was probed)".to_string());
     }
@@ -2421,14 +2465,20 @@ fn run_auth_command_with_secrets(
             provider,
             mode,
             path,
+            yes,
         } => {
             let provider: ProviderKind = provider.into();
+            let (source, path) = external_credential_target(provider, path)?;
+            let preview = external_consent_preview_lines(provider, source, &path);
+            for line in &preview {
+                println!("{line}");
+            }
             if mode == ExternalCredentialModeArg::Managed {
                 bail!(
                     "managed external credential access is unsupported in v0.9.1: no provider has a reviewed schema-safe preservation adapter. Use --mode read-only, or use Codewhale-owned login/API-key storage."
                 );
             }
-            let (source, path) = external_credential_target(provider, path)?;
+            confirm_external_consent(yes)?;
             let consent = codewhale_config::ExternalCredentialConsentToml::read_only(
                 provider,
                 source,
@@ -2558,6 +2608,62 @@ fn run_auth_command_with_secrets(
         }
         AuthCommand::Migrate { dry_run } => run_auth_migrate(store, secrets, dry_run),
     }
+}
+
+fn external_consent_preview_lines(
+    provider: ProviderKind,
+    source: codewhale_config::ExternalCredentialSource,
+    path: &Path,
+) -> Vec<String> {
+    vec![
+        "External credential consent preview (nothing has been saved):".to_string(),
+        format!("  provider: {}", provider.as_str()),
+        format!(
+            "  owning CLI: {} ({})",
+            source.owner_label(),
+            source.as_str()
+        ),
+        format!("  exact resolved path: {}", path.display()),
+        format!(
+            "  access: read_only ({})",
+            codewhale_config::EXTERNAL_CREDENTIAL_READ_ONLY_SEMANTICS
+        ),
+        "  managed: unavailable (no reviewed schema-safe preservation adapter)".to_string(),
+        format!(
+            "  revoke: codewhale auth external-revoke --provider {}",
+            provider.as_str()
+        ),
+    ]
+}
+
+fn confirm_external_consent(yes: bool) -> Result<()> {
+    use std::io::IsTerminal;
+
+    if yes {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "external credential consent was not saved: non-interactive use requires explicit --yes after reviewing the preview"
+        );
+    }
+    confirm_external_consent_answer(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())
+}
+
+fn confirm_external_consent_answer(
+    reader: &mut impl std::io::BufRead,
+    writer: &mut impl std::io::Write,
+) -> Result<()> {
+    write!(writer, "Type 'yes' to grant this exact read-only access: ")?;
+    writer.flush()?;
+    let mut answer = String::new();
+    reader
+        .read_line(&mut answer)
+        .context("reading external credential consent confirmation")?;
+    if answer.trim() != "yes" {
+        bail!("external credential consent cancelled; no configuration was changed");
+    }
+    Ok(())
 }
 
 fn yes_no(b: bool) -> &'static str {
@@ -4693,6 +4799,7 @@ model = "qwen-2.5-7b"
             "read-only",
             "--path",
             "/tmp/codex-auth.json",
+            "--yes",
         ]);
         assert!(matches!(
             cli.command,
@@ -4701,6 +4808,7 @@ model = "qwen-2.5-7b"
                     provider: ProviderArg::OpenaiCodex,
                     mode: ExternalCredentialModeArg::ReadOnly,
                     path: Some(_),
+                    yes: true,
                 }
             }))
         ));
@@ -5300,7 +5408,10 @@ model = "qwen-2.5-7b"
         assert!(output.contains("auth mode: codex_oauth"));
         assert!(output.contains("active source: missing"));
         assert!(output.contains("lookup order: env -> consent-gated exact Codex CLI file"));
-        assert!(output.contains("external credentials: disabled (no file was probed)"));
+        assert!(output.contains("external credentials: disabled"));
+        assert!(output.contains("scope_valid=false"));
+        assert!(output.contains("disabled; no probing, reading"));
+        assert!(output.contains("file not probed"));
         assert!(!output.contains("secret-token"));
 
         store.config.providers.openai_codex.external_credentials =
@@ -5372,12 +5483,57 @@ model = "qwen-2.5-7b"
         let mut store = ConfigStore::load(Some(config_path.clone())).expect("store should load");
         let secrets = no_keyring_secrets();
 
+        let preview = external_consent_preview_lines(
+            ProviderKind::Xai,
+            codewhale_config::ExternalCredentialSource::GrokCli,
+            &external_path,
+        )
+        .join("\n");
+        assert!(preview.contains("owning CLI: Grok CLI"), "{preview}");
+        assert!(
+            preview.contains(&format!("exact resolved path: {}", external_path.display())),
+            "{preview}"
+        );
+        assert!(preview.contains("no refresh, network requests, writes, or rewrites"));
+        assert!(preview.contains("managed: unavailable"));
+
+        let mut prompt = Vec::new();
+        confirm_external_consent_answer(&mut "yes\n".as_bytes(), &mut prompt)
+            .expect("exact yes confirms");
+        assert!(
+            String::from_utf8(prompt)
+                .unwrap()
+                .contains("exact read-only")
+        );
+        let cancelled = confirm_external_consent_answer(&mut "YES\n".as_bytes(), &mut Vec::new())
+            .expect_err("confirmation is deliberate and case-sensitive");
+        assert!(cancelled.to_string().contains("cancelled"));
+
+        let unconfirmed = run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::ExternalConsent {
+                provider: ProviderArg::Xai,
+                mode: ExternalCredentialModeArg::ReadOnly,
+                path: Some(external_path.clone()),
+                yes: false,
+            },
+            &secrets,
+        )
+        .expect_err("non-interactive consent requires --yes");
+        assert!(unconfirmed.to_string().contains("requires explicit --yes"));
+        assert!(store.config.providers.xai.external_credentials.is_none());
+        assert!(
+            !config_path.exists(),
+            "unconfirmed consent must not persist"
+        );
+
         run_auth_command_with_secrets(
             &mut store,
             AuthCommand::ExternalConsent {
                 provider: ProviderArg::Xai,
                 mode: ExternalCredentialModeArg::ReadOnly,
                 path: Some(external_path.clone()),
+                yes: true,
             },
             &secrets,
         )
@@ -5454,6 +5610,7 @@ model = "qwen-2.5-7b"
                 provider: ProviderArg::Xai,
                 mode: ExternalCredentialModeArg::ReadOnly,
                 path: Some(external_path.clone()),
+                yes: true,
             },
             &secrets,
         )
@@ -5488,6 +5645,7 @@ model = "qwen-2.5-7b"
                 provider: ProviderArg::OpenaiCodex,
                 mode: ExternalCredentialModeArg::Managed,
                 path: Some(external_path.clone()),
+                yes: true,
             },
             &secrets,
         )
@@ -5504,6 +5662,7 @@ model = "qwen-2.5-7b"
                 provider: ProviderArg::Moonshot,
                 mode: ExternalCredentialModeArg::ReadOnly,
                 path: Some(external_path.clone()),
+                yes: true,
             },
             &secrets,
         )
@@ -5537,6 +5696,50 @@ model = "qwen-2.5-7b"
             !config_path.exists(),
             "rejected consent must not write config"
         );
+    }
+
+    #[test]
+    fn api_key_config_failure_restores_absent_and_existing_secret_state() {
+        for prior in [None, Some("prior-xai-key")] {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let config_path = dir.path().join("config.toml");
+            let mut store = ConfigStore::load(Some(config_path.clone())).expect("load store");
+            store.config.providers.xai.auth_mode = Some("oauth".to_string());
+            store.config.providers.xai.external_credentials =
+                Some(codewhale_config::ExternalCredentialConsentToml::read_only(
+                    ProviderKind::Xai,
+                    codewhale_config::ExternalCredentialSource::GrokCli,
+                    dir.path().join("external.json"),
+                ));
+            std::fs::create_dir(&config_path).expect("turn config target into a directory");
+            let secrets = no_keyring_secrets();
+            if let Some(prior) = prior {
+                secrets.set("xai", prior).expect("seed prior secret");
+            }
+
+            let error = run_auth_command_with_secrets(
+                &mut store,
+                AuthCommand::Set {
+                    provider: ProviderArg::Xai,
+                    api_key: Some("new-xai-key".to_string()),
+                    api_key_stdin: false,
+                },
+                &secrets,
+            )
+            .expect_err("config write must fail");
+            assert!(error.to_string().contains("config"), "{error:#}");
+            assert_eq!(
+                secrets.get("xai").expect("restored secret"),
+                prior.map(str::to_string)
+            );
+            assert_eq!(
+                store.config.providers.xai.auth_mode.as_deref(),
+                Some("oauth")
+            );
+            assert!(store.config.providers.xai.external_credentials.is_some());
+            assert!(store.config.providers.xai.api_key.is_none());
+            assert!(config_path.is_dir());
+        }
     }
 
     #[test]

@@ -194,6 +194,16 @@ pub fn credentials_present(config: &Config) -> bool {
 /// exact read-only consent has been validated.
 #[must_use]
 pub fn credentials_valid(config: &Config) -> bool {
+    // Codewhale-owned OAuth bytes are inert until the xAI provider explicitly
+    // selects OAuth. A failed post-login config finalization can therefore
+    // never make a newly written token silently ready on the next launch.
+    if !config
+        .provider_config_for(ApiProvider::Xai)
+        .and_then(|entry| entry.auth_mode.as_deref())
+        .is_some_and(auth_mode_uses_xai_oauth)
+    {
+        return false;
+    }
     if let Ok(path) = codewhale_auth_file_path()
         && path.exists()
         && let Ok(mut file) = load_auth_file(&path)
@@ -228,6 +238,14 @@ pub fn get_access_token(config: &Config) -> Result<String> {
 }
 
 pub fn get_credentials(config: &Config) -> Result<XaiOAuthCredentials> {
+    anyhow::ensure!(
+        config.api_provider() == ApiProvider::Xai
+            && config
+                .provider_config_for(ApiProvider::Xai)
+                .and_then(|entry| entry.auth_mode.as_deref())
+                .is_some_and(auth_mode_uses_xai_oauth),
+        "Codewhale-owned xAI OAuth credentials are inactive until the xAI route explicitly selects OAuth"
+    );
     let owned_path = codewhale_auth_file_path()?;
     if owned_path.exists() {
         return get_owned_credentials(&owned_path);
@@ -460,13 +478,12 @@ fn load_auth_file(path: &Path) -> Result<AuthFile> {
 fn load_external_auth_file(
     grant: &codewhale_config::ExternalCredentialReadGrant,
 ) -> Result<AuthFile> {
-    if !crate::external_credentials::exists(grant) {
+    let Some(raw) = crate::external_credentials::read_to_string(grant)? else {
         bail!(
             "external xAI/Grok credential file not found at {}",
             grant.path().display()
         );
-    }
-    let raw = crate::external_credentials::read_to_string(grant)?;
+    };
     parse_auth_file(&raw, grant.path())
 }
 
@@ -1012,7 +1029,8 @@ mod tests {
     fn loads_fresh_token_from_grok_auth_json() {
         let _guard = crate::test_support::lock_test_env();
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("auth.json");
+        let root = dir.path().canonicalize().expect("canonical temp root");
+        let path = root.join("auth.json");
         let future = rfc3339_from_now(3600);
         let scope = format!("{XAI_OIDC_ISSUER}::{GROK_OIDC_CLIENT_ID}");
         let file = serde_json::json!({
@@ -1026,7 +1044,7 @@ mod tests {
             }
         });
         fs::write(&path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
-        let _home_guard = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+        let _home_guard = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
         let _path_guard = crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &path);
         let config = Config {
             provider: Some(ApiProvider::Xai.as_str().to_string()),
@@ -1102,7 +1120,8 @@ mod tests {
         let _guard = crate::test_support::lock_test_env();
         let server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("external-grok-auth.json");
+        let root = dir.path().canonicalize().expect("canonical temp root");
+        let path = root.join("external-grok-auth.json");
         let scope = format!("{}::{GROK_OIDC_CLIENT_ID}", server.uri());
         let raw = serde_json::json!({
             scope: {
@@ -1116,7 +1135,7 @@ mod tests {
         })
         .to_string();
         fs::write(&path, &raw).unwrap();
-        let owned_home = dir.path().join("codewhale-owned");
+        let owned_home = root.join("codewhale-owned");
         let _home_guard = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &owned_home);
         let _path_guard = crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &path);
         let config = Config {
