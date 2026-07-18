@@ -7,6 +7,12 @@ on:
     branches: [master, main]
   schedule:
     - cron: '31 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Exact 40-character commit selected by --ref (manual runs always force full CI)
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -40,10 +46,30 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
           BEFORE_SHA: ${{ github.event.before }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
         run: |
           set -euo pipefail
 
-          if [[ "${EVENT_NAME}" == "schedule" || "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            if [[ "${#EXPECTED_SHA}" -ne 40 || "${EXPECTED_SHA}" =~ [^0-9a-fA-F] ]]; then
+              echo "::error::expected_sha must be a full 40-character commit SHA." >&2
+              exit 1
+            fi
+            actual="$(git rev-parse HEAD)"
+            expected_normalized="$(printf '%s' "${EXPECTED_SHA}" | tr '[:upper:]' '[:lower:]')"
+            if [[ "${actual}" != "${expected_normalized}" ]]; then
+              echo "::error::Dispatch resolved to ${actual}, not requested ${EXPECTED_SHA}." >&2
+              exit 1
+            fi
+            echo "Manual exact-head dispatch: forcing heavy, workflow, mobile, and action gates."
+            echo "heavy=true" >> "${GITHUB_OUTPUT}"
+            echo "workflow=true" >> "${GITHUB_OUTPUT}"
+            echo "mobile=true" >> "${GITHUB_OUTPUT}"
+            echo "actions=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ "${EVENT_NAME}" == "schedule" ]]; then
             echo "heavy=true" >> "${GITHUB_OUTPUT}"
             echo "workflow=true" >> "${GITHUB_OUTPUT}"
             echo "mobile=true" >> "${GITHUB_OUTPUT}"
@@ -86,7 +112,7 @@ jobs:
               scripts/release/npm-wrapper-smoke.js|scripts/mobile-smoke.sh|scripts/check-provider-registry.py)
                 heavy=true
                 ;;
-              docs/*|*.md|.github/PULL_REQUEST_TEMPLATE.md|.github/ISSUE_TEMPLATE/*|.github/scripts/agent-task-metadata.test.sh|.github/workflows/agent-task-labels.yml|.github/workflows/auto-tag.yml|.github/workflows/stale.yml|.github/workflows/triage.yml|scripts/v0867-setup-qa.sh|scripts/release/check-versions.sh|scripts/release/check-ohos-deps.sh|scripts/release/prepare-release.sh|scripts/release/prepare-release.test.sh|scripts/check-coauthor-trailers.py)
+              docs/*|*.md|.github/PULL_REQUEST_TEMPLATE.md|.github/ISSUE_TEMPLATE/*|.github/scripts/agent-task-metadata.test.sh|.github/workflows/agent-task-labels.yml|.github/workflows/auto-tag.yml|.github/workflows/stale.yml|.github/workflows/triage.yml|scripts/v0867-setup-qa.sh|scripts/release/check-versions.sh|scripts/release/check-ohos-deps.sh|scripts/release/install-dogfood.sh|scripts/release/install-dogfood.test.sh|scripts/release/prepare-release.sh|scripts/release/prepare-release.test.sh|scripts/check-coauthor-trailers.py)
                 ;;
               *)
                 heavy=true
@@ -132,7 +158,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
       - name: Check version drift
@@ -143,10 +169,14 @@ jobs:
         run: |
           bash .github/scripts/agent-task-metadata.test.sh
           bash scripts/release/generate-release-body.test.sh
+          bash scripts/release/install-dogfood.test.sh
           bash scripts/release/prepare-release.test.sh
           bash scripts/release/require-release-tag-checkout.test.sh
           bash scripts/release/verify-remote-tag.test.sh
           bash .github/scripts/update-homebrew-tap.test.sh
+          node .github/scripts/release-workflows.test.js
+          node --test scripts/release/assemble-release-assets.test.js
+          node --test scripts/release/ensure-release-assets-absent.test.js
 
   lint:
     name: Lint
@@ -286,30 +316,30 @@ jobs:
         if: needs.changes.outputs.heavy != 'true'
         run: echo "No executable Rust changes detected; preserving required Test context."
       - uses: actions/checkout@v7
-        if: needs.changes.outputs.heavy == 'true' && matrix.os != 'ubuntu-latest'
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch')
       - uses: dtolnay/rust-toolchain@stable
-        if: needs.changes.outputs.heavy == 'true' && matrix.os != 'ubuntu-latest'
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch')
       - uses: mozilla-actions/sccache-action@v0.0.10
         id: sccache
         continue-on-error: true
-        if: needs.changes.outputs.heavy == 'true' && matrix.os != 'ubuntu-latest'
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch')
       - name: Enable sccache
-        if: needs.changes.outputs.heavy == 'true' && matrix.os != 'ubuntu-latest' && steps.sccache.outcome == 'success'
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch') && steps.sccache.outcome == 'success'
         shell: bash
         run: |
           echo "SCCACHE_GHA_ENABLED=true" >> "${GITHUB_ENV}"
           echo "RUSTC_WRAPPER=sccache" >> "${GITHUB_ENV}"
           echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> "${GITHUB_ENV}"
       - uses: Swatinem/rust-cache@v2
-        if: needs.changes.outputs.heavy == 'true' && matrix.os != 'ubuntu-latest'
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch')
         with:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run tests
-        if: needs.changes.outputs.heavy == 'true' && matrix.os != 'ubuntu-latest'
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch')
         run: cargo test --workspace --all-features --locked
       - name: Lockfile drift guard
-        if: needs.changes.outputs.heavy == 'true' && matrix.os != 'ubuntu-latest'
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch')
         run: git diff --exit-code -- Cargo.lock
       - name: Run Offline Eval Harness
         # The eval harness is OS-independent prompt/composition checking;
@@ -319,12 +349,12 @@ jobs:
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'macos-latest'
         run: cargo run -p codewhale-tui --all-features -- eval
       - name: sccache stats
-        if: needs.changes.outputs.heavy == 'true' && matrix.os != 'ubuntu-latest' && steps.sccache.outcome == 'success'
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch') && steps.sccache.outcome == 'success'
         continue-on-error: true
         shell: bash
         run: sccache --show-stats
       - name: Linux test location
-        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest'
+        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && github.event_name != 'workflow_dispatch'
         run: echo "Linux workspace tests run on CNB for mirrored first-party branches."
 
   npm-wrapper-smoke:
@@ -344,31 +374,31 @@ jobs:
         if: needs.changes.outputs.heavy != 'true'
         run: echo "No executable Rust changes detected; preserving required npm wrapper smoke context."
       - uses: actions/checkout@v7
-        if: needs.changes.outputs.heavy == 'true' && matrix.os != 'ubuntu-latest'
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch')
       - uses: dtolnay/rust-toolchain@stable
-        if: needs.changes.outputs.heavy == 'true' && matrix.os != 'ubuntu-latest'
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch')
       - uses: mozilla-actions/sccache-action@v0.0.10
         id: sccache
         continue-on-error: true
-        if: needs.changes.outputs.heavy == 'true' && matrix.os != 'ubuntu-latest'
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch')
       - name: Enable sccache
-        if: needs.changes.outputs.heavy == 'true' && matrix.os != 'ubuntu-latest' && steps.sccache.outcome == 'success'
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch') && steps.sccache.outcome == 'success'
         shell: bash
         run: |
           echo "SCCACHE_GHA_ENABLED=true" >> "${GITHUB_ENV}"
           echo "RUSTC_WRAPPER=sccache" >> "${GITHUB_ENV}"
           echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> "${GITHUB_ENV}"
-      - uses: actions/setup-node@v6
-        if: needs.changes.outputs.heavy == 'true' && matrix.os != 'ubuntu-latest'
+      - uses: actions/setup-node@v7
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch')
         with:
           node-version: 20
       - uses: Swatinem/rust-cache@v2
-        if: needs.changes.outputs.heavy == 'true' && matrix.os != 'ubuntu-latest'
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch')
         with:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build wrapper binaries
-        if: needs.changes.outputs.heavy == 'true' && matrix.os != 'ubuntu-latest'
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch')
         # The smoke validates wrapper install/delegation plumbing, not
         # codegen quality, so skip fat LTO + codegen-units=1 for a much
         # cheaper release build. Shipped binaries keep the real profile via
@@ -378,15 +408,15 @@ jobs:
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
         run: cargo build --release --locked -p codewhale-cli -p codewhale-tui
       - name: Smoke wrapper install and delegated entrypoints
-        if: needs.changes.outputs.heavy == 'true' && matrix.os != 'ubuntu-latest'
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch')
         run: node scripts/release/npm-wrapper-smoke.js
       - name: sccache stats
-        if: needs.changes.outputs.heavy == 'true' && matrix.os != 'ubuntu-latest' && steps.sccache.outcome == 'success'
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch') && steps.sccache.outcome == 'success'
         continue-on-error: true
         shell: bash
         run: sccache --show-stats
       - name: Linux smoke location
-        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest'
+        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && github.event_name != 'workflow_dispatch'
         run: echo "Linux npm wrapper smoke runs on CNB for mirrored first-party branches."
 
   mobile-smoke:
@@ -458,7 +488,7 @@ jobs:
   # Check documentation builds without warnings
   docs:
     name: Documentation
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

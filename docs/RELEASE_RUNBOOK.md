@@ -81,7 +81,6 @@ cargo fmt --all -- --check
 cargo check --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
-cargo publish --dry-run --locked --allow-dirty -p codewhale-tui
 ./scripts/release/publish-crates.sh dry-run
 ```
 
@@ -100,11 +99,11 @@ without unpublished workspace dependencies and a packaging preflight for depende
 workspace crates. That avoids false negatives from crates.io not yet containing the
 new workspace version while still validating package contents before publish.
 
-For npm wrapper verification, build the two shipped binaries and run the
+For npm wrapper verification, build the three shipped entrypoints and run the
 cross-platform smoke harness. This packs the npm wrapper, installs it into a
-clean temporary project, serves local release assets over HTTP, and checks both
-the dispatcher-to-TUI path (`codewhale doctor --help`) and the direct TUI
-entrypoint (`codewhale-tui --help`).
+clean temporary project, serves local release assets over HTTP, and checks the
+dispatcher-to-TUI path (`codewhale doctor --help`), the installed native shortcut
+(`codew --version`), and the direct TUI entrypoint (`codewhale-tui --help`).
 
 ```bash
 cargo build --release --locked -p codewhale-cli -p codewhale-tui
@@ -113,6 +112,51 @@ node scripts/release/npm-wrapper-smoke.js
 
 Set `DEEPSEEK_TUI_KEEP_SMOKE_DIR=1` to keep the temporary pack/install
 directory for inspection.
+
+## Exact-head GitHub proof before publication
+
+Two manual workflows provide exact-head evidence without crossing the public
+release boundary. Run them only after the intended source is on a named ref
+(normally the frozen `main`), and pass the full commit SHA as an independent
+guard against that ref moving between inspection and dispatch:
+
+```bash
+git fetch origin main
+candidate_sha="$(git rev-parse origin/main)"
+
+gh workflow run ci.yml --ref main \
+  -f expected_sha="${candidate_sha}"
+gh workflow run release-candidate.yml --ref main \
+  -f expected_sha="${candidate_sha}"
+```
+
+The manual `ci.yml` path verifies that the dispatch resolved to
+`expected_sha`, disables light-change shortcuts, and forces the heavy Rust,
+workflow, mobile, Actions, Linux, macOS, Windows, npm-wrapper, and documentation
+gates. A mismatch fails before those gates start; it never silently tests a
+different head.
+
+`release-candidate.yml` also fails unless the selected ref resolves to the
+exact requested SHA. It invokes the same reusable artifact workflow as the
+public release, building all seven targets (including Android arm64 and native
+Windows arm64), staging `codewhale`, `codew`, and `codewhale-tui`, building the
+NSIS installer and nine platform archives, and validating the authoritative
+34-file inventory from `npm/codewhale/scripts/artifacts.js`. It then installs
+the packed npm wrapper against those assembled local assets and exercises its
+delegated entrypoints. The resulting `codewhale-release-assets` bundle is a
+short-lived GitHub Actions artifact only.
+
+This candidate workflow does not create a tag or GitHub Release, publish a
+crate or npm package, push a container, update Homebrew, deploy anything, or
+write repository contents. Its green result is evidence, not publication
+authorization. The stop line remains explicit Hunter approval: do not create
+the `vX.Y.Z` tag, dispatch `release.yml`, or run any registry publication step
+until that approval is given.
+
+The Android target is cross-built and included in the checksum/bundle gates,
+but GitHub's Linux runner cannot execute the Android binary as a real Termux
+user. Keep the real-device limitation in the release packet unless separate
+device evidence exists.
 
 To exercise `npm run release:check` locally as well, regenerate the local asset
 directory with a full asset matrix fixture before starting the server:
@@ -186,7 +230,9 @@ and fails branch-only release sources before assets are published.
    `./scripts/release/prepare-release.sh X.Y.Z` — it bumps every
    version-bearing file (workspace + crate pins + npm wrapper + README
    install tags), refreshes the lockfile and generated files, and runs
-   `check-versions.sh`.
+   the version and OHOS gates. It is safe to rerun after the workspace already
+   equals `X.Y.Z`: the second run skips replacements, refreshes the packaged
+   changelog and web facts, and reruns both gates.
 2. Run `./scripts/release/publish-crates.sh dry-run` locally; it must be clean.
 3. Merge the release PR into `main` before tagging. After the same-version
    queue is frozen and `main` is at the intended source SHA, create `vX.Y.Z`
@@ -198,7 +244,10 @@ and fails branch-only release sources before assets are published.
      `gh workflow run release.yml --ref vX.Y.Z -f version=X.Y.Z`.
    - Never dispatch from `main`, and do not start a duplicate while the
      tag-triggered run is merely delayed. The workflow serializes runs for the
-     same tag, but a duplicate still rebuilds public artifacts unnecessarily.
+     same tag. It also refuses to start release work when that tag already owns
+     any GitHub Release asset, rechecks immediately before upload, and disables
+     the release action's overwrite behavior. A normal rerun must never replace
+     public bytes.
 4. Wait for the GitHub Release workflow and all public assets to finish, then
    fetch the release tag and run the public asset gate. Do not publish any
    Cargo or npm package until it passes:
@@ -365,8 +414,13 @@ If the workflow failed for the release tag, use the exact-tag rerun or
   - rerun `./scripts/release/publish-crates.sh publish`
   - already-published crate versions will be skipped
 - GitHub assets missing or checksum manifest incomplete:
-  - fix `.github/workflows/release.yml`
-  - retag or upload corrected assets before `npm publish`
+  - fix `.github/workflows/release.yml`, but do not rerun it over an existing
+    asset set and do not delete assets merely to make the guard pass
+  - if any asset may have been public or consumed, cut a new patch version
+  - only after explicit maintainer approval and proof that no downstream
+    publication or consumer treated the failed asset set as public may a
+    deliberately scoped recovery remove the failed release before an exact-tag
+    rerun; record that exception in the release packet
 - npm packaging-only problem:
   - bump only the npm package version
   - keep `codewhaleBinaryVersion` on the last known-good Rust release

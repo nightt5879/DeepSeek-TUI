@@ -134,7 +134,12 @@ function parsePackJson(stdout) {
 
 async function main() {
   const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "codewhale-npm-smoke-"));
-  const releaseAssetsDir = path.join(tempRoot, "release-assets");
+  const suppliedAssetsDir = String(
+    process.env.CODEWHALE_SMOKE_ASSETS_DIR || "",
+  ).trim();
+  const releaseAssetsDir = suppliedAssetsDir
+    ? path.resolve(suppliedAssetsDir)
+    : path.join(tempRoot, "release-assets");
   const packDir = path.join(tempRoot, "pack");
   const installDir = path.join(tempRoot, "install");
   let keepTemp = process.env.DEEPSEEK_TUI_KEEP_SMOKE_DIR === "1";
@@ -144,7 +149,15 @@ async function main() {
     await fsp.mkdir(packDir, { recursive: true });
     await fsp.mkdir(installDir, { recursive: true });
 
-    await runCommand(process.execPath, [prepareAssetsScript, releaseAssetsDir]);
+    if (suppliedAssetsDir) {
+      const assetDirectoryStat = await fsp.stat(releaseAssetsDir);
+      if (!assetDirectoryStat.isDirectory()) {
+        throw new Error(`CODEWHALE_SMOKE_ASSETS_DIR is not a directory: ${releaseAssetsDir}`);
+      }
+      console.log(`Using preassembled release assets from ${releaseAssetsDir}`);
+    } else {
+      await runCommand(process.execPath, [prepareAssetsScript, releaseAssetsDir]);
+    }
     const served = await serveDirectory(releaseAssetsDir);
     server = served.server;
 
@@ -166,6 +179,10 @@ async function main() {
     await runCommand("npm", ["init", "-y"], { cwd: installDir });
     await runCommand("npm", ["install", tarball], { cwd: installDir, env });
     await runCommand("npx", ["--no-install", "codewhale", "doctor", "--help"], {
+      cwd: installDir,
+      env,
+    });
+    await runCommand("npx", ["--no-install", "codew", "--version"], {
       cwd: installDir,
       env,
     });
