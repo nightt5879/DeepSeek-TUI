@@ -13,8 +13,9 @@
 //! ```
 //!
 //! Default state when the file does not exist: empty list (everything enabled).
-//! A corrupt file is logged and treated as the default, so upgrades never
-//! accidentally hide every skill.
+//! A present but unreadable or malformed file is an error. Callers may keep
+//! native Skills available for recovery, but reviewed plugin Skills must stay
+//! hidden until their exact activation state can be read authoritatively.
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
@@ -144,17 +145,8 @@ fn load_disabled_unlocked(path: &Path) -> Result<BTreeSet<String>> {
             return Err(error).with_context(|| format!("read skill state at {}", path.display()));
         }
     };
-    let parsed: OnDiskState = match toml::from_str(&raw) {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!(
-                "skills_state.toml at {} is malformed ({}); treating all skills as enabled",
-                path.display(),
-                error
-            );
-            OnDiskState::default()
-        }
-    };
+    let parsed: OnDiskState =
+        toml::from_str(&raw).with_context(|| format!("parse skill state at {}", path.display()))?;
     Ok(parsed.disabled.into_iter().collect())
 }
 
@@ -300,12 +292,17 @@ mod tests {
     }
 
     #[test]
-    fn malformed_file_falls_back_to_default() {
+    fn malformed_file_fails_closed() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(STATE_FILE_NAME);
         fs::write(&path, b"this is not toml = { broken").unwrap();
-        let store = SkillStateStore::load_from(path).unwrap();
-        assert!(store.is_enabled("anything"));
+        let error = SkillStateStore::load_from(path.clone()).unwrap_err();
+        assert!(error.to_string().contains("parse skill state"));
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"this is not toml = { broken",
+            "a malformed authority file must remain untouched for recovery"
+        );
     }
 
     #[test]

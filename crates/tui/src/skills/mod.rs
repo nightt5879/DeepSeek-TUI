@@ -561,12 +561,29 @@ impl SkillRegistry {
     /// discovery. A qualified plugin Skill can be hidden independently, but
     /// this never changes the plugin bundle's trust or MCP lifecycle.
     #[must_use]
-    pub(crate) fn into_enabled(mut self) -> Self {
-        match crate::skill_state::SkillStateStore::load_default() {
+    pub(crate) fn into_enabled(self) -> Self {
+        self.into_enabled_with_state(crate::skill_state::SkillStateStore::load_default())
+    }
+
+    #[must_use]
+    fn into_enabled_with_state(
+        mut self,
+        state: anyhow::Result<crate::skill_state::SkillStateStore>,
+    ) -> Self {
+        match state {
             Ok(state) => self.skills.retain(|skill| state.is_enabled(&skill.name)),
-            Err(error) => self.push_warning(format!(
-                "Failed to read Skill activation state; leaving discovered Skills enabled: {error}"
-            )),
+            Err(error) => {
+                let hidden_plugin_skills = self
+                    .skills
+                    .iter()
+                    .filter(|skill| matches!(skill.source, SkillSource::Plugin { .. }))
+                    .count();
+                self.skills
+                    .retain(|skill| matches!(skill.source, SkillSource::Native));
+                self.push_warning(format!(
+                    "Failed to read Skill activation state; native Skills remain available for recovery, but {hidden_plugin_skills} reviewed plugin Skill(s) were hidden fail-closed: {error}"
+                ));
+            }
         }
         self
     }
@@ -2457,6 +2474,30 @@ body";
         assert!(
             !rendered.contains(&plugin_root.display().to_string()),
             "model prompt must not expose mutable plugin files after snapshot review"
+        );
+
+        let mut fail_closed_input = registry.clone();
+        fail_closed_input.skills.push(super::Skill {
+            name: "native-recovery".to_string(),
+            description: "native recovery skill".to_string(),
+            localized_descriptions: std::collections::HashMap::new(),
+            body: "recovery".to_string(),
+            path: tmp.path().join("native/SKILL.md"),
+            source: super::SkillSource::Native,
+        });
+        let fail_closed = fail_closed_input.into_enabled_with_state(Err(anyhow::anyhow!(
+            "injected activation-state read failure"
+        )));
+        assert!(fail_closed.get("native-recovery").is_some());
+        assert!(
+            fail_closed.get("demo:hello-world").is_none(),
+            "reviewed plugin Skills must not fail open when activation state is unreadable"
+        );
+        assert!(
+            fail_closed
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("hidden fail-closed"))
         );
 
         std::fs::remove_file(tmp.path().join("plugin-state.json.lock")).unwrap();
