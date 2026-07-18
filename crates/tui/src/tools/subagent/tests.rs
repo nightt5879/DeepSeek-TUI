@@ -4889,7 +4889,7 @@ fn fresh_forked_and_nested_subagents_share_authority_bound_skill_catalogs() {
         user_plugins_dir: tmp.path().join("user-plugins"),
         workspace_plugins_dir: workspace.join(".codewhale/plugins"),
         builtin_plugin_dirs: Vec::new(),
-        state_path: tmp.path().join("plugin-state.json"),
+        state_path: tmp.path().join("plugin-state/state.json"),
     };
     let mut plugins = crate::plugins::discovery::discover_with_config(&config);
     plugins.trust("demo").expect("trust plugin");

@@ -2446,7 +2446,7 @@ body";
             user_plugins_dir: tmp.path().join("plugins"),
             workspace_plugins_dir: tmp.path().join("workspace-plugins"),
             builtin_plugin_dirs: Vec::new(),
-            state_path: tmp.path().join("plugin-state.json"),
+            state_path: tmp.path().join("plugin-state/state.json"),
         };
         let mut plugins = crate::plugins::discovery::discover_with_config(&config);
 
@@ -2500,7 +2500,7 @@ body";
                 .any(|warning| warning.contains("hidden fail-closed"))
         );
 
-        std::fs::remove_file(tmp.path().join("plugin-state.json.lock")).unwrap();
+        std::fs::remove_file(config.state_path.with_file_name("state.json.lock")).unwrap();
         let mut denied = super::SkillRegistry::default();
         super::merge_active_plugin_skills(&mut denied, &plugins);
         assert!(

@@ -520,8 +520,22 @@ fn save_state_with_hardener(
     // Restrict the exact temporary object before its atomic rename publishes
     // it under the stable state path. Post-publish hardening leaves a Windows
     // race in which another local principal can open the inherited DACL.
-    harden_temporary(temporary.path())?;
-    persist_plugin_state(temporary, path)
+    #[cfg(windows)]
+    {
+        // `NamedTempFile` keeps a writer handle open. The ACL hardener
+        // intentionally opens its target with FILE_SHARE_READ only, so close
+        // that writer before safely reopening the name for ACL mutation. Its
+        // parent was hardened above, which prevents another principal from
+        // replacing the temporary entry between those operations.
+        let temporary = temporary.into_temp_path();
+        harden_temporary(temporary.as_ref())?;
+        persist_plugin_state(temporary, path)
+    }
+    #[cfg(not(windows))]
+    {
+        harden_temporary(temporary.path())?;
+        persist_plugin_state(temporary, path)
+    }
 }
 
 #[cfg(unix)]
@@ -560,7 +574,7 @@ fn persist_plugin_state_with_directory_sync(
 }
 
 #[cfg(windows)]
-fn persist_plugin_state(mut temporary: tempfile::NamedTempFile, path: &Path) -> Result<(), String> {
+fn persist_plugin_state(mut temporary: tempfile::TempPath, path: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt as _;
     use windows::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TEMPORARY, MOVEFILE_REPLACE_EXISTING,
@@ -572,7 +586,7 @@ fn persist_plugin_state(mut temporary: tempfile::NamedTempFile, path: &Path) -> 
         path.as_os_str().encode_wide().chain(Some(0)).collect()
     }
 
-    let temporary_path = temporary.path().to_path_buf();
+    let temporary_path = temporary.to_path_buf();
     let temporary_wide = wide_path(&temporary_path);
     let destination_wide = wide_path(path);
     // NamedTempFile marks the source as temporary. Clear only that temporary
@@ -609,8 +623,7 @@ fn persist_plugin_state(mut temporary: tempfile::NamedTempFile, path: &Path) -> 
         ));
     }
 
-    // The old temporary pathname no longer exists. Disarm path cleanup before
-    // the retained file handle is closed on drop.
+    // The old temporary pathname no longer exists. Disarm TempPath cleanup.
     temporary.disable_cleanup(true);
     Ok(())
 }
@@ -653,6 +666,12 @@ fn open_state_lock(path: &Path, create: bool) -> Result<fs::File, String> {
         // Open the reparse point itself. `validate_opened_regular_file` then
         // rejects it instead of following it to an unrelated ACL target.
         options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+        if create {
+            // Keep the writer handle used for the lock and grant it exactly
+            // the control rights needed to harden that same validated object.
+            // This avoids reopening the path with a conflicting share mode.
+            options.access_mode(0x001e_019f); // FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC | WRITE_OWNER
+        }
     }
     let file = options
         .open(path)
@@ -662,6 +681,9 @@ fn open_state_lock(path: &Path, create: bool) -> Result<fs::File, String> {
     // byte-for-byte and descriptor-for-descriptor non-mutating. ACL/mode
     // hardening belongs only to trust/enable/disable/revoke updates.
     if create {
+        #[cfg(windows)]
+        harden_opened_plugin_state_file(path, &file)?;
+        #[cfg(not(windows))]
         harden_plugin_state_file(path)?;
     }
     Ok(file)
@@ -840,6 +862,13 @@ fn ensure_private_plugin_state_directory(path: &Path) -> Result<(), String> {
 #[cfg(windows)]
 fn harden_plugin_state_file(path: &Path) -> Result<(), String> {
     set_windows_owner_only_acl(path)
+}
+
+#[cfg(windows)]
+fn harden_opened_plugin_state_file(path: &Path, file: &fs::File) -> Result<(), String> {
+    validate_opened_regular_file(path, file)?;
+    ensure_windows_registry_path_still_opened(path, file)?;
+    apply_windows_owner_only_acl(file, 0x001f_01ff)
 }
 
 #[cfg(unix)]
@@ -1119,6 +1148,11 @@ fn copy_bundle_tree_bounded(
             destination_file
                 .sync_all()
                 .map_err(|e| format!("failed to sync staged plugin file: {e}"))?;
+            #[cfg(windows)]
+            // The containing staging directory is already owner-only. Close
+            // the writer before reopening this path with the ACL hardener's
+            // deliberately restrictive share mode.
+            drop(destination_file);
             preserve_owner_only_file_mode(&destination_path, &metadata)?;
             #[cfg(windows)]
             ensure_windows_registry_path_still_opened(&source_path, &source_file)?;
@@ -1476,18 +1510,7 @@ fn set_windows_owner_only_acl(path: &Path) -> Result<(), String> {
 
 #[cfg(windows)]
 fn set_windows_owner_only_acl_with_mask(path: &Path, access_mask: u32) -> Result<(), String> {
-    use std::mem::{MaybeUninit, size_of};
     use std::os::windows::fs::OpenOptionsExt as _;
-    use std::os::windows::io::AsRawHandle as _;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, WIN32_ERROR};
-    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
-    use windows::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-        GetLengthSid, GetTokenInformation, InitializeAcl, OBJECT_INHERIT_ACE,
-        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
-        TokenUser,
-    };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     // Bind ACL mutation to the exact object opened without following a
     // reparse point. A pathname-only SetNamedSecurityInfoW call could inspect
@@ -1517,6 +1540,23 @@ fn set_windows_owner_only_acl_with_mask(path: &Path, access_mask: u32) -> Result
         );
     }
     ensure_windows_registry_path_still_opened(path, &target)?;
+
+    apply_windows_owner_only_acl(&target, access_mask)
+}
+
+#[cfg(windows)]
+fn apply_windows_owner_only_acl(target: &fs::File, access_mask: u32) -> Result<(), String> {
+    use std::mem::{MaybeUninit, size_of};
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, WIN32_ERROR};
+    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    use windows::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+        GetLengthSid, GetTokenInformation, InitializeAcl, OBJECT_INHERIT_ACE,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+        TokenUser,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     let mut token = HANDLE::default();
     // SAFETY: output handle points to valid storage and the pseudo process
@@ -1827,7 +1867,8 @@ mod unix_state_directory_tests {
 mod windows_acl_tests {
     use super::{
         PluginStateFile, ensure_private_runtime_parent, harden_plugin_state_file,
-        harden_staged_tree_contents, save_state_with_hardener, set_windows_owner_only_acl,
+        harden_staged_tree_contents, open_state_lock, save_state_with_hardener,
+        set_windows_owner_only_acl, state_lock_path,
     };
     use std::ffi::c_void;
     use std::mem::{MaybeUninit, size_of};
@@ -1897,6 +1938,19 @@ mod windows_acl_tests {
 
         let error = harden_staged_tree_contents(&stage).unwrap_err();
         assert!(error.contains("reparse point"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn state_lock_hardening_keeps_its_writer_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state");
+        std::fs::create_dir(&state_directory).unwrap();
+        set_windows_owner_only_acl(&state_directory).unwrap();
+        let lock_path = state_lock_path(&state_directory.join("state.json"));
+
+        let lock = open_state_lock(&lock_path, true)
+            .expect("state lock ACL hardening must not conflict with its writer handle");
+        assert!(lock.metadata().unwrap().is_file());
     }
 
     #[test]

@@ -5021,7 +5021,7 @@ async fn skills_endpoint_exposes_safe_plugin_provenance_and_shared_toggle() -> R
         user_plugins_dir: tmp.path().join("plugins"),
         workspace_plugins_dir: workspace.join(".codewhale/plugins"),
         builtin_plugin_dirs: Vec::new(),
-        state_path: tmp.path().join("plugin-state.json"),
+        state_path: tmp.path().join("plugin-state/state.json"),
     };
     let discovery = crate::plugins::PluginDiscoveryContext::from_config_and_environment(
         &plugin_config,

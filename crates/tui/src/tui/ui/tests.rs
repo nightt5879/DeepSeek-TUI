@@ -4164,7 +4164,7 @@ fn persisted_queued_plugin_skill_is_denied_after_cross_process_revocation() {
         user_plugins_dir: plugins_root,
         workspace_plugins_dir: tmpdir.path().join("workspace-plugins-unused"),
         builtin_plugin_dirs: Vec::new(),
-        state_path: tmpdir.path().join("plugin-state.json"),
+        state_path: tmpdir.path().join("plugin-state/state.json"),
     };
     let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
     registry.trust("queued-skill").unwrap();

@@ -1125,7 +1125,9 @@ args = ["server.js"]
         user_plugins_dir: plugins_root,
         workspace_plugins_dir: workspace.join(".codewhale/plugins-unused"),
         builtin_plugin_dirs: Vec::new(),
-        state_path: workspace.join(format!("plugin-state-{name}.json")),
+        state_path: workspace
+            .join("plugin-state")
+            .join(format!("plugin-state-{name}.json")),
     };
     let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
     registry.trust(name).unwrap();
@@ -1199,7 +1201,7 @@ connect_timeout = 1
         user_plugins_dir: plugins_root,
         workspace_plugins_dir: dir.path().join("workspace-plugins"),
         builtin_plugin_dirs: Vec::new(),
-        state_path: dir.path().join("plugin-state.json"),
+        state_path: dir.path().join("plugin-state/state.json"),
     };
     let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
     registry.trust("guarded").unwrap();
@@ -1306,7 +1308,7 @@ CALL_MARKER = "${CODEWHALE_TEST_PLUGIN_CALL_MARKER}"
         user_plugins_dir: plugins_root,
         workspace_plugins_dir: dir.path().join("workspace-plugins-unused"),
         builtin_plugin_dirs: Vec::new(),
-        state_path: dir.path().join("plugin-state.json"),
+        state_path: dir.path().join("plugin-state/state.json"),
     };
     let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
     registry.trust("revoked").unwrap();
@@ -1466,7 +1468,7 @@ async fn revoked_plugin_mcp_denies_catalog_tool_resource_and_prompt_operations()
         user_plugins_dir: plugins_root,
         workspace_plugins_dir: dir.path().join("workspace-plugins-unused"),
         builtin_plugin_dirs: Vec::new(),
-        state_path: dir.path().join("plugin-state.json"),
+        state_path: dir.path().join("plugin-state/state.json"),
     };
     let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
     registry.trust("catalog-guard").unwrap();
@@ -1572,7 +1574,7 @@ fn cached_reviewed_plugin_catalog_fixture() -> (tempfile::TempDir, PathBuf, Path
         user_plugins_dir: plugins_root,
         workspace_plugins_dir: dir.path().join("workspace-plugins-unused"),
         builtin_plugin_dirs: Vec::new(),
-        state_path: dir.path().join("plugin-state.json"),
+        state_path: dir.path().join("plugin-state/state.json"),
     };
     let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
     registry.trust("catalog-drift").unwrap();
@@ -1741,7 +1743,7 @@ fn active_plugin_fixture(
         user_plugins_dir: plugins_root,
         workspace_plugins_dir: root.join("workspace-plugins-unused"),
         builtin_plugin_dirs: Vec::new(),
-        state_path: root.join(format!(
+        state_path: root.join("plugin-state").join(format!(
             "plugin-state-{}.json",
             plugin_base.file_name().unwrap().to_string_lossy()
         )),
