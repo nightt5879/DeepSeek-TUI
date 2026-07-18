@@ -58,7 +58,8 @@ binaries = ["node"]
 ```
 
 Component paths must be relative, contained, present, and free of symbolic
-links. The v1 schema rejects unknown MCP fields, ambiguous local/remote
+links or Windows reparse points (including junctions and mount points). The v1
+schema rejects unknown MCP fields, ambiguous local/remote
 transport combinations, unbounded lists/timeouts, and overlapping tool
 filters.
 
@@ -173,8 +174,9 @@ bundles fail closed until the state file is repaired or moved.
 The content hash covers the manifest, complete bundle tree, and executable
 shape in deterministic path order, including local MCP entrypoints and
 companion assets. Staging is bounded, rejects symbolic links and unsupported
-file kinds (and hard links on Unix), uses an atomic destination swap, and
-applies owner-only runtime permissions or ACLs. The capability hash covers the
+file kinds (plus every Windows reparse point and hard-linked files), uses an
+atomic destination swap, and applies owner-only runtime permissions or ACLs
+through validated object handles on Windows. The capability hash covers the
 normalized component and permission inventory. A source or staged-content
 edit, capability change, or unsafe runtime-root replacement invalidates the
 receipt deterministically; an already-enabled bundle becomes inactive until

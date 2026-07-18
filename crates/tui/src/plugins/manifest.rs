@@ -7,6 +7,9 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::path_identity::metadata_is_link_or_reparse;
+#[cfg(windows)]
+use super::path_identity::windows_file_identity;
 use crate::mcp::{McpServerConfig, is_relative_stdio_path_arg};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -1160,12 +1163,7 @@ fn hash_path(
         let directory_guard = open_bundle_directory(path)
             .map_err(|e| format!("failed to open component directory safely: {e}"))?;
         #[cfg(windows)]
-        ensure_windows_metadata_identity(
-            &metadata,
-            &directory_guard
-                .metadata()
-                .map_err(|e| format!("failed to inspect opened component directory: {e}"))?,
-        )?;
+        ensure_windows_path_still_opened(path, &directory_guard)?;
         hasher.update(b"D\0");
         super::path_identity::hash_os_path(hasher, b"bundle-relative-directory", relative);
         let mut entries = fs::read_dir(path)
@@ -1190,12 +1188,7 @@ fn hash_path(
         let mut file = open_bundle_file(path)
             .map_err(|e| format!("failed to read component file {}: {e}", path.display()))?;
         #[cfg(windows)]
-        ensure_windows_metadata_identity(
-            &metadata,
-            &file
-                .metadata()
-                .map_err(|e| format!("failed to inspect opened component file: {e}"))?,
-        )?;
+        ensure_windows_path_still_opened(path, &file)?;
         let mut file_hasher = Sha256::new();
         file_hasher.update(b"codewhale-plugin-file-bytes-v1\0");
         let mut buffer = [0_u8; 64 * 1024];
@@ -1263,7 +1256,7 @@ pub(crate) fn open_bundle_file(path: &Path) -> std::io::Result<fs::File> {
 
 #[cfg(windows)]
 pub(crate) fn open_bundle_file(path: &Path) -> std::io::Result<fs::File> {
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::windows::fs::OpenOptionsExt as _;
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     let file = fs::OpenOptions::new()
@@ -1272,9 +1265,10 @@ pub(crate) fn open_bundle_file(path: &Path) -> std::io::Result<fs::File> {
         .custom_flags(0x0020_0000) // FILE_FLAG_OPEN_REPARSE_POINT
         .open(path)?;
     let metadata = file.metadata()?;
+    let identity = windows_file_identity(&file)?;
     if !metadata.is_file()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || metadata.number_of_links() != Some(1)
+        || identity.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || identity.links != 1
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1291,7 +1285,7 @@ pub(crate) fn open_bundle_file(path: &Path) -> std::io::Result<fs::File> {
 
 #[cfg(windows)]
 fn open_bundle_directory(path: &Path) -> std::io::Result<fs::File> {
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::windows::fs::OpenOptionsExt as _;
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     let file = fs::OpenOptions::new()
@@ -1300,7 +1294,8 @@ fn open_bundle_directory(path: &Path) -> std::io::Result<fs::File> {
         .custom_flags(0x0220_0000) // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
         .open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+    let identity = windows_file_identity(&file)?;
+    if !metadata.is_dir() || identity.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "plugin directory is a reparse point or non-directory",
@@ -1310,44 +1305,28 @@ fn open_bundle_directory(path: &Path) -> std::io::Result<fs::File> {
 }
 
 #[cfg(windows)]
-fn ensure_windows_metadata_identity(
-    before: &fs::Metadata,
-    opened: &fs::Metadata,
-) -> Result<(), String> {
-    use std::os::windows::fs::MetadataExt as _;
-
-    let before_id = (before.volume_serial_number(), before.file_index());
-    let opened_id = (opened.volume_serial_number(), opened.file_index());
-    if before_id.0.is_none() || before_id.1.is_none() || before_id != opened_id {
-        return Err(
-            "plugin path identity changed between metadata inspection and handle open".to_string(),
-        );
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
 fn ensure_windows_path_still_opened(path: &Path, opened: &fs::File) -> Result<(), String> {
     let after = fs::symlink_metadata(path)
         .map_err(|e| format!("failed to re-inspect plugin path after handle open: {e}"))?;
-    let opened = opened
-        .metadata()
-        .map_err(|e| format!("failed to inspect retained plugin handle: {e}"))?;
     if metadata_is_link_or_reparse(&after) {
         return Err("plugin path changed into a reparse point during validation".to_string());
     }
-    ensure_windows_metadata_identity(&after, &opened)
-}
-
-#[cfg(windows)]
-fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-    metadata.file_type().is_symlink() || metadata.file_attributes() & 0x0000_0400 != 0
-}
-
-#[cfg(not(windows))]
-fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
+    let current = if after.is_dir() {
+        open_bundle_directory(path)
+    } else if after.is_file() {
+        open_bundle_file(path)
+    } else {
+        return Err("plugin path changed into an unsupported object during validation".to_string());
+    }
+    .map_err(|e| format!("failed to reopen plugin path for identity validation: {e}"))?;
+    let opened = windows_file_identity(opened)
+        .map_err(|e| format!("failed to identify retained plugin handle: {e}"))?;
+    let current = windows_file_identity(&current)
+        .map_err(|e| format!("failed to identify current plugin path: {e}"))?;
+    if opened.volume != current.volume || opened.index != current.index {
+        return Err("plugin path identity changed between handle open and validation".to_string());
+    }
+    Ok(())
 }
 
 fn hash_inventory(inventory: &PluginInventory) -> String {

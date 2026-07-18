@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use super::manifest::{PluginManifest, ValidatedManifest};
+use super::path_identity::metadata_is_link_or_reparse;
 use super::registry::PluginRegistry;
 use super::types::{
     LoadedPlugin, PluginDiagnostic, PluginId, PluginOrigin, PluginScope, PluginSkillSnapshot,
@@ -171,11 +172,11 @@ fn scan_root(
     let Ok(metadata) = fs::symlink_metadata(root) else {
         return;
     };
-    if metadata.file_type().is_symlink() {
+    if metadata_is_link_or_reparse(&metadata) {
         diagnostics.push(PluginDiagnostic::error(
             "root-symlink",
             format!(
-                "Plugin discovery root may not be a symbolic link: {}",
+                "Plugin discovery root may not be a symbolic link or reparse point: {}",
                 root.display()
             ),
             Some(root.to_path_buf()),
@@ -233,21 +234,21 @@ fn scan_root(
 
     for entry in entries {
         let plugin_root = entry.path();
-        let Ok(file_type) = entry.file_type() else {
+        let Ok(metadata) = fs::symlink_metadata(&plugin_root) else {
             continue;
         };
-        if file_type.is_symlink() {
+        if metadata_is_link_or_reparse(&metadata) {
             diagnostics.push(PluginDiagnostic::error(
                 "bundle-symlink",
                 format!(
-                    "Plugin bundle directory may not be a symbolic link: {}",
+                    "Plugin bundle directory may not be a symbolic link or reparse point: {}",
                     plugin_root.display()
                 ),
                 Some(plugin_root),
             ));
             continue;
         }
-        if !file_type.is_dir() {
+        if !metadata.is_dir() {
             continue;
         }
         let manifest_path = plugin_root.join(PLUGIN_MANIFEST);
@@ -618,6 +619,61 @@ mod tests {
                 .diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic.code == "root-symlink")
+        );
+    }
+
+    #[cfg(windows)]
+    fn create_junction(link: &Path, target: &Path) {
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("invoke Windows junction creation");
+        assert!(
+            output.status.success(),
+            "failed to create junction: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_discovery_root_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_plugin(outside.path(), "a", "outside");
+        let cfg = config(tmp.path());
+        create_junction(&cfg.workspace_plugins_dir, outside.path());
+
+        let registry = discover_with_config(&cfg);
+        assert!(registry.is_empty());
+        assert!(
+            registry
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "root-symlink")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_bundle_entry_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = write_plugin(outside.path(), "actual", "outside");
+        let cfg = config(tmp.path());
+        fs::create_dir_all(&cfg.workspace_plugins_dir).unwrap();
+        create_junction(&cfg.workspace_plugins_dir.join("linked"), &target);
+
+        let registry = discover_with_config(&cfg);
+        assert!(registry.is_empty());
+        assert!(
+            registry
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "bundle-symlink")
         );
     }
 

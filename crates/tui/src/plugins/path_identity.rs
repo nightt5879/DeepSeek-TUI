@@ -2,6 +2,57 @@ use std::path::Path;
 
 use sha2::Digest;
 
+/// Return true for every pathname indirection the plugin boundary rejects.
+///
+/// `FileType::is_symlink` is insufficient on Windows: junctions, mount points,
+/// and other name-surrogate objects carry `FILE_ATTRIBUTE_REPARSE_POINT`
+/// without necessarily using the symbolic-link reparse tag. Keep this one
+/// predicate shared by discovery, manifest validation, staging, and ACL
+/// hardening so no surface silently follows a broader class than another.
+#[cfg(windows)]
+pub(crate) fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    metadata.file_type().is_symlink() || metadata.file_attributes() & 0x0000_0400 != 0
+}
+
+#[cfg(not(windows))]
+pub(crate) fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowsFileIdentity {
+    pub(crate) volume: u32,
+    pub(crate) index: u64,
+    pub(crate) links: u32,
+    pub(crate) attributes: u32,
+}
+
+/// Query stable handle-relative Windows identity without relying on Rust's
+/// still-unstable `windows_by_handle` metadata extensions.
+#[cfg(windows)]
+pub(crate) fn windows_file_identity(file: &std::fs::File) -> std::io::Result<WindowsFileIdentity> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` retains a valid handle and `information` points to live,
+    // writable storage for the duration of the call.
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information) }
+        .map_err(std::io::Error::other)?;
+    Ok(WindowsFileIdentity {
+        volume: information.dwVolumeSerialNumber,
+        index: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+        links: information.nNumberOfLinks,
+        attributes: information.dwFileAttributes,
+    })
+}
+
 /// Add a lossless, platform-scoped OS path to a digest.
 ///
 /// Plugin identity must never pass through Unicode replacement. Unix paths
@@ -57,6 +108,29 @@ mod tests {
         let mut hasher = Sha256::new();
         hash_os_path(&mut hasher, b"test-domain", path);
         hasher.finalize().to_vec()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junctions_are_reparse_points_even_when_not_symbolic_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let junction = directory.path().join("junction");
+        std::fs::create_dir(&target).unwrap();
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .output()
+            .expect("invoke Windows junction creation");
+        assert!(
+            output.status.success(),
+            "failed to create junction: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let metadata = std::fs::symlink_metadata(&junction).unwrap();
+        assert!(metadata_is_link_or_reparse(&metadata));
     }
 
     #[cfg(unix)]

@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::manifest::PluginInventory;
+use super::path_identity::metadata_is_link_or_reparse;
+#[cfg(windows)]
+use super::path_identity::windows_file_identity;
 use super::types::{
     LoadedPlugin, PluginAuthority, PluginDiagnostic, PluginDiagnosticLevel, PluginId,
     PluginTrustStatus,
@@ -590,15 +593,15 @@ fn validate_opened_regular_file(path: &Path, file: &fs::File) -> Result<(), Stri
 
 #[cfg(windows)]
 fn validate_opened_regular_file(path: &Path, file: &fs::File) -> Result<(), String> {
-    use std::os::windows::fs::MetadataExt as _;
-
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     let metadata = file
         .metadata()
         .map_err(|e| format!("failed to inspect opened {}: {e}", path.display()))?;
+    let identity = windows_file_identity(file)
+        .map_err(|e| format!("failed to identify opened {}: {e}", path.display()))?;
     if !metadata.is_file()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || metadata.number_of_links() != 1
+        || identity.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || identity.links != 1
     {
         return Err(format!(
             "{} must be one regular, non-reparse, non-hard-linked file",
@@ -752,6 +755,13 @@ fn ensure_private_runtime_parent(state_path: &Path, parent: &Path) -> Result<(),
         .ok_or_else(|| "plugin state path has no parent directory".to_string())?;
     fs::create_dir_all(configured_base)
         .map_err(|e| format!("failed to create plugin state directory: {e}"))?;
+    let base_metadata = fs::symlink_metadata(configured_base)
+        .map_err(|e| format!("failed to inspect plugin state directory: {e}"))?;
+    if metadata_is_link_or_reparse(&base_metadata) || !base_metadata.is_dir() {
+        return Err(
+            "plugin state directory must not be a symbolic link or reparse point".to_string(),
+        );
+    }
     // `runtime_stage_path` canonicalizes the same parent. Match that identity
     // here as well (notably `/var` -> `/private/var` on macOS) before proving
     // that every runtime component stays beneath the state directory.
@@ -769,9 +779,10 @@ fn ensure_private_runtime_parent(state_path: &Path, parent: &Path) -> Result<(),
         };
         cursor.push(component);
         match fs::symlink_metadata(&cursor) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(metadata) if metadata_is_link_or_reparse(&metadata) => {
                 return Err(
-                    "plugin runtime snapshot directory may not traverse symbolic links".to_string(),
+                    "plugin runtime snapshot directory may not traverse symbolic links or reparse points"
+                        .to_string(),
                 );
             }
             Ok(metadata) if !metadata.is_dir() => {
@@ -787,7 +798,7 @@ fn ensure_private_runtime_parent(state_path: &Path, parent: &Path) -> Result<(),
                                 "failed to inspect concurrently created plugin runtime snapshot directory: {e}"
                             )
                         })?;
-                        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
                             return Err(
                                 "concurrently created plugin runtime snapshot parent is not a safe directory"
                                     .to_string(),
@@ -832,7 +843,7 @@ fn copy_bundle_tree_bounded(
     use std::io::Read as _;
     let metadata = fs::symlink_metadata(source)
         .map_err(|e| format!("failed to inspect plugin content during staging: {e}"))?;
-    if registry_metadata_is_link_or_reparse(&metadata) {
+    if metadata_is_link_or_reparse(&metadata) {
         return Err("Plugin content changed into a symbolic link during staging".to_string());
     }
     if !metadata.is_dir() {
@@ -841,12 +852,7 @@ fn copy_bundle_tree_bounded(
     #[cfg(windows)]
     let source_guard = open_windows_bundle_directory(source)?;
     #[cfg(windows)]
-    ensure_windows_registry_identity(
-        &metadata,
-        &source_guard.metadata().map_err(|e| {
-            format!("failed to inspect opened plugin directory during staging: {e}")
-        })?,
-    )?;
+    ensure_windows_registry_path_still_opened(source, &source_guard)?;
     let mut entries = fs::read_dir(source)
         .map_err(|e| format!("failed to read plugin content during staging: {e}"))?
         .collect::<Result<Vec<_>, _>>()
@@ -857,7 +863,7 @@ fn copy_bundle_tree_bounded(
         let destination_path = destination.join(entry.file_name());
         let metadata = fs::symlink_metadata(&source_path)
             .map_err(|e| format!("failed to inspect plugin entry during staging: {e}"))?;
-        if registry_metadata_is_link_or_reparse(&metadata) {
+        if metadata_is_link_or_reparse(&metadata) {
             return Err("Plugin content may not contain symbolic links".to_string());
         }
         if metadata.is_dir() {
@@ -873,12 +879,7 @@ fn copy_bundle_tree_bounded(
             let mut source_file = super::manifest::open_bundle_file(&source_path)
                 .map_err(|e| format!("failed to open plugin file without following links: {e}"))?;
             #[cfg(windows)]
-            ensure_windows_registry_identity(
-                &metadata,
-                &source_file.metadata().map_err(|e| {
-                    format!("failed to inspect opened plugin file during staging: {e}")
-                })?,
-            )?;
+            ensure_windows_registry_path_still_opened(&source_path, &source_file)?;
             let mut destination_file = OpenOptions::new()
                 .create_new(true)
                 .write(true)
@@ -919,7 +920,7 @@ fn copy_bundle_tree_bounded(
 
 #[cfg(windows)]
 fn open_windows_bundle_directory(path: &Path) -> Result<fs::File, String> {
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::windows::fs::OpenOptionsExt as _;
 
     let file = OpenOptions::new()
         .read(true)
@@ -930,54 +931,40 @@ fn open_windows_bundle_directory(path: &Path) -> Result<fs::File, String> {
     let metadata = file
         .metadata()
         .map_err(|e| format!("failed to inspect opened plugin directory: {e}"))?;
-    if !metadata.is_dir() || metadata.file_attributes() & 0x0000_0400 != 0 {
+    let identity = windows_file_identity(&file)
+        .map_err(|e| format!("failed to identify opened plugin directory: {e}"))?;
+    if !metadata.is_dir() || identity.attributes & 0x0000_0400 != 0 {
         return Err("Plugin directory changed into a reparse point during staging".to_string());
     }
     Ok(file)
 }
 
 #[cfg(windows)]
-fn ensure_windows_registry_identity(
-    before: &fs::Metadata,
-    opened: &fs::Metadata,
-) -> Result<(), String> {
-    use std::os::windows::fs::MetadataExt as _;
-
-    let before_id = (before.volume_serial_number(), before.file_index());
-    let opened_id = (opened.volume_serial_number(), opened.file_index());
-    if before_id.0.is_none() || before_id.1.is_none() || before_id != opened_id {
-        return Err("Plugin path identity changed while staging".to_string());
-    }
-    if opened.is_file() && opened.number_of_links() != Some(1) {
-        return Err("Plugin content may not contain hard-linked files".to_string());
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
 fn ensure_windows_registry_path_still_opened(path: &Path, opened: &fs::File) -> Result<(), String> {
     let after = fs::symlink_metadata(path)
         .map_err(|e| format!("failed to re-inspect staged source path: {e}"))?;
-    if registry_metadata_is_link_or_reparse(&after) {
+    if metadata_is_link_or_reparse(&after) {
         return Err("Plugin path changed into a reparse point during staging".to_string());
     }
-    ensure_windows_registry_identity(
-        &after,
-        &opened
-            .metadata()
-            .map_err(|e| format!("failed to inspect retained source handle: {e}"))?,
-    )
-}
-
-#[cfg(windows)]
-fn registry_metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-    metadata.file_type().is_symlink() || metadata.file_attributes() & 0x0000_0400 != 0
-}
-
-#[cfg(all(not(unix), not(windows)))]
-fn registry_metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
+    let current = if after.is_dir() {
+        open_windows_bundle_directory(path)?
+    } else if after.is_file() {
+        super::manifest::open_bundle_file(path)
+            .map_err(|e| format!("failed to reopen staged source file safely: {e}"))?
+    } else {
+        return Err("Plugin path changed into an unsupported object during staging".to_string());
+    };
+    let opened = windows_file_identity(opened)
+        .map_err(|e| format!("failed to identify retained plugin handle: {e}"))?;
+    let current = windows_file_identity(&current)
+        .map_err(|e| format!("failed to identify current plugin path: {e}"))?;
+    if opened.volume != current.volume || opened.index != current.index {
+        return Err("Plugin path identity changed while staging".to_string());
+    }
+    if opened.links != 1 && after.is_file() {
+        return Err("Plugin content may not contain hard-linked files".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1176,6 +1163,12 @@ fn copy_bundle_directory_fd(
 fn harden_staged_tree(path: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|e| format!("failed to harden staged plugin content: {e}"))?;
+    if metadata_is_link_or_reparse(&metadata) {
+        return Err(
+            "Staged plugin content changed into a symbolic link or reparse point before hardening"
+                .to_string(),
+        );
+    }
     if metadata.is_dir() {
         let entries = fs::read_dir(path)
             .map_err(|e| format!("failed to read staged plugin content: {e}"))?
@@ -1196,7 +1189,7 @@ fn harden_staged_tree(path: &Path) -> Result<(), String> {
 fn harden_staged_tree_contents(path: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|e| format!("failed to harden staged plugin root: {e}"))?;
-    if !metadata.is_dir() {
+    if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
         return Err("Staged plugin root changed type before activation".to_string());
     }
     let entries = fs::read_dir(path)
@@ -1236,8 +1229,7 @@ fn set_staged_read_only_file(path: &Path, source: &fs::Metadata) -> Result<(), S
 
 #[cfg(windows)]
 fn set_staged_read_only_file(path: &Path, source: &fs::Metadata) -> Result<(), String> {
-    preserve_owner_only_file_mode(path, source)?;
-    set_windows_owner_only_acl_with_mask(path, 0xa000_0000)
+    preserve_owner_only_file_mode(path, source)
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -1269,16 +1261,45 @@ fn set_windows_owner_only_acl(path: &Path) -> Result<(), String> {
 #[cfg(windows)]
 fn set_windows_owner_only_acl_with_mask(path: &Path, access_mask: u32) -> Result<(), String> {
     use std::mem::{MaybeUninit, size_of};
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
     use windows::Win32::Foundation::{CloseHandle, HANDLE, WIN32_ERROR};
-    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
     use windows::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
         GetLengthSid, GetTokenInformation, InitializeAcl, OBJECT_INHERIT_ACE,
         PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    use windows::core::PCWSTR;
+
+    // Bind ACL mutation to the exact object opened without following a
+    // reparse point. A pathname-only SetNamedSecurityInfoW call could inspect
+    // a safe entry and then follow a junction substituted before the update.
+    let before = fs::symlink_metadata(path)
+        .map_err(|error| format!("failed to inspect Windows plugin ACL target: {error}"))?;
+    if metadata_is_link_or_reparse(&before) || !(before.is_file() || before.is_dir()) {
+        return Err(
+            "Windows plugin ACL target must be a regular non-reparse file or directory".to_string(),
+        );
+    }
+    let target = OpenOptions::new()
+        .access_mode(0x0002_0000 | 0x0004_0000) // READ_CONTROL | WRITE_DAC
+        .share_mode(0x0000_0001) // FILE_SHARE_READ
+        .custom_flags(0x0220_0000) // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        .open(path)
+        .map_err(|error| format!("failed to open Windows plugin ACL target safely: {error}"))?;
+    let opened = target
+        .metadata()
+        .map_err(|error| format!("failed to inspect opened Windows plugin ACL target: {error}"))?;
+    let opened_identity = windows_file_identity(&target)
+        .map_err(|error| format!("failed to identify opened Windows plugin ACL target: {error}"))?;
+    if opened_identity.attributes & 0x0000_0400 != 0 || !(opened.is_file() || opened.is_dir()) {
+        return Err(
+            "Windows plugin ACL target changed into a reparse point or unsupported object"
+                .to_string(),
+        );
+    }
+    ensure_windows_registry_path_still_opened(path, &target)?;
 
     let mut token = HANDLE::default();
     // SAFETY: output handle points to valid storage and the pseudo process
@@ -1335,13 +1356,12 @@ fn set_windows_owner_only_acl_with_mask(path: &Path, access_mask: u32) -> Result
         }
         .map_err(|error| format!("failed to grant the current Windows user access: {error}"))?;
 
-        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
-        wide.push(0);
-        // SAFETY: path is NUL terminated; ACL and SID buffers remain alive for
-        // the call. A protected DACL prevents inherited broad access.
+        // SAFETY: `target` retains the exact validated non-reparse object and
+        // the ACL/SID buffers remain alive through the call. A protected DACL
+        // prevents inherited broad access.
         let status = unsafe {
-            SetNamedSecurityInfoW(
-                PCWSTR(wide.as_ptr()),
+            SetSecurityInfo(
+                HANDLE(target.as_raw_handle()),
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 None,
@@ -1377,7 +1397,15 @@ fn preserve_owner_only_file_mode(path: &Path, source: &fs::Metadata) -> Result<(
         .map_err(|e| format!("failed to restrict staged plugin file permissions: {e}"))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn preserve_owner_only_file_mode(path: &Path, _source: &fs::Metadata) -> Result<(), String> {
+    // The protected handle-relative DACL is the Windows non-writable
+    // authority. Avoid `set_permissions(path)`, which can follow a reparse
+    // point substituted after metadata inspection.
+    set_windows_owner_only_acl_with_mask(path, 0xa000_0000)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn preserve_owner_only_file_mode(path: &Path, _source: &fs::Metadata) -> Result<(), String> {
     let mut permissions = fs::metadata(path)
         .map_err(|e| format!("failed to inspect staged plugin file permissions: {e}"))?
@@ -1451,7 +1479,9 @@ pub fn verify_plugin_state_authority(authority: &PluginAuthority) -> Result<(), 
 
 #[cfg(all(test, windows))]
 mod windows_acl_tests {
-    use super::set_windows_owner_only_acl;
+    use super::{
+        ensure_private_runtime_parent, harden_staged_tree_contents, set_windows_owner_only_acl,
+    };
     use std::ffi::c_void;
     use std::mem::{MaybeUninit, size_of};
     use std::os::windows::ffi::OsStrExt;
@@ -1462,6 +1492,64 @@ mod windows_acl_tests {
         PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
     };
     use windows::core::{BOOL, PCWSTR};
+
+    fn create_junction(link: &std::path::Path, target: &std::path::Path) {
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("invoke Windows junction creation");
+        assert!(
+            output.status.success(),
+            "failed to create junction: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn acl_hardening_rejects_junction_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let junction = directory.path().join("junction");
+        std::fs::create_dir(&target).unwrap();
+        create_junction(&junction, &target);
+
+        let error = set_windows_owner_only_acl(&junction).unwrap_err();
+        assert!(error.contains("non-reparse"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn runtime_parent_creation_rejects_junction_components() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&state_root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        create_junction(&state_root.join(".runtime"), &outside);
+        let state_path = state_root.join("state.json");
+        let expected_parent = state_root.join(".runtime/v1/plugin");
+
+        let error = ensure_private_runtime_parent(&state_path, &expected_parent).unwrap_err();
+        assert!(
+            error.contains("reparse points"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn staged_tree_hardening_rejects_junction_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let stage = directory.path().join("stage");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        create_junction(&stage.join("linked"), &outside);
+
+        let error = harden_staged_tree_contents(&stage).unwrap_err();
+        assert!(error.contains("reparse point"), "unexpected error: {error}");
+    }
 
     #[test]
     fn owner_only_runtime_acl_is_protected_and_has_one_full_access_ace() {
