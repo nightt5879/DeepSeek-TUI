@@ -13184,7 +13184,7 @@ async fn run_xai_device_login_from_tui(
         app.use_mouse_capture,
         app.use_bracketed_paste,
     )?;
-    let login_result = tokio::task::block_in_place(crate::xai_oauth::device_code_login);
+    let login_result = crate::xai_oauth::device_code_login().await;
     resume_terminal(
         terminal,
         app.use_alt_screen,

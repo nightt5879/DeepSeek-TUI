@@ -1425,7 +1425,7 @@ async fn run_async_main() -> Result<()> {
             Commands::Login { api_key } => run_login(api_key),
             Commands::Logout => run_logout(),
             Commands::Auth(args) => match args.command {
-                TuiAuthCommand::XaiDevice => run_xai_device_auth(cli.config.as_deref()),
+                TuiAuthCommand::XaiDevice => run_xai_device_auth(cli.config.as_deref()).await,
             },
             Commands::Models(args) => {
                 let config = load_config_from_cli(&cli)?;
@@ -5734,8 +5734,8 @@ fn run_logout() -> Result<()> {
     Ok(())
 }
 
-fn run_xai_device_auth(config_path: Option<&Path>) -> Result<()> {
-    let _credentials = xai_oauth::device_code_login()?;
+async fn run_xai_device_auth(config_path: Option<&Path>) -> Result<()> {
+    let _credentials = xai_oauth::device_code_login().await?;
     let saved =
         config::save_provider_auth_mode_for_at(config::ApiProvider::Xai, "oauth", config_path)?;
     println!(

@@ -261,7 +261,7 @@ pub fn get_credentials() -> Result<XaiOAuthCredentials> {
 /// Public residual entry point for CLI/TUI wiring (`codewhale auth` /
 /// slash command). Call from a headless or TUI surface that can print the
 /// verification URL.
-pub fn device_code_login() -> Result<XaiOAuthCredentials> {
+pub async fn device_code_login() -> Result<XaiOAuthCredentials> {
     let issuer = std::env::var("GROK_OIDC_ISSUER")
         .or_else(|_| std::env::var("XAI_OIDC_ISSUER"))
         .unwrap_or_else(|_| XAI_OIDC_ISSUER.to_string());
@@ -274,7 +274,21 @@ pub fn device_code_login() -> Result<XaiOAuthCredentials> {
     let auth_path = auth_file_path();
     let open_browser = std::env::var_os("CODEWHALE_XAI_OAUTH_NO_BROWSER").is_none();
 
-    device_code_login_with(&issuer, &client_id, &scopes, &auth_path, open_browser)
+    device_code_login_on_blocking_thread(issuer, client_id, scopes, auth_path, open_browser).await
+}
+
+async fn device_code_login_on_blocking_thread(
+    issuer: String,
+    client_id: String,
+    scopes: String,
+    auth_path: PathBuf,
+    open_browser: bool,
+) -> Result<XaiOAuthCredentials> {
+    tokio::task::spawn_blocking(move || {
+        device_code_login_with(&issuer, &client_id, &scopes, &auth_path, open_browser)
+    })
+    .await
+    .context("xAI device-code login worker failed")?
 }
 
 fn device_code_login_with(
@@ -986,7 +1000,7 @@ mod tests {
         assert_eq!(XAI_OIDC_ISSUER, "https://auth.x.ai");
         assert_eq!(GROK_OIDC_CLIENT_ID.len(), 36);
         // Keep device_code_login referenced so the residual entry point stays linked.
-        let _ = device_code_login as fn() -> Result<XaiOAuthCredentials>;
+        let _ = device_code_login;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1014,6 +1028,47 @@ mod tests {
                 token_endpoint: format!("{}/oauth2/token-advertised", server.uri()),
             }
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn device_login_discovery_request_is_safe_inside_tokio_runtime() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": server.uri(),
+                "device_authorization_endpoint": format!("{}/oauth2/device-advertised", server.uri()),
+                "token_endpoint": format!("{}/oauth2/token-advertised", server.uri())
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/device-advertised"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_scope",
+                "error_description": "mock refusal before browser or polling"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let auth_dir = TempDir::new().unwrap();
+        let auth_path = auth_dir.path().join("unused-auth.json");
+        let error = device_code_login_on_blocking_thread(
+            server.uri(),
+            "test-public-client".to_string(),
+            "openid".to_string(),
+            auth_path.clone(),
+            false,
+        )
+        .await
+        .expect_err("mock device request must fail without a runtime-drop panic");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("invalid_scope"), "{message}");
+        assert!(message.contains("HTTP 400"), "{message}");
+        assert!(!auth_path.exists());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

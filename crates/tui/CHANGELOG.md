@@ -59,8 +59,10 @@ site's draft, feed, login, and content-watch boundaries.
 - Restore xAI/Grok device-code OAuth login against the live xAI OIDC
   contract: discovery with issuer/endpoint validation and documented
   fallbacks, user-principal scope set, RFC 8628 `slow_down` backoff capped at
-  code expiry, and bounded, sanitized error reporting for denial, expiry, and
-  malformed responses (#4410).
+  code expiry, bounded, sanitized error reporting for denial, expiry, and
+  malformed responses, and a shared blocking-worker boundary for both CLI and
+  TUI login so reqwest's blocking client never creates or drops its private
+  runtime inside Codewhale's Tokio runtime (#4410).
 - Anchor `FREQ=HOURLY` automations with `BYHOUR`/`BYMINUTE` to persisted
   local-calendar slots so intervals keep their wall-clock phase across DST,
   restart, resume, RRULE updates, duplicate-slot recovery, and post-run

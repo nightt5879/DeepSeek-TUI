@@ -39,6 +39,10 @@ const OUTPUT_LIMIT: usize = 12 * 1024;
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 #[cfg(unix)]
 const MAX_TIMEOUT_SECS: u64 = 600;
+#[cfg(unix)]
+const CANCEL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const CANCEL_SENTINEL_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 #[cfg(unix)]
 struct TerminalSession {
@@ -471,6 +475,51 @@ fn wait_shared_session(
     }
 }
 
+/// Interrupt a foreground command and wait until the persistent shell confirms
+/// that it is ready again.
+///
+/// Canonical PTYs may flush queued input when they process ETX. Resubmit the
+/// completion sentinel until the shell acknowledges it so a busy host cannot
+/// strand the session merely because the one post-interrupt write raced that
+/// flush.
+#[cfg(unix)]
+fn cancel_shared_session(session: &SharedSession) -> Result<(i32, String), ToolError> {
+    let marker = {
+        let session = session
+            .lock()
+            .map_err(|_| ToolError::execution_failed("terminal session lock poisoned"))?;
+        if session.command.is_none() || completion(&session).is_some() {
+            return Err(ToolError::execution_failed(
+                "terminal session has no running foreground command",
+            ));
+        }
+        write_bytes(&session, &[3]).map_err(ToolError::execution_failed)?;
+        session
+            .command
+            .as_ref()
+            .expect("running command checked above")
+            .marker
+            .clone()
+    };
+    let deadline = Instant::now() + CANCEL_CONFIRM_TIMEOUT;
+
+    loop {
+        std::thread::sleep(CANCEL_SENTINEL_RETRY_INTERVAL);
+        let session = session
+            .lock()
+            .map_err(|_| ToolError::execution_failed("terminal session lock poisoned"))?;
+        if let Some(done) = completion(&session) {
+            return Ok(done);
+        }
+        if Instant::now() >= deadline {
+            return Err(ToolError::execution_failed(
+                "terminal interrupt was sent, but cancellation was not confirmed within 2 seconds",
+            ));
+        }
+        write_completion_sentinel(&session, &marker, 130).map_err(ToolError::execution_failed)?;
+    }
+}
+
 #[cfg(unix)]
 fn session_result(
     session: &mut TerminalSession,
@@ -729,40 +778,11 @@ impl ToolSpec for TerminalCancelTool {
             let name = session_name(&input, true)?.to_string();
             let session = find(&name, &context.workspace).map_err(ToolError::execution_failed)?;
             return tokio::task::spawn_blocking(move || {
-                let marker = {
-                    let session = session.lock().map_err(|_| {
-                        ToolError::execution_failed("terminal session lock poisoned")
-                    })?;
-                    if session.command.is_none() || completion(&session).is_some() {
-                        return Err(ToolError::execution_failed(
-                            "terminal session has no running foreground command",
-                        ));
-                    }
-                    write_bytes(&session, &[3]).map_err(ToolError::execution_failed)?;
-                    session
-                        .command
-                        .as_ref()
-                        .expect("running command checked above")
-                        .marker
-                        .clone()
-                };
-                // Canonical-mode terminals flush queued input on ETX. That can
-                // discard the sentinel originally queued behind the foreground
-                // command, so enqueue it again after the interrupt has reached
-                // the process group. A duplicate sentinel is harmless.
-                std::thread::sleep(Duration::from_millis(50));
-                {
-                    let session = session.lock().map_err(|_| {
-                        ToolError::execution_failed("terminal session lock poisoned")
-                    })?;
-                    write_completion_sentinel(&session, &marker, 130)
-                        .map_err(ToolError::execution_failed)?;
-                }
-                let (done, _) = wait_shared_session(&session, Duration::from_secs(2))?;
+                let done = cancel_shared_session(&session)?;
                 let mut session = session
                     .lock()
                     .map_err(|_| ToolError::execution_failed("terminal session lock poisoned"))?;
-                let mut result = session_result(&mut session, done, false);
+                let mut result = session_result(&mut session, Some(done), false);
                 result.success = true;
                 if let Some(metadata) = result.metadata.as_mut() {
                     metadata["status"] = json!("canceled");
@@ -945,25 +965,16 @@ mod tests {
             let mut guard = worker.lock().unwrap();
             start_command(&mut guard, "sleep 10").unwrap();
         }
-        let started = Instant::now();
         let handle = std::thread::spawn(move || {
             let (done, timed_out) = wait_shared_session(&worker, Duration::from_secs(30)).unwrap();
             let mut guard = worker.lock().unwrap();
             session_result(&mut guard, done, timed_out)
         });
         std::thread::sleep(Duration::from_millis(150));
-        let marker = {
-            let guard = session.lock().unwrap();
-            write_bytes(&guard, &[3]).unwrap();
-            guard.command.as_ref().unwrap().marker.clone()
-        };
-        std::thread::sleep(Duration::from_millis(50));
-        write_completion_sentinel(&session.lock().unwrap(), &marker, 130).unwrap();
-        let _ = handle.join().unwrap();
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "cancel was blocked behind the foreground waiter"
-        );
+        let done = cancel_shared_session(&session).unwrap();
+        let result = handle.join().unwrap();
+        assert_eq!(done.0, 130);
+        assert_eq!(result.metadata.as_ref().unwrap()["exit_code"], 130);
         assert!(
             run(&session, "printf alive", Duration::from_secs(3))
                 .content
