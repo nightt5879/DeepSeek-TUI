@@ -782,7 +782,7 @@ fn open_owned_credentials_directory(directory: &Path) -> Result<XaiOAuthCredenti
     use std::os::windows::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC, WRITE_OWNER,
     };
 
     anyhow::ensure!(
@@ -835,7 +835,7 @@ fn open_owned_credentials_directory(directory: &Path) -> Result<XaiOAuthCredenti
     );
     let mut secure_options = fs::OpenOptions::new();
     secure_options
-        .access_mode(FILE_GENERIC_READ | WRITE_DAC)
+        .access_mode(FILE_GENERIC_READ | WRITE_DAC | WRITE_OWNER)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     let final_directory = secure_options.open(directory).with_context(|| {
@@ -858,31 +858,19 @@ fn open_owned_credentials_directory(directory: &Path) -> Result<XaiOAuthCredenti
 
 #[cfg(windows)]
 impl XaiOAuthCredentialStore {
-    fn open_windows_file(
-        &self,
-        name: &str,
-        read: bool,
-        write: bool,
-        create: bool,
-        share_delete: bool,
-    ) -> Result<Option<File>> {
+    fn open_windows_file(&self, name: &str, read: bool, write: bool) -> Result<Option<File>> {
         use std::os::windows::fs::OpenOptionsExt as _;
         use windows_sys::Win32::Storage::FileSystem::{
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
 
         validate_private_basename(name)?;
         let path = self.directory.join(name);
         let mut options = fs::OpenOptions::new();
-        let mut share = FILE_SHARE_READ | FILE_SHARE_WRITE;
-        if share_delete {
-            share |= FILE_SHARE_DELETE;
-        }
         options
             .read(read)
             .write(write)
-            .create(create)
-            .share_mode(share)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         match options.open(&path) {
             Ok(file) => {
@@ -900,12 +888,62 @@ impl XaiOAuthCredentialStore {
     }
 
     fn open_owned_file_for_read(&self, name: &str) -> Result<Option<File>> {
-        self.open_windows_file(name, true, false, false, false)
+        self.open_windows_file(name, true, false)
     }
 
     fn open_internal_file(&self, name: &str) -> Result<File> {
-        self.open_windows_file(name, true, true, true, false)?
-            .context("xAI OAuth lifecycle lock disappeared while opening")
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC, WRITE_OWNER,
+        };
+
+        validate_private_basename(name)?;
+        let path = self.directory.join(name);
+        for _ in 0..8 {
+            if let Some(existing) = self.open_windows_file(name, true, true)? {
+                return Ok(existing);
+            }
+
+            let mut options = fs::OpenOptions::new();
+            options
+                .access_mode(
+                    FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC | WRITE_OWNER | DELETE,
+                )
+                .create_new(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            let file = match options.open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "creating Codewhale-owned xAI OAuth lifecycle lock {}",
+                            crate::quote_os_path(&path)
+                        )
+                    });
+                }
+            };
+            let secured = (|| -> Result<()> {
+                validate_windows_file_shape(&file, &path)?;
+                secure_windows_owner_only_handle(&file, false)
+                    .context("securing a new xAI OAuth lifecycle lock")?;
+                validate_owned_file_handle(&file, &path)?;
+                Ok(())
+            })();
+            if let Err(error) = secured {
+                let cleanup = mark_windows_file_handle_for_deletion(&file);
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(error).context(format!(
+                        "also failed to delete the empty lifecycle lock: {cleanup:#}"
+                    )),
+                };
+            }
+            return Ok(file);
+        }
+        bail!("xAI OAuth lifecycle lock changed repeatedly while opening")
     }
 
     fn write_owned_file(&self, name: &str, bytes: &[u8], allow_replace: bool) -> Result<()> {
@@ -919,41 +957,86 @@ impl XaiOAuthCredentialStore {
         }
         let mut temporary = tempfile::NamedTempFile::new_in(&self.directory)
             .context("creating private xAI OAuth temporary file")?;
-        temporary
-            .write_all(bytes)
-            .context("writing xAI OAuth temporary file")?;
-        temporary
-            .flush()
-            .context("flushing xAI OAuth temporary file")?;
-        temporary
-            .as_file()
-            .sync_all()
-            .context("syncing xAI OAuth temporary file")?;
-        if allow_replace {
+        let temporary_path = temporary.path().to_path_buf();
+        let security_handle =
+            reopen_windows_file_for_owner_security(temporary.as_file(), &temporary_path)?;
+        secure_windows_owner_only_handle(&security_handle, false)
+            .context("securing a new xAI OAuth temporary file before writing credentials")?;
+        validate_owned_file_handle(&security_handle, &temporary_path)
+            .context("verifying a new xAI OAuth temporary file before writing credentials")?;
+        let write_result = (|| -> Result<()> {
             temporary
-                .persist(&path)
-                .map_err(|error| error.error)
-                .context("atomically replacing xAI OAuth credentials")?;
-        } else {
+                .write_all(bytes)
+                .context("writing xAI OAuth temporary file")?;
             temporary
-                .persist_noclobber(&path)
-                .map_err(|error| error.error)
-                .context("installing a new xAI OAuth generation without replacement")?;
+                .flush()
+                .context("flushing xAI OAuth temporary file")?;
+            temporary
+                .as_file()
+                .sync_all()
+                .context("syncing xAI OAuth temporary file")?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            return Err(cleanup_windows_secret_after_error(
+                &security_handle,
+                error,
+                "temporary file",
+            ));
         }
-        let file = self
-            .open_owned_file_for_read(name)?
-            .context("xAI OAuth credentials disappeared after persistence")?;
-        validate_owned_file_handle(&file, &path)?;
+        let persisted = if allow_replace {
+            match temporary.persist(&path) {
+                Ok(file) => file,
+                Err(error) => {
+                    let tempfile::PersistError { error, file } = error;
+                    let persistence_error = anyhow::Error::new(error)
+                        .context("atomically replacing xAI OAuth credentials");
+                    let error = cleanup_windows_secret_after_error(
+                        &security_handle,
+                        persistence_error,
+                        "temporary file",
+                    );
+                    drop(file);
+                    return Err(error);
+                }
+            }
+        } else {
+            match temporary.persist_noclobber(&path) {
+                Ok(file) => file,
+                Err(error) => {
+                    let tempfile::PersistError { error, file } = error;
+                    let persistence_error = anyhow::Error::new(error)
+                        .context("installing a new xAI OAuth generation without replacement");
+                    let error = cleanup_windows_secret_after_error(
+                        &security_handle,
+                        persistence_error,
+                        "temporary file",
+                    );
+                    drop(file);
+                    return Err(error);
+                }
+            }
+        };
+        if let Err(error) = validate_persisted_windows_owned_file(&persisted, &path) {
+            // MoveFileEx has already published this exact object. Delete it by
+            // handle rather than trusting the pathname again. For a refresh
+            // replacement this can leave the unchanged config pointer missing;
+            // that fail-closed availability outcome is safer than retaining a
+            // generation that failed the post-publication invariant check.
+            return Err(cleanup_windows_secret_after_error(
+                &security_handle,
+                error,
+                "rejected generation",
+            ));
+        }
         Ok(())
     }
 
     fn remove_raw(&self, name: &str) -> Result<bool> {
         use std::os::windows::fs::OpenOptionsExt as _;
-        use std::os::windows::io::AsRawHandle as _;
         use windows_sys::Win32::Storage::FileSystem::{
-            DELETE, FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo,
-            SetFileInformationByHandle,
+            DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
 
         validate_private_basename(name)?;
@@ -969,29 +1052,116 @@ impl XaiOAuthCredentialStore {
             Err(error) => return Err(error).context("opening xAI OAuth file for exact deletion"),
         };
         validate_owned_file_handle(&file, &path)?;
-        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
-        // SAFETY: the disposition buffer has the documented structure and the
-        // handle remains owned until after the call. Windows marks this exact
-        // file object delete-pending rather than resolving the path again.
-        if unsafe {
-            SetFileInformationByHandle(
-                file.as_raw_handle(),
-                FileDispositionInfo,
-                (&raw const disposition).cast(),
-                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
-            )
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error())
-                .context("marking exact xAI OAuth file handle for deletion");
-        }
+        mark_windows_file_handle_for_deletion(&file)?;
         drop(file);
         Ok(true)
     }
 }
 
 #[cfg(windows)]
+fn reopen_windows_file_for_owner_security(file: &File, path: &Path) -> Result<File> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile, WRITE_DAC, WRITE_OWNER,
+    };
+
+    // ReOpenFile derives a new handle from the already-created temporary file,
+    // so no pathname can be substituted between creation and hardening.
+    let handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle(),
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC | WRITE_OWNER | DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error())
+            .context("reopening a new xAI OAuth temporary file for owner-only security");
+    }
+    // SAFETY: ReOpenFile returned a newly owned handle on the success path.
+    let reopened = unsafe { File::from_raw_handle(handle) };
+    validate_windows_file_shape(&reopened, path)?;
+    Ok(reopened)
+}
+
+#[cfg(windows)]
+fn mark_windows_file_handle_for_deletion(file: &File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: the disposition buffer has the documented structure and the
+    // handle remains owned until after the call. Windows marks this exact file
+    // object delete-pending rather than resolving the path again.
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("marking exact xAI OAuth file handle for deletion");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn cleanup_windows_secret_after_error(
+    file: &File,
+    error: anyhow::Error,
+    label: &str,
+) -> anyhow::Error {
+    match mark_windows_file_handle_for_deletion(file) {
+        Ok(()) => error,
+        Err(cleanup) => error.context(format!(
+            "also failed to delete the xAI OAuth {label} by exact handle: {cleanup:#}"
+        )),
+    }
+}
+
+#[cfg(all(windows, test))]
+static WINDOWS_POST_PERSIST_VALIDATION_FAILURE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+#[cfg(windows)]
+fn validate_persisted_windows_owned_file(file: &File, path: &Path) -> Result<fs::Metadata> {
+    #[cfg(test)]
+    {
+        let mut injected = WINDOWS_POST_PERSIST_VALIDATION_FAILURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if injected.as_deref() == Some(path) {
+            *injected = None;
+            bail!("injected post-persistence xAI OAuth validation failure");
+        }
+    }
+    validate_owned_file_handle(file, path)
+}
+
+#[cfg(all(windows, test))]
+fn fail_next_windows_post_persist_validation(path: &Path) {
+    *WINDOWS_POST_PERSIST_VALIDATION_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.to_path_buf());
+}
+
+#[cfg(windows)]
 fn validate_owned_file_handle(file: &File, path: &Path) -> Result<fs::Metadata> {
+    let metadata = validate_windows_file_shape(file, path)?;
+    verify_windows_owner_only_handle(file)
+        .context("Codewhale-owned xAI OAuth file is not current-user-only")?;
+    Ok(metadata)
+}
+
+#[cfg(windows)]
+fn validate_windows_file_shape(file: &File, path: &Path) -> Result<fs::Metadata> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
@@ -1008,8 +1178,6 @@ fn validate_owned_file_handle(file: &File, path: &Path) -> Result<fs::Metadata> 
         information.nNumberOfLinks == 1,
         "xAI OAuth file must not have multiple filesystem links"
     );
-    verify_windows_owner_only_handle(file)
-        .context("Codewhale-owned xAI OAuth file is not current-user-only")?;
     Ok(metadata)
 }
 
@@ -1100,8 +1268,8 @@ fn secure_windows_owner_only_handle(file: &File, inherit_to_children: bool) -> R
         TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, NO_INHERITANCE, PROTECTED_DACL_SECURITY_INFORMATION,
-        SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+        DACL_SECURITY_INFORMATION, NO_INHERITANCE, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
     };
     use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
@@ -1132,13 +1300,16 @@ fn secure_windows_owner_only_handle(file: &File, inherit_to_children: bool) -> R
     }
     let _acl = WindowsLocalAllocation(acl.cast());
     // SAFETY: the file handle remains owned by `file`, and the ACL remains
-    // allocated for the duration of the call. Owner/group/SACL are unchanged.
+    // allocated for the duration of the call. The owner and protected DACL are
+    // committed together so the verifier never observes a half-secured file.
     let result = unsafe {
         SetSecurityInfo(
             file.as_raw_handle(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            user.sid(),
             std::ptr::null_mut(),
             acl,
             std::ptr::null(),
@@ -1524,6 +1695,82 @@ mod tests {
             0xd800,
         ]));
         assert!(normalize_windows_path_for_comparison(&invalid).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_post_persist_failure_exact_deletes_new_and_replacement_generations() {
+        fn assert_directory_empty(path: &Path) {
+            let entries = fs::read_dir(path)
+                .expect("read credentials directory")
+                .collect::<std::io::Result<Vec<_>>>()
+                .expect("read credential entries");
+            assert!(
+                entries.is_empty(),
+                "rejected credential bytes must leave no durable file: {entries:?}"
+            );
+        }
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let root = root.path().canonicalize().expect("canonical temp root");
+        let credentials = root.join("new-credentials");
+        let store = open_owned_credentials_directory(&credentials).expect("open secure store");
+        let generation = "xai-auth-0123456789abcdef0123456789abcdef.json";
+        let generation_path = credentials.join(generation);
+        fail_next_windows_post_persist_validation(&generation_path);
+        let error = store
+            .write(generation, b"new credential bytes", false)
+            .expect_err("post-persist validation must fail");
+        assert!(error.to_string().contains("injected post-persistence"));
+        assert_directory_empty(&credentials);
+
+        let replacement_credentials = root.join("replacement-credentials");
+        let replacement_store = open_owned_credentials_directory(&replacement_credentials)
+            .expect("open replacement store");
+        let replacement_path = replacement_credentials.join(generation);
+        replacement_store
+            .write(generation, b"prior credential bytes", false)
+            .expect("seed prior generation");
+        fail_next_windows_post_persist_validation(&replacement_path);
+        let error = replacement_store
+            .write(generation, b"replacement credential bytes", true)
+            .expect_err("replacement validation must fail");
+        assert!(error.to_string().contains("injected post-persistence"));
+        assert!(
+            !replacement_path.exists(),
+            "a rejected replacement deliberately fails closed instead of restoring by path"
+        );
+        assert_directory_empty(&replacement_credentials);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_store_secures_every_new_owned_object_for_the_current_user() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let root = root.path().canonicalize().expect("canonical temp root");
+        let credentials = root.join("credentials");
+        let store = open_owned_credentials_directory(&credentials).expect("open secure store");
+
+        let directory = store
+            ._component_handles
+            .last()
+            .expect("final credentials directory handle");
+        verify_windows_owner_only_handle(directory).expect("current-user-only directory");
+
+        let lock = store.open_lock_file().expect("create lifecycle lock");
+        validate_owned_file_handle(&lock, &credentials.join(XAI_OAUTH_LIFECYCLE_LOCK_FILE_NAME))
+            .expect("current-user-only lifecycle lock");
+
+        let generation = "xai-auth-0123456789abcdef0123456789abcdef.json";
+        store
+            .write(generation, b"credential bytes", false)
+            .expect("write secure generation");
+        let generation_file = store
+            .open_owned_file_for_read(generation)
+            .expect("open generation")
+            .expect("generation exists");
+        validate_owned_file_handle(&generation_file, &credentials.join(generation))
+            .expect("current-user-only generation");
     }
 
     #[cfg(windows)]

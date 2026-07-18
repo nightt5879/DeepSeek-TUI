@@ -367,8 +367,8 @@ pub(crate) fn secure_codewhale_owned_windows_path(
         TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, NO_INHERITANCE, PROTECTED_DACL_SECURITY_INFORMATION,
-        SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+        DACL_SECURITY_INFORMATION, NO_INHERITANCE, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
     };
     use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
@@ -399,13 +399,16 @@ pub(crate) fn secure_codewhale_owned_windows_path(
     let _acl = WindowsLocalAllocation(acl.cast());
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
     // SAFETY: `wide` is NUL terminated and `acl` remains allocated for the
-    // duration of this call. Owner/group/SACL are intentionally unchanged.
+    // duration of this call. Owner and DACL are applied together to match the
+    // production current-user-only verifier.
     let result = unsafe {
         SetNamedSecurityInfoW(
             wide.as_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            user.sid(),
             std::ptr::null_mut(),
             acl,
             std::ptr::null(),
