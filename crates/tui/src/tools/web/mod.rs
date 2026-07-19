@@ -3,5 +3,7 @@
 //! `fetch_url`, `web_search`, and `web.run` are thin surfaces over this
 //! module so security and parsing behavior cannot drift between tools.
 
+pub(crate) mod backend;
+pub(crate) mod contract;
 pub(crate) mod guard;
 pub mod scrape;

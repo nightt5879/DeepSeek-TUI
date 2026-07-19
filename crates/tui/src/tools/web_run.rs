@@ -21,10 +21,10 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{RwLock, RwLockWriteGuard};
 
-use super::web::scrape::{
-    ScrapedSearchResult, is_duckduckgo_challenge, parse_bing_results as scrape_bing_results,
-    parse_duckduckgo_results as scrape_duckduckgo_results,
+use super::web::contract::{
+    Recency, SearchQuery, SearchReceipt, SearchResult as NormalizedSearchResult,
 };
+use super::web_search::{domain_matches, execute_search};
 
 const MAX_RESULTS: usize = 10;
 const DEFAULT_TIMEOUT_MS: u64 = 15_000;
@@ -240,21 +240,15 @@ impl ResponseLength {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct SearchEntry {
-    title: String,
-    url: String,
-    snippet: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct SearchResult {
+struct WebRunSearchResult {
     ref_id: String,
     query: String,
     source: String,
     count: usize,
-    results: Vec<SearchEntry>,
+    results: Vec<NormalizedSearchResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<String>,
+    receipt: SearchReceipt,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -324,7 +318,7 @@ struct ImageQueryResult {
 #[derive(Debug, Clone, Serialize, Default)]
 struct WebRunOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
-    search_query: Option<Vec<SearchResult>>,
+    search_query: Option<Vec<WebRunSearchResult>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     image_query: Option<Vec<ImageQueryResult>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -361,7 +355,7 @@ impl ToolSpec for WebRunTool {
                         "type": "object",
                         "properties": {
                             "q": { "type": "string" },
-                            "recency": { "type": "integer" },
+                            "recency": { "type": "integer", "minimum": 1, "maximum": 3650 },
                             "max_results": { "type": "integer" },
                             "timeout_ms": { "type": "integer" },
                             "domains": { "type": "array", "items": { "type": "string" } }
@@ -481,34 +475,40 @@ impl ToolSpec for WebRunTool {
                     })
                     .unwrap_or_default();
 
-                let (entries, source, warning) =
-                    run_search(&query, max_results, timeout_ms, &domains).await?;
-                let mut warnings = Vec::new();
-                if recency > 0 {
-                    warnings.push(format!(
-                        "Recency filter not enforced (requested last {recency} days)"
-                    ));
-                }
-                if let Some(w) = warning {
-                    warnings.push(w);
-                }
+                let requested_recency = if recency == 0 {
+                    None
+                } else {
+                    let days = u16::try_from(recency)
+                        .ok()
+                        .filter(|days| *days <= 3650)
+                        .ok_or_else(|| {
+                            ToolError::invalid_input(
+                                "Field 'search_query[].recency' must be between 1 and 3650 days",
+                            )
+                        })?;
+                    Some(Recency::Days(days))
+                };
+                let response = execute_search(
+                    SearchQuery::new(query, max_results, requested_recency, domains, None),
+                    timeout_ms,
+                    context,
+                )
+                .await?;
+                let warning = response.receipt.warning();
                 search_counter += 1;
                 let ref_id = format!("{scope}turn{turn}search{search_counter}");
 
-                let page = page_from_search(&query, &entries);
+                let page = page_from_search(&response.query, &response.results);
                 store_page(&context.state_namespace, &ref_id, page);
 
-                results.push(SearchResult {
+                results.push(WebRunSearchResult {
                     ref_id,
-                    query,
-                    source,
-                    count: entries.len(),
-                    results: entries,
-                    warning: if warnings.is_empty() {
-                        None
-                    } else {
-                        Some(warnings.join("; "))
-                    },
+                    query: response.query,
+                    source: response.source,
+                    count: response.count,
+                    results: response.results,
+                    warning,
+                    receipt: response.receipt,
                 });
             }
             if !results.is_empty() {
@@ -777,142 +777,6 @@ fn looks_like_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
 }
 
-async fn run_search(
-    query: &str,
-    max_results: usize,
-    timeout_ms: u64,
-    domains: &[String],
-) -> Result<(Vec<SearchEntry>, String, Option<String>), ToolError> {
-    let client = crate::tls::reqwest_client_builder()
-        .timeout(Duration::from_millis(timeout_ms))
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| ToolError::execution_failed(format!("Failed to build HTTP client: {e}")))?;
-
-    let encoded = url_encode(query);
-    let url = format!("https://html.duckduckgo.com/html/?q={encoded}");
-    let resp = client
-        .get(&url)
-        .header(
-            "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        )
-        .header("Accept-Language", "en-US,en;q=0.5")
-        .send()
-        .await
-        .map_err(|e| ToolError::execution_failed(format!("Web search request failed: {e}")))?;
-
-    let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| ToolError::execution_failed(format!("Failed to read response: {e}")))?;
-
-    if !status.is_success() {
-        return Err(ToolError::execution_failed(format!(
-            "Web search failed: HTTP {}",
-            status.as_u16()
-        )));
-    }
-
-    let mut results = parse_duckduckgo_results(&body, max_results);
-    let mut source = "duckduckgo".to_string();
-    let mut warnings = Vec::new();
-
-    if results.is_empty() {
-        let duckduckgo_blocked = is_duckduckgo_challenge(&body);
-        match run_bing_search(&client, query, max_results).await {
-            Ok(fallback_results) if !fallback_results.is_empty() => {
-                results = fallback_results;
-                source = "bing".to_string();
-                warnings.push(if duckduckgo_blocked {
-                    "DuckDuckGo returned a bot challenge; used Bing fallback".to_string()
-                } else {
-                    "DuckDuckGo returned no parseable results; used Bing fallback".to_string()
-                });
-            }
-            Ok(_) if duckduckgo_blocked => {
-                return Err(ToolError::execution_failed(
-                    "DuckDuckGo returned a bot challenge and Bing fallback returned no results",
-                ));
-            }
-            Err(err) if duckduckgo_blocked => {
-                return Err(ToolError::execution_failed(format!(
-                    "DuckDuckGo returned a bot challenge and Bing fallback failed: {err}"
-                )));
-            }
-            Ok(_) | Err(_) => {}
-        }
-    }
-
-    if !domains.is_empty() {
-        let before = results.len();
-        results.retain(|entry| domain_matches(&entry.url, domains));
-        if before != results.len() {
-            warnings.push("Filtered search results by domain list".to_string());
-        }
-    }
-
-    Ok((
-        results,
-        source,
-        if warnings.is_empty() {
-            None
-        } else {
-            Some(warnings.join("; "))
-        },
-    ))
-}
-
-async fn run_bing_search(
-    client: &reqwest::Client,
-    query: &str,
-    max_results: usize,
-) -> Result<Vec<SearchEntry>, ToolError> {
-    let encoded = url_encode(query);
-    let url = format!("https://www.bing.com/search?q={encoded}");
-    let resp = client
-        .get(&url)
-        .header(
-            "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        )
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .send()
-        .await
-        .map_err(|e| ToolError::execution_failed(format!("Bing fallback request failed: {e}")))?;
-
-    let status = resp.status();
-    let body = resp.text().await.map_err(|e| {
-        ToolError::execution_failed(format!("Failed to read Bing fallback response: {e}"))
-    })?;
-
-    if !status.is_success() {
-        return Err(ToolError::execution_failed(format!(
-            "Bing fallback failed: HTTP {}",
-            status.as_u16()
-        )));
-    }
-
-    Ok(parse_bing_results(&body, max_results))
-}
-
-fn domain_matches(url: &str, domains: &[String]) -> bool {
-    if domains.is_empty() {
-        return true;
-    }
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    domains.iter().any(|domain| {
-        let domain = domain.trim_start_matches("www.");
-        host == domain || host.ends_with(&format!(".{domain}"))
-    })
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct DuckDuckGoImageResponse {
     #[serde(default)]
@@ -1079,7 +943,7 @@ async fn run_image_search(
     Ok((results, warning))
 }
 
-fn page_from_search(query: &str, results: &[SearchEntry]) -> WebPage {
+fn page_from_search(query: &str, results: &[NormalizedSearchResult]) -> WebPage {
     let mut lines = Vec::new();
     let mut links = Vec::new();
 
@@ -1573,28 +1437,6 @@ fn decode_html_entities(text: &str) -> String {
         .replace("&nbsp;", " ")
 }
 
-fn parse_duckduckgo_results(html: &str, max_results: usize) -> Vec<SearchEntry> {
-    scrape_duckduckgo_results(html, max_results)
-        .into_iter()
-        .map(search_entry_from_scraped)
-        .collect()
-}
-
-fn parse_bing_results(html: &str, max_results: usize) -> Vec<SearchEntry> {
-    scrape_bing_results(html, max_results)
-        .into_iter()
-        .map(search_entry_from_scraped)
-        .collect()
-}
-
-fn search_entry_from_scraped(entry: ScrapedSearchResult) -> SearchEntry {
-    SearchEntry {
-        title: entry.title,
-        url: entry.url,
-        snippet: entry.snippet,
-    }
-}
-
 fn url_encode(input: &str) -> String {
     crate::utils::url_encode(input)
 }
@@ -1604,6 +1446,7 @@ fn url_encode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::web::scrape::{parse_bing_results, parse_duckduckgo_results};
     use std::path::PathBuf;
     use tokio::sync::{Mutex, MutexGuard};
 
@@ -1674,6 +1517,64 @@ mod tests {
         assert_eq!(
             extract_duckduckgo_vqd(html_plain),
             Some("3-xyz_123".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn text_search_uses_configured_shared_backend_and_exposes_receipt() {
+        use crate::config::SearchProvider;
+        use crate::tools::spec::ToolSpec;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .and(query_param("q", "shared seam"))
+            .and(query_param("format", "json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "title": "Shared result",
+                    "url": "https://docs.example.com/shared",
+                    "content": "one adapter path"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut context = ToolContext::new(tmp.path().to_path_buf());
+        context.search_provider = SearchProvider::Searxng;
+        context.search_base_url = Some(server.uri());
+        context.state_namespace = "shared-backend-test".to_string();
+
+        let result = WebRunTool
+            .execute(
+                json!({
+                    "search_query": [{
+                        "q": "shared seam",
+                        "recency": 7,
+                        "domains": ["example.com"]
+                    }]
+                }),
+                &context,
+            )
+            .await
+            .expect("web.run should use configured SearXNG backend");
+        let value: Value = serde_json::from_str(&result.content).expect("web.run json");
+        let search = &value["search_query"][0];
+
+        assert_eq!(search["source"], "searxng");
+        assert_eq!(search["count"], 1);
+        assert_eq!(search["results"][0]["rank"], 1);
+        assert_eq!(search["results"][0]["domain"], "docs.example.com");
+        assert_eq!(search["receipt"]["backend"], "searxng");
+        assert_eq!(search["receipt"]["honored"]["domains"], true);
+        assert!(
+            search["warning"]
+                .as_str()
+                .expect("visible degraded warning")
+                .contains("recency")
         );
     }
 
