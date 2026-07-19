@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
+use crate::localization::{Locale, MessageId, tr};
 use crate::settings::Settings;
 use crate::tui::app::{App, AppMode, StatusToastLevel};
 
@@ -34,15 +35,24 @@ impl BehavioralTip {
         }
     }
 
-    const fn message(self) -> &'static str {
+    const fn message_id(self) -> MessageId {
         match self {
-            Self::PlanningMode => "Planning? Tab cycles to Plan mode",
-            Self::BackgroundJobReceipt => {
-                "Receipts live in the Work panel — Enter opens the inspector"
-            }
-            Self::ClearedInputRestore => "Cleared · Ctrl+Z restores",
-            Self::McpValidation => "codewhale mcp validate starts servers and shows why",
-            Self::RepeatedCommandHotbar => "/hotbar can pin this",
+            Self::PlanningMode => MessageId::BehavioralTipPlanning,
+            Self::BackgroundJobReceipt => MessageId::BehavioralTipBackgroundReceipt,
+            Self::ClearedInputRestore => MessageId::BehavioralTipClearedInput,
+            Self::McpValidation => MessageId::BehavioralTipMcpValidation,
+            Self::RepeatedCommandHotbar => MessageId::BehavioralTipRepeatedCommand,
+        }
+    }
+
+    fn message(self, locale: Locale) -> String {
+        let template = tr(locale, self.message_id());
+        match self {
+            Self::PlanningMode => template.replace("{key}", "Tab"),
+            Self::BackgroundJobReceipt => template.replace("{key}", "Enter"),
+            Self::ClearedInputRestore => template.replace("{chord}", "Ctrl+Z"),
+            Self::McpValidation => template.replace("{command}", "codewhale mcp validate"),
+            Self::RepeatedCommandHotbar => template.replace("{command}", "/hotbar"),
         }
     }
 }
@@ -110,7 +120,11 @@ impl App {
         {
             tracing::warn!(tip = tip.key(), error = %err, "behavioral tip impression was not persisted");
         }
-        self.push_status_toast(tip.message(), StatusToastLevel::Info, Some(8_000));
+        self.push_status_toast(
+            tip.message(self.ui_locale),
+            StatusToastLevel::Info,
+            Some(8_000),
+        );
         true
     }
 
@@ -194,5 +208,43 @@ mod tests {
         assert!(!state.note_manual_command("/model one"));
         assert!(!state.note_manual_command("/hotbar"));
         assert!(!state.note_manual_command("ordinary prompt"));
+    }
+
+    #[test]
+    fn every_complete_locale_renders_tips_with_code_owned_controls() {
+        let tips = [
+            BehavioralTip::PlanningMode,
+            BehavioralTip::BackgroundJobReceipt,
+            BehavioralTip::ClearedInputRestore,
+            BehavioralTip::McpValidation,
+            BehavioralTip::RepeatedCommandHotbar,
+        ];
+        for locale in Locale::shipped_complete() {
+            for tip in tips {
+                let message = tip.message(*locale);
+                assert!(!message.contains('{'), "unexpanded placeholder: {message}");
+            }
+        }
+
+        assert_eq!(
+            BehavioralTip::PlanningMode.message(Locale::En),
+            "Planning? Tab cycles to Plan mode"
+        );
+        assert_eq!(
+            BehavioralTip::BackgroundJobReceipt.message(Locale::En),
+            "Receipts live in the Work panel — Enter opens the inspector"
+        );
+        assert_eq!(
+            BehavioralTip::ClearedInputRestore.message(Locale::En),
+            "Cleared · Ctrl+Z restores"
+        );
+        assert_eq!(
+            BehavioralTip::McpValidation.message(Locale::En),
+            "codewhale mcp validate starts servers and shows why"
+        );
+        assert_eq!(
+            BehavioralTip::RepeatedCommandHotbar.message(Locale::En),
+            "/hotbar can pin this"
+        );
     }
 }
