@@ -501,12 +501,7 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> Result<String, String>
         }
     };
     let headers = String::from_utf8_lossy(&bytes[..header_end]);
-    let content_length = headers
-        .lines()
-        .find_map(|line| line.split_once(':'))
-        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-        .unwrap_or(0);
+    let content_length = http_content_length(&headers);
     while bytes.len() < header_end + content_length {
         let read = stream.read(&mut chunk).map_err(|error| error.to_string())?;
         if read == 0 {
@@ -515,6 +510,25 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> Result<String, String>
         bytes.extend_from_slice(&chunk[..read]);
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn http_content_length(headers: &str) -> usize {
+    headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+#[test]
+fn local_probe_server_finds_content_length_after_other_headers() {
+    let headers = "POST /v1/chat/completions HTTP/1.1\r\n\
+        authorization: Bearer redacted\r\n\
+        content-type: application/json\r\n\
+        Content-Length: 37\r\n\r\n";
+
+    assert_eq!(http_content_length(headers), 37);
 }
 
 /// A rustup shim may initialize its own toolchain state below `$HOME` when
