@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const MAX_SEARCH_RESULTS: usize = 10;
+pub(crate) const MAX_SEARCH_RESULTS: u8 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -98,7 +98,8 @@ impl SearchQuery {
         domains.dedup();
         Self {
             query,
-            max_results: u8::try_from(max_results.clamp(1, MAX_SEARCH_RESULTS)).unwrap_or(u8::MAX),
+            max_results: u8::try_from(max_results.clamp(1, usize::from(MAX_SEARCH_RESULTS)))
+                .unwrap_or(MAX_SEARCH_RESULTS),
             recency,
             domains,
             locale: locale

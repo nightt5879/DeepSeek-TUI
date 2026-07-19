@@ -35,6 +35,7 @@ use super::web::scrape::{
 
 const DUCKDUCKGO_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
 const BING_HOST: &str = "www.bing.com";
+const BING_ENDPOINT: &str = "https://www.bing.com/search";
 const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
 const BOCHA_ENDPOINT: &str = "https://api.bochaai.com/v1/web-search";
 const METASO_ENDPOINT: &str = "https://metaso.cn/api/v1";
@@ -729,11 +730,21 @@ pub(crate) async fn execute_search(
     };
     let timeout = Duration::from_millis(effective_timeout_ms);
     let deadline = started + timeout;
-    let mut raw = tokio::time::timeout(timeout, backend.search(&query, deadline))
+    let raw = tokio::time::timeout(timeout, backend.search(&query, deadline))
         .await
         .map_err(|_| ToolError::Timeout {
             seconds: effective_timeout_ms.div_ceil(1_000),
         })??;
+
+    Ok(finalize_search_response(query, capabilities, raw, started))
+}
+
+fn finalize_search_response(
+    query: SearchQuery,
+    capabilities: super::web::contract::QueryCapabilities,
+    mut raw: BackendSearch,
+    started: Instant,
+) -> SearchResponse {
     let mut honored = HonoredQueryCapabilities {
         max_results: true,
         ..HonoredQueryCapabilities::default()
@@ -780,14 +791,14 @@ pub(crate) async fn execute_search(
         (_, None) => format!("Found {count} result(s)"),
     };
 
-    Ok(SearchResponse {
+    SearchResponse {
         query: query.query,
         source: raw.source,
         count,
         message,
         results: raw.results,
         receipt,
-    })
+    }
 }
 
 pub(crate) async fn run_backend_search(
@@ -885,11 +896,43 @@ pub(crate) async fn run_backend_search(
     }
 }
 
+#[derive(Clone, Copy)]
+struct ScrapeEndpoints<'a> {
+    bing: &'a str,
+    allow_bing_fallback: Option<bool>,
+}
+
+impl Default for ScrapeEndpoints<'static> {
+    fn default() -> Self {
+        Self {
+            bing: BING_ENDPOINT,
+            allow_bing_fallback: None,
+        }
+    }
+}
+
 async fn run_scrape_search(
     provider: SearchProvider,
     query: &SearchQuery,
     timeout_ms: u64,
     context: &ToolContext,
+) -> Result<BackendSearch, ToolError> {
+    run_scrape_search_with_endpoints(
+        provider,
+        query,
+        timeout_ms,
+        context,
+        ScrapeEndpoints::default(),
+    )
+    .await
+}
+
+async fn run_scrape_search_with_endpoints(
+    provider: SearchProvider,
+    query: &SearchQuery,
+    timeout_ms: u64,
+    context: &ToolContext,
+    endpoints: ScrapeEndpoints<'_>,
 ) -> Result<BackendSearch, ToolError> {
     let decider = context.network_policy.as_ref();
     let client = crate::tls::reqwest_client_builder()
@@ -904,7 +947,7 @@ async fn run_scrape_search(
 
     if provider == SearchProvider::Bing {
         check_policy(decider, BING_HOST)?;
-        let results = run_bing_search(&client, &query.query, max_results).await?;
+        let results = run_bing_search(&client, &query.query, max_results, endpoints.bing).await?;
         if !results.is_empty() {
             return Ok(BackendSearch {
                 backend: BackendId::Bing,
@@ -923,7 +966,9 @@ async fn run_scrape_search(
 
     let (url, duckduckgo_host) =
         duckduckgo_search_url(context.search_base_url.as_deref(), &query.query)?;
-    let allow_bing_fallback = duckduckgo_allows_bing_fallback(context.search_base_url.as_deref());
+    let allow_bing_fallback = endpoints
+        .allow_bing_fallback
+        .unwrap_or_else(|| duckduckgo_allows_bing_fallback(context.search_base_url.as_deref()));
     check_policy(decider, &duckduckgo_host)?;
     let resp = client
         .get(&url)
@@ -988,7 +1033,7 @@ async fn run_scrape_search(
     }
 
     check_policy(decider, BING_HOST)?;
-    match run_bing_search(&client, &query.query, max_results).await {
+    match run_bing_search(&client, &query.query, max_results, endpoints.bing).await {
         Ok(results) if !results.is_empty() => {
             degraded.push(DegradedReason::ScrapeFallback {
                 from: BackendId::DuckDuckGo,
@@ -1478,7 +1523,7 @@ fn search_query_from_input(input: &Value) -> Result<SearchQuery, ToolError> {
     }
     let max_results = usize::try_from(optional_search_max_results(input))
         .unwrap_or(DEFAULT_MAX_RESULTS)
-        .clamp(1, MAX_SEARCH_RESULTS);
+        .clamp(1, usize::from(MAX_SEARCH_RESULTS));
     let recency = search_option(input, "recency")
         .map(parse_recency)
         .transpose()?;
@@ -1552,11 +1597,13 @@ async fn run_bing_search(
     client: &reqwest::Client,
     query: &str,
     max_results: usize,
+    endpoint: &str,
 ) -> Result<Vec<WebSearchEntry>, ToolError> {
-    let encoded = url_encode(query);
-    let url = format!("https://www.bing.com/search?q={encoded}");
+    let mut url = reqwest::Url::parse(endpoint)
+        .map_err(|error| ToolError::invalid_input(format!("Invalid Bing endpoint: {error}")))?;
+    url.query_pairs_mut().append_pair("q", query);
     let resp = client
-        .get(&url)
+        .get(url)
         .header(
             "Accept",
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -1655,19 +1702,17 @@ fn duckduckgo_allows_bing_fallback(base_url: Option<&str>) -> bool {
     configured_search_base_url(base_url).is_none()
 }
 
-fn url_encode(input: &str) -> String {
-    crate::utils::url_encode(input)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        ERROR_BODY_PREVIEW_BYTES, WebSearchTool, baidu_search_payload, bocha_error_message,
-        duckduckgo_search_url, extract_search_query, optional_search_max_results,
-        parse_baidu_results, parse_bocha_results, parse_metaso_results, parse_searxng_results,
-        parse_sofya_results, parse_tavily_results, parse_volcengine_results, sanitize_error_body,
+        ERROR_BODY_PREVIEW_BYTES, ScrapeEndpoints, WebSearchTool, baidu_search_payload,
+        bocha_error_message, duckduckgo_search_url, extract_search_query, finalize_search_response,
+        optional_search_max_results, parse_baidu_results, parse_bocha_results,
+        parse_metaso_results, parse_searxng_results, parse_sofya_results, parse_tavily_results,
+        parse_volcengine_results, run_scrape_search_with_endpoints, sanitize_error_body,
         searxng_search_url, truncate_error_body, volcengine_extract_text,
     };
+    use crate::tools::web::contract::{QueryCapabilities, SearchQuery};
     use crate::tools::web::scrape::{decode_html_entities, normalize_bing_url};
     use serde_json::json;
 
@@ -2760,6 +2805,79 @@ mod tests {
                 && msg.contains("bot challenge")
                 && msg.contains("private search service"),
             "got `{msg}`"
+        );
+    }
+
+    #[tokio::test]
+    async fn duckduckgo_challenge_to_bing_success_populates_fallback_receipt() {
+        use crate::config::SearchProvider;
+        use crate::tools::spec::ToolContext;
+        use std::time::Instant;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .and(query_param("q", "fallback receipt"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<html><body><div class="anomaly-modal">Unfortunately, bots use DuckDuckGo too</div></body></html>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/bing"))
+            .and(query_param("q", "fallback receipt"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"
+                <ol><li class="b_algo">
+                  <h2><a href="https://example.com/fallback">Fallback result</a></h2>
+                  <div class="b_caption"><p>Bing result after challenge.</p></div>
+                </li></ol>
+                "#,
+            ))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut context = ToolContext::new(tmp.path().to_path_buf());
+        context.search_provider = SearchProvider::DuckDuckGo;
+        context.search_base_url = Some(format!("{}/html/", server.uri()));
+        let query = SearchQuery::new("fallback receipt".to_string(), 5, None, Vec::new(), None);
+        let started = Instant::now();
+        let raw = run_scrape_search_with_endpoints(
+            SearchProvider::DuckDuckGo,
+            &query,
+            5_000,
+            &context,
+            ScrapeEndpoints {
+                bing: &format!("{}/bing", server.uri()),
+                allow_bing_fallback: Some(true),
+            },
+        )
+        .await
+        .expect("Bing fallback should succeed");
+        let response =
+            finalize_search_response(query, QueryCapabilities::count_only(), raw, started);
+        let value = serde_json::to_value(&response).expect("response serializes");
+
+        assert_eq!(value["source"], "bing");
+        assert_eq!(value["count"], 1);
+        assert_eq!(value["receipt"]["backend"], "bing");
+        assert_eq!(
+            value["receipt"]["degraded"][0],
+            json!({"kind": "challenge_detected", "backend": "duckduckgo"})
+        );
+        assert_eq!(
+            value["receipt"]["degraded"][1],
+            json!({"kind": "scrape_fallback", "from": "duckduckgo", "to": "bing"})
+        );
+        assert!(
+            response
+                .receipt
+                .warning()
+                .expect("warning")
+                .contains("used bing fallback")
         );
     }
 

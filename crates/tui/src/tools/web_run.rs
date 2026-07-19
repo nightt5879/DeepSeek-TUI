@@ -461,7 +461,7 @@ impl ToolSpec for WebRunTool {
                     response_length.max_results() as u64,
                 ))
                 .unwrap_or(response_length.max_results())
-                .clamp(1, MAX_SEARCH_RESULTS);
+                .clamp(1, usize::from(MAX_SEARCH_RESULTS));
                 let timeout_ms = optional_u64(search, "timeout_ms", DEFAULT_TIMEOUT_MS).min(60_000);
 
                 let domains = search
@@ -529,7 +529,7 @@ impl ToolSpec for WebRunTool {
                     response_length.max_results() as u64,
                 ))
                 .unwrap_or(response_length.max_results())
-                .clamp(1, MAX_SEARCH_RESULTS);
+                .clamp(1, usize::from(MAX_SEARCH_RESULTS));
                 let timeout_ms = optional_u64(image, "timeout_ms", DEFAULT_TIMEOUT_MS).min(60_000);
 
                 let domains = image
