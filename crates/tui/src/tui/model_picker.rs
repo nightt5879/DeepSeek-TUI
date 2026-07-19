@@ -29,7 +29,8 @@ use crate::codex_model_cache::{
 use crate::config::{ApiProvider, Config, DEEPSEEK_ALIAS_REPLACEMENT};
 use crate::localization::{Locale, MessageId, tr};
 use crate::model_profile::{
-    CapabilityOverride, SupportState, resolved_capability_profile_with_overrides,
+    CapabilityOverride, SupportState, resolved_capability_profile_for_route_with_overrides,
+    resolved_capability_profile_with_overrides,
 };
 use crate::model_registry;
 use crate::models_dev_live::{self, ModelsDevFreshness};
@@ -1353,12 +1354,21 @@ fn effective_picker_metadata_with_codex(
     };
 
     let context_override = config.context_window_for_provider_config(provider);
-    let profile = resolved_capability_profile_with_overrides(
-        provider,
-        id,
-        CapabilityOverride {
-            context_window: context_override,
-            ..CapabilityOverride::default()
+    let overrides = CapabilityOverride {
+        context_window: context_override,
+        ..CapabilityOverride::default()
+    };
+    let profile = offering.as_ref().map_or_else(
+        || resolved_capability_profile_with_overrides(provider, id, overrides.clone()),
+        |offering| {
+            let route_offering = offering.to_offering();
+            resolved_capability_profile_for_route_with_overrides(
+                provider,
+                id,
+                route_offering.capabilities,
+                route_offering.limits,
+                overrides.clone(),
+            )
         },
     );
     let card_context = card

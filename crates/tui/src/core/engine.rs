@@ -640,6 +640,7 @@ pub struct Engine {
     /// custom route across snapshots and config reloads.
     api_provider_id: Option<String>,
     active_route_limits: Option<codewhale_config::route::RouteLimits>,
+    active_route_capabilities: codewhale_config::route::RouteCapabilities,
     rx_op: mpsc::Receiver<Op>,
     /// Clone of the op-channel sender, so the engine can self-dispatch ops
     /// (e.g. a goal-continuation `SendMessage` after a turn completes).
@@ -902,6 +903,7 @@ impl Engine {
         let provider_id = route.identity.exact_id;
         let model = route.model;
         let limits = crate::route_budget::known_route_limits(route.candidate.limits());
+        let capabilities = route.candidate.capabilities();
         let api_config = *route.config;
         let client = route.client;
 
@@ -910,6 +912,7 @@ impl Engine {
         self.api_provider_id = provider_id;
         self.api_config = api_config;
         self.active_route_limits = limits;
+        self.active_route_capabilities = capabilities;
         self.api_key_env_only_recovery = Self::env_only_api_key_recovery_hint(&self.api_config);
         self.deepseek_client = Some(client.clone());
         if !self.model_client_injected {
@@ -945,6 +948,7 @@ impl Engine {
         let provider_id = route.identity.exact_id;
         let model = route.model;
         let limits = crate::route_budget::known_route_limits(route.candidate.limits());
+        let capabilities = route.candidate.capabilities();
         let api_config = *route.config;
         let concrete_client = preflighted_client
             .map(Ok)
@@ -955,6 +959,7 @@ impl Engine {
         self.api_provider_id = provider_id;
         self.api_config = api_config;
         self.active_route_limits = limits;
+        self.active_route_capabilities = capabilities;
         self.api_key_env_only_recovery = Self::env_only_api_key_recovery_hint(&self.api_config);
         match concrete_client {
             Ok(client) => {
@@ -1196,6 +1201,7 @@ impl Engine {
             api_provider_identity,
             api_provider_id,
             active_route_limits,
+            active_route_capabilities: codewhale_config::route::RouteCapabilities::default(),
             rx_op,
             tx_op: tx_op.clone(),
             rx_approval,
@@ -1863,6 +1869,11 @@ impl Engine {
                         self.session.model = model;
                         self.config.model.clone_from(&self.session.model);
                         self.active_route_limits = route_limits;
+                        // This lightweight operation carries no executable
+                        // route candidate, so old provider/model capability
+                        // facts must not bleed into the new model.
+                        self.active_route_capabilities =
+                            codewhale_config::route::RouteCapabilities::default();
                         self.refresh_system_prompt();
                         self.emit_session_updated().await;
                         let _ = self
@@ -2984,9 +2995,11 @@ impl Engine {
             Vec::new()
         };
         let tools = tool_registry.as_ref().map(|registry| {
-            let capability = crate::model_profile::resolved_capability_profile(
+            let capability = crate::model_profile::resolved_capability_profile_for_route(
                 self.api_config.api_provider(),
                 &self.config.model,
+                self.active_route_capabilities,
+                self.active_route_limits.unwrap_or_default(),
             );
             let mut always_load = self.config.tools_always_load.clone();
             if self.config.features.enabled(Feature::Mcp) {

@@ -94,12 +94,18 @@ pub struct CatalogOffering {
     /// unknown, not "text-only").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modalities: Option<ModelsDevModalities>,
+    /// Whether this provider offering accepts attachments, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<bool>,
     /// Whether this offering supports reasoning, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
     /// Whether tool calling is supported, when known (#4115).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call: Option<bool>,
+    /// Whether structured output is supported, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<bool>,
     /// Provider-scoped reasoning controls / accepted effort metadata. Kept as
     /// raw JSON so the same model family served through different gateways can
     /// expose different effort vocabularies without lossy collapsing.
@@ -143,6 +149,17 @@ impl CatalogOffering {
                 .as_ref()
                 .map(RouteLimits::from)
                 .unwrap_or_default(),
+            capabilities: crate::route::RouteCapabilities {
+                attachments: crate::route::CapabilityState::from_optional_bool(self.attachment),
+                reasoning: crate::route::CapabilityState::from_optional_bool(self.reasoning),
+                native_tool_calls: crate::route::CapabilityState::from_optional_bool(
+                    self.tool_call,
+                ),
+                structured_output: crate::route::CapabilityState::from_optional_bool(
+                    self.structured_output,
+                ),
+                ..crate::route::RouteCapabilities::default()
+            },
             pricing: crate::pricing::route_pricing_sku(self),
         }
     }
@@ -264,8 +281,10 @@ fn offerings_from_models_dev(
                 limit: model.limit.clone(),
                 cost: model.cost.clone(),
                 modalities: model.modalities.clone(),
+                attachment: model.attachment,
                 reasoning: model.reasoning,
                 tool_call: model.tool_call,
+                structured_output: model.structured_output,
                 reasoning_options: model.reasoning_options.clone(),
                 source: source.clone(),
             });

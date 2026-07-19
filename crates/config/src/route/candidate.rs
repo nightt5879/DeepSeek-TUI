@@ -14,15 +14,14 @@
 //! and a candidate's limits are therefore exactly what the resolver produced
 //! (including any [`SourcedLimitOverride`]s recorded on it).
 //!
-//! DEFERRED: #3384's full sketch also carried `capabilities: CapabilityProfile`
-//! and `config_snapshot: Config`. Both are intentionally omitted here: pulling
-//! `CapabilityProfile` into `crates/config` would force a `tui -> config` type
-//! move, and embedding `Config` would couple the candidate to the full config
-//! model. They will be added when those types have a home in this crate.
+//! The route-owned, three-state capability profile lives in this crate and is
+//! carried on the candidate. A full `config_snapshot: Config` remains deferred
+//! because embedding it would couple the candidate to the full config model.
 
 use serde::{Deserialize, Serialize};
 
 use super::RequestProtocol;
+use super::capabilities::RouteCapabilities;
 use super::ids::{LogicalModelRef, ModelId, ProviderId, WireModelId};
 use super::offering::RouteLimits;
 use crate::ProviderKind;
@@ -198,6 +197,8 @@ pub struct ReadyRouteCandidate {
     protocol: RequestProtocol,
     /// Route/offering-scoped token limits, when known (overrides applied).
     limits: RouteLimits,
+    /// Capability facts for the exact provider/model offering.
+    capabilities: RouteCapabilities,
     /// Pricing/quota class, if known.
     pricing: Option<PricingSku>,
     /// Validation outcome.
@@ -221,6 +222,7 @@ impl ReadyRouteCandidate {
         auth: ResolvedAuthSource,
         protocol: RequestProtocol,
         limits: RouteLimits,
+        capabilities: RouteCapabilities,
         pricing: Option<PricingSku>,
         validation: ValidationReport,
         applied_limit_overrides: Vec<SourcedLimitOverride>,
@@ -235,6 +237,7 @@ impl ReadyRouteCandidate {
             auth,
             protocol,
             limits,
+            capabilities,
             pricing,
             validation,
             applied_limit_overrides,
@@ -293,6 +296,12 @@ impl ReadyRouteCandidate {
     #[must_use]
     pub fn limits(&self) -> RouteLimits {
         self.limits
+    }
+
+    /// Capability facts for the exact provider/model offering.
+    #[must_use]
+    pub fn capabilities(&self) -> RouteCapabilities {
+        self.capabilities
     }
 
     /// Pricing/quota class, if known.

@@ -10,6 +10,7 @@
 //! - [`ids`] — provider/model/wire string newtypes + namespace hints.
 //! - [`descriptor`] — route-facing view over the static provider registry.
 //! - [`offering`] — provider/model offering seam (wire-id binding).
+//! - [`capabilities`] — three-state provider/model capability facts.
 //! - [`candidate`] — the runtime-resolved executable route + its parts.
 //! - [`errors`] — route resolution errors.
 //! - [`resolver`] — the sole producer of [`candidate::ReadyRouteCandidate`].
@@ -27,6 +28,7 @@
 pub use crate::provider::WireFormat as RequestProtocol;
 
 pub mod candidate;
+pub mod capabilities;
 pub mod descriptor;
 pub mod errors;
 pub mod ids;
@@ -37,6 +39,7 @@ pub use candidate::{
     LimitField, OverrideSource, PricingSku, ReadyRouteCandidate, ResolvedAuthSource,
     ResolvedEndpoint, SourcedLimitOverride, ValidationReport,
 };
+pub use capabilities::{CapabilityState, RouteCapabilities};
 pub use descriptor::{EndpointDescriptor, ProviderDescriptor};
 pub use errors::RouteError;
 pub use ids::{LogicalModelRef, ModelId, NamespaceHint, ProviderId, WireModelId};

@@ -40,10 +40,12 @@ use crate::config::{
 };
 use crate::core::ops::ProviderRuntimeStatus;
 use crate::localization::{Locale, MessageId, tr};
-use crate::model_profile::{SupportState, resolved_capability_profile};
+use crate::model_profile::{
+    SupportState, resolved_capability_profile, resolved_capability_profile_for_route,
+};
 use crate::models_dev_live::{self, ModelsDevFreshness};
 use crate::palette;
-use crate::provider_lake::catalog_model_count_for_provider;
+use crate::provider_lake::{catalog_model_count_for_provider, catalog_offering_for_model};
 use crate::provider_readiness::{
     CredentialState, ProviderReadinessSnapshot, ProviderRouteIdentity, ResolvedProviderReadiness,
     credential_state_for_provider, route_identity_for_model,
@@ -275,7 +277,18 @@ pub struct ProviderCapabilityBadges {
 
 impl ProviderCapabilityBadges {
     fn for_route(provider: ApiProvider, wire_model: &str) -> Self {
-        let cap = resolved_capability_profile(provider, wire_model);
+        let cap = catalog_offering_for_model(provider, wire_model).map_or_else(
+            || resolved_capability_profile(provider, wire_model),
+            |offering| {
+                let route_offering = offering.to_offering();
+                resolved_capability_profile_for_route(
+                    provider,
+                    wire_model,
+                    route_offering.capabilities,
+                    route_offering.limits,
+                )
+            },
+        );
         Self {
             context_window: cap.context_window,
             context_window_source: None,

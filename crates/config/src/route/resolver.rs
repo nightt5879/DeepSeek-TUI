@@ -31,6 +31,7 @@ use super::candidate::{
     LimitField, PricingSku, ReadyRouteCandidate, ResolvedAuthSource, ResolvedEndpoint,
     SourcedLimitOverride, ValidationReport,
 };
+use super::capabilities::RouteCapabilities;
 use super::descriptor::ProviderDescriptor;
 use super::errors::RouteError;
 use super::ids::{LogicalModelRef, ModelId, ProviderId, WireModelId};
@@ -63,6 +64,41 @@ pub struct RouteRequest {
 #[derive(Debug, Clone)]
 pub struct RouteResolver {
     offerings: Vec<ProviderModelOffering>,
+}
+
+/// Offering-owned facts selected within one provider scope before the final
+/// executable route candidate is minted.
+struct ResolvedOffering {
+    wire_model_id: WireModelId,
+    canonical_model: Option<ModelId>,
+    endpoint_key: String,
+    limits: RouteLimits,
+    capabilities: RouteCapabilities,
+    pricing: PricingSku,
+}
+
+impl ResolvedOffering {
+    fn unknown(wire_model_id: WireModelId) -> Self {
+        Self {
+            wire_model_id,
+            canonical_model: None,
+            endpoint_key: "chat".to_string(),
+            limits: RouteLimits::default(),
+            capabilities: RouteCapabilities::default(),
+            pricing: PricingSku::UnknownOrStale,
+        }
+    }
+
+    fn from_offering(offering: &ProviderModelOffering) -> Self {
+        Self {
+            wire_model_id: offering.wire_model_id.clone(),
+            canonical_model: offering.canonical_model.clone(),
+            endpoint_key: offering.endpoint_key.clone(),
+            limits: offering.limits,
+            capabilities: offering.capabilities,
+            pricing: offering.pricing.clone(),
+        }
+    }
 }
 
 impl Default for RouteResolver {
@@ -150,29 +186,14 @@ impl RouteResolver {
         } else {
             classify(provider_kind)
         };
-        let (wire_model_id, canonical_model, endpoint_key, limits, pricing) = if is_auto {
+        let selected = if is_auto {
             default_offering.map_or_else(
                 || {
-                    (
-                        descriptor.default_wire_model(),
-                        None,
-                        "chat".to_string(),
-                        RouteLimits::default(),
-                        // No offering in hand on the default branch: pricing is
-                        // honestly unknown (#3085), never a fabricated zero.
-                        PricingSku::UnknownOrStale,
-                    )
+                    // No offering in hand on the default branch: capability
+                    // and pricing facts are honestly unknown.
+                    ResolvedOffering::unknown(descriptor.default_wire_model())
                 },
-                |offering| {
-                    (
-                        offering.wire_model_id.clone(),
-                        offering.canonical_model.clone(),
-                        offering.endpoint_key.clone(),
-                        offering.limits,
-                        // Matched offering: carry its sourced pricing meter.
-                        offering.pricing.clone(),
-                    )
-                },
+                ResolvedOffering::from_offering,
             )
         } else {
             self.scope_selector(provider_kind, &provider_id, &logical_model, class)?
@@ -183,7 +204,7 @@ impl RouteResolver {
                 .base_url_override
                 .clone()
                 .unwrap_or_else(|| descriptor.default_base_url().to_string()),
-            endpoint_key,
+            endpoint_key: selected.endpoint_key,
             protocol: descriptor.protocol(),
         };
 
@@ -201,7 +222,7 @@ impl RouteResolver {
         // Apply caller-requested limit overrides in order, BEFORE the candidate
         // is minted. The candidate is immutable afterwards; the applied
         // overrides are recorded on it as provenance.
-        let mut limits = limits;
+        let mut limits = selected.limits;
         for limit_override in &req.limit_overrides {
             match limit_override.field {
                 LimitField::ContextTokens => limits.context_tokens = limit_override.value,
@@ -214,18 +235,19 @@ impl RouteResolver {
             provider_id,
             provider_kind,
             logical_model,
-            canonical_model,
-            wire_model_id,
+            selected.canonical_model,
+            selected.wire_model_id,
             endpoint,
             // The resolver never inspects credentials: auth is honestly
             // `Unresolved` at resolution time, not a claimed `Missing`.
             ResolvedAuthSource::Unresolved,
             descriptor.protocol(),
             limits,
+            selected.capabilities,
             // #3085: honest pricing projected from the matched offering (the
             // catalog layer maps sourced cost → SKU); `UnknownOrStale` whenever
             // no offering was matched or the offering carried no price.
-            Some(pricing),
+            Some(selected.pricing),
             validation,
             req.limit_overrides.clone(),
         ))
@@ -238,16 +260,7 @@ impl RouteResolver {
         provider_id: &ProviderId,
         logical_model: &LogicalModelRef,
         class: ProviderClass,
-    ) -> Result<
-        (
-            WireModelId,
-            Option<ModelId>,
-            String,
-            RouteLimits,
-            PricingSku,
-        ),
-        RouteError,
-    > {
+    ) -> Result<ResolvedOffering, RouteError> {
         // OpenCode Go publishes one combined model roster across two wire
         // protocols. Codewhale's provider is deliberately Chat Completions
         // only, so this allowlist must sit at the sole route-candidate seam.
@@ -277,14 +290,7 @@ impl RouteResolver {
                 .is_some_and(|m| m.as_str() == raw);
             let matches_wire = offering.wire_model_id.as_str() == raw;
             if matches_canonical || matches_wire {
-                return Ok((
-                    offering.wire_model_id.clone(),
-                    offering.canonical_model.clone(),
-                    offering.endpoint_key.clone(),
-                    offering.limits,
-                    // Matched offering: carry its sourced pricing meter (#3085).
-                    offering.pricing.clone(),
-                ));
+                return Ok(ResolvedOffering::from_offering(offering));
             }
         }
 
@@ -309,26 +315,14 @@ impl RouteResolver {
                 // A bare, unknown model on a strict direct provider is passed
                 // through verbatim (the provider validates it server-side). No
                 // offering matched, so pricing is honestly unknown (#3085).
-                Ok((
-                    WireModelId::from(raw),
-                    None,
-                    "chat".to_string(),
-                    RouteLimits::default(),
-                    PricingSku::UnknownOrStale,
-                ))
+                Ok(ResolvedOffering::unknown(WireModelId::from(raw)))
             }
             // Aggregators, local runtimes, and custom OpenAI-compatible
             // endpoints legitimately accept arbitrary / prefixed ids verbatim.
             ProviderClass::Aggregator | ProviderClass::LocalOrCustom => {
                 let _ = provider_kind;
                 // No offering matched: pricing is honestly unknown (#3085).
-                Ok((
-                    WireModelId::from(raw),
-                    None,
-                    "chat".to_string(),
-                    RouteLimits::default(),
-                    PricingSku::UnknownOrStale,
-                ))
+                Ok(ResolvedOffering::unknown(WireModelId::from(raw)))
             }
         }
     }

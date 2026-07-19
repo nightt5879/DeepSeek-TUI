@@ -1012,6 +1012,42 @@ fn priced_deepseek_resolver() -> RouteResolver {
 }
 
 #[test]
+fn resolver_carries_exact_offering_capabilities_without_protocol_inference() {
+    use crate::catalog::{CatalogOffering, CatalogSource};
+    use crate::route::CapabilityState;
+
+    let offering = CatalogOffering {
+        provider: "deepseek".into(),
+        wire_model_id: "deepseek-v4-pro".into(),
+        canonical_model: Some("deepseek-v4-pro".into()),
+        endpoint_key: "chat".into(),
+        default_for_provider: true,
+        attachment: Some(false),
+        reasoning: Some(true),
+        tool_call: Some(false),
+        structured_output: Some(true),
+        source: CatalogSource::Bundled,
+        ..Default::default()
+    };
+    let resolver = RouteResolver::from_offerings(vec![offering.to_offering()]);
+
+    let candidate = resolver
+        .resolve(&req(Some(ProviderKind::Deepseek), Some("deepseek-v4-pro")))
+        .expect("matching offering resolves");
+    let capabilities = candidate.capabilities();
+
+    assert_eq!(capabilities.attachments, CapabilityState::Unsupported);
+    assert_eq!(capabilities.reasoning, CapabilityState::Supported);
+    assert_eq!(capabilities.native_tool_calls, CapabilityState::Unsupported);
+    assert_eq!(capabilities.structured_output, CapabilityState::Supported);
+    assert_eq!(capabilities.streaming, CapabilityState::Unknown);
+    assert_eq!(
+        capabilities.server_side_web_search,
+        CapabilityState::Unknown
+    );
+}
+
+#[test]
 fn priced_offering_yields_token_pricing_sku() {
     use super::candidate::PricingSku;
 

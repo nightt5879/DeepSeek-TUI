@@ -27,8 +27,11 @@ const FIXTURE: &str = r#"{
           "id": "glm-5.2",
           "family": "glm",
           "default": true,
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [{ "type": "effort", "values": ["high", "max"] }],
+          "tool_call": true,
+          "structured_output": true,
           "modalities": { "input": ["text"], "output": ["text"] },
           "limit": { "context": 1000000, "output": 131072 },
           "cost": { "input": 1.4, "output": 4.4, "cache_read": 0.26 }
@@ -76,6 +79,9 @@ fn hydrates_models_dev_offerings_preserving_offering_facts() {
     assert!(glm.default_for_provider);
     assert_eq!(glm.family.as_deref(), Some("glm"));
     assert_eq!(glm.reasoning, Some(true));
+    assert_eq!(glm.attachment, Some(false));
+    assert_eq!(glm.tool_call, Some(true));
+    assert_eq!(glm.structured_output, Some(true));
     // Provider-scoped reasoning options are preserved, not collapsed.
     assert_eq!(glm.reasoning_options.len(), 1);
     assert_eq!(glm.limit.as_ref().and_then(|l| l.context), Some(1_000_000));
@@ -109,6 +115,26 @@ fn to_offering_projects_routing_identity_and_limits() {
     assert_eq!(glm.endpoint_key, "chat");
     assert_eq!(glm.limits.context_tokens, Some(1_000_000));
     assert_eq!(glm.limits.output_tokens, Some(131_072));
+    assert_eq!(
+        glm.capabilities.attachments,
+        crate::route::CapabilityState::Unsupported
+    );
+    assert_eq!(
+        glm.capabilities.reasoning,
+        crate::route::CapabilityState::Supported
+    );
+    assert_eq!(
+        glm.capabilities.native_tool_calls,
+        crate::route::CapabilityState::Supported
+    );
+    assert_eq!(
+        glm.capabilities.structured_output,
+        crate::route::CapabilityState::Supported
+    );
+    assert_eq!(
+        glm.capabilities.streaming,
+        crate::route::CapabilityState::Unknown
+    );
 }
 
 #[test]

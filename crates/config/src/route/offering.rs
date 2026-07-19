@@ -15,6 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::candidate::PricingSku;
+use super::capabilities::RouteCapabilities;
 use super::ids::{ModelId, ProviderId, WireModelId};
 
 /// Token limits for one resolved route/offering.
@@ -61,6 +62,9 @@ pub struct ProviderModelOffering {
     pub default_for_provider: bool,
     /// Provider/offering-scoped token limits, when known.
     pub limits: RouteLimits,
+    /// Provider/model-scoped capability facts. Unknown is preserved rather
+    /// than inferred from the wire protocol.
+    pub capabilities: RouteCapabilities,
     /// Coarse route-facing pricing meter for this offering (#3085).
     ///
     /// Projected from the offering's sourced cost at the layer that owns it

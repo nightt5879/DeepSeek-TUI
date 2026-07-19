@@ -1566,8 +1566,10 @@ impl DeepSeekClient {
                     limit: None,
                     cost: None,
                     modalities: None,
+                    attachment: None,
                     reasoning: None,
                     tool_call: None,
+                    structured_output: None,
                     reasoning_options: Vec::new(),
                     source: CatalogSource::Live {
                         base_url_fingerprint: fingerprint.clone(),
@@ -2200,8 +2202,10 @@ fn openrouter_to_catalog_offering(
         limit,
         cost,
         modalities,
+        attachment: None,
         reasoning,
         tool_call,
+        structured_output: None,
         reasoning_options: Vec::new(),
         source: CatalogSource::Live {
             base_url_fingerprint: base_url_fingerprint.to_string(),
