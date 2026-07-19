@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) const MAX_SEARCH_RESULTS: usize = 10;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum BackendId {
@@ -96,7 +98,7 @@ impl SearchQuery {
         domains.dedup();
         Self {
             query,
-            max_results: u8::try_from(max_results.clamp(1, 10)).unwrap_or(10),
+            max_results: u8::try_from(max_results.clamp(1, MAX_SEARCH_RESULTS)).unwrap_or(u8::MAX),
             recency,
             domains,
             locale: locale
@@ -346,5 +348,41 @@ mod tests {
         assert_eq!(value["backend"], "duckduckgo");
         assert_eq!(value["degraded"][0]["kind"], "knob_ignored");
         assert!(receipt.warning().expect("warning").contains("recency"));
+    }
+
+    #[test]
+    fn scrape_fallback_receipt_preserves_backend_transitions() {
+        let receipt = SearchReceipt {
+            backend: BackendId::Bing,
+            backend_detail: None,
+            requested: SearchQuery::new("fallback query".to_string(), 5, None, Vec::new(), None),
+            capabilities: QueryCapabilities::count_only(),
+            honored: HonoredQueryCapabilities {
+                max_results: true,
+                ..HonoredQueryCapabilities::default()
+            },
+            degraded: vec![
+                DegradedReason::ChallengeDetected {
+                    backend: BackendId::DuckDuckGo,
+                },
+                DegradedReason::ScrapeFallback {
+                    from: BackendId::DuckDuckGo,
+                    to: BackendId::Bing,
+                },
+            ],
+            latency_ms: 12,
+            cache_hit: false,
+        };
+
+        let value = serde_json::to_value(&receipt).expect("receipt serializes");
+        assert_eq!(value["backend"], "bing");
+        assert_eq!(value["degraded"][0]["kind"], "challenge_detected");
+        assert_eq!(value["degraded"][0]["backend"], "duckduckgo");
+        assert_eq!(value["degraded"][1]["kind"], "scrape_fallback");
+        assert_eq!(value["degraded"][1]["from"], "duckduckgo");
+        assert_eq!(value["degraded"][1]["to"], "bing");
+        let warning = receipt.warning().expect("warning");
+        assert!(warning.contains("bot challenge"));
+        assert!(warning.contains("used bing fallback"));
     }
 }

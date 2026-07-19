@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 
 use super::web::backend::{ConfiguredSearchBackend, SearchBackend};
 use super::web::contract::{
-    BackendId, BackendSearch, DegradedReason, HonoredQueryCapabilities, QueryKnob, Recency,
-    SearchQuery, SearchReceipt, SearchResponse, SearchResult,
+    BackendId, BackendSearch, DegradedReason, HonoredQueryCapabilities, MAX_SEARCH_RESULTS,
+    QueryKnob, Recency, SearchQuery, SearchReceipt, SearchResponse, SearchResult,
 };
 use super::web::scrape::{
     ScrapedSearchResult, is_duckduckgo_challenge, parse_bing_results as scrape_bing_results,
@@ -75,7 +75,6 @@ fn get_bearer_token_re() -> &'static Regex {
 }
 
 const DEFAULT_MAX_RESULTS: usize = 5;
-const MAX_RESULTS: usize = 10;
 const DEFAULT_TIMEOUT_MS: u64 = 15_000;
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 
@@ -1479,7 +1478,7 @@ fn search_query_from_input(input: &Value) -> Result<SearchQuery, ToolError> {
     }
     let max_results = usize::try_from(optional_search_max_results(input))
         .unwrap_or(DEFAULT_MAX_RESULTS)
-        .clamp(1, MAX_RESULTS);
+        .clamp(1, MAX_SEARCH_RESULTS);
     let recency = search_option(input, "recency")
         .map(parse_recency)
         .transpose()?;
@@ -1776,7 +1775,7 @@ mod tests {
     #[test]
     fn optional_max_results_uses_default_when_neither_set() {
         // No explicit bound anywhere → the DEFAULT (currently 5)
-        // applies, so the model can't accidentally pull MAX_RESULTS
+        // applies, so the model can't accidentally pull the maximum
         // worth of bandwidth just by omitting the field.
         assert_eq!(optional_search_max_results(&json!({"query": "x"})), 5);
         assert_eq!(

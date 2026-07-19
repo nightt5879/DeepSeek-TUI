@@ -22,11 +22,10 @@ use std::time::{Duration, Instant};
 use parking_lot::{RwLock, RwLockWriteGuard};
 
 use super::web::contract::{
-    Recency, SearchQuery, SearchReceipt, SearchResult as NormalizedSearchResult,
+    MAX_SEARCH_RESULTS, Recency, SearchQuery, SearchReceipt, SearchResult as NormalizedSearchResult,
 };
 use super::web_search::{domain_matches, execute_search};
 
-const MAX_RESULTS: usize = 10;
 const DEFAULT_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_OPEN_TIMEOUT_MS: u64 = 20_000;
 const MAX_WEB_RUN_SESSIONS: usize = 64;
@@ -462,7 +461,7 @@ impl ToolSpec for WebRunTool {
                     response_length.max_results() as u64,
                 ))
                 .unwrap_or(response_length.max_results())
-                .clamp(1, MAX_RESULTS);
+                .clamp(1, MAX_SEARCH_RESULTS);
                 let timeout_ms = optional_u64(search, "timeout_ms", DEFAULT_TIMEOUT_MS).min(60_000);
 
                 let domains = search
@@ -530,7 +529,7 @@ impl ToolSpec for WebRunTool {
                     response_length.max_results() as u64,
                 ))
                 .unwrap_or(response_length.max_results())
-                .clamp(1, MAX_RESULTS);
+                .clamp(1, MAX_SEARCH_RESULTS);
                 let timeout_ms = optional_u64(image, "timeout_ms", DEFAULT_TIMEOUT_MS).min(60_000);
 
                 let domains = image
