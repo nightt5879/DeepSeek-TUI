@@ -1565,13 +1565,16 @@ fn validate_mfjs_enum(
     {
         return Err(KimiParameterSchemaError::InvalidKeywordValue);
     }
-    let type_matches = match (schema_type, kind) {
-        (None, _) => true,
-        (Some("string"), MfjsLiteralKind::String) => true,
-        (Some("integer"), MfjsLiteralKind::Integer) => true,
-        (Some("number"), MfjsLiteralKind::Integer | MfjsLiteralKind::Number) => true,
-        _ => false,
-    };
+    let type_matches = matches!(
+        (schema_type, kind),
+        (None, _)
+            | (Some("string"), MfjsLiteralKind::String)
+            | (Some("integer"), MfjsLiteralKind::Integer)
+            | (
+                Some("number"),
+                MfjsLiteralKind::Integer | MfjsLiteralKind::Number
+            )
+    );
     if !type_matches {
         return Err(KimiParameterSchemaError::InvalidKeywordValue);
     }
