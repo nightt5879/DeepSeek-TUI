@@ -7,8 +7,8 @@
 //!
 //! ## v0.6.7: Codex-style takeover with stakes-based variants (#129)
 //!
-//! The modal now renders as a full-screen takeover (calm centered card
-//! against the transcript area) and routes each request to one of two
+//! The modal renders as a compact bottom-anchored approval card that preserves
+//! transcript context and routes each request to one of two
 //! stakes-based variants:
 //!
 //! - **Benign** (`RiskLevel::Benign`) — read-only ops, MCP discovery,
@@ -17,7 +17,7 @@
 //! - **Destructive** (`RiskLevel::Destructive`) — file writes, shell
 //!   commands that are not proven read-only, patches, MCP actions,
 //!   unclassified tools, and any "fetch arbitrary content" surface.
-//!   The takeover keeps the destructive badge and
+//!   The approval card keeps the destructive badge and
 //!   impact summary visible, then lets `Enter` commit the highlighted
 //!   option or `y` / `a` / `d` commit directly.
 //!
@@ -130,7 +130,7 @@ pub struct ApprovalRequest {
     pub description: String,
     /// Tool category
     pub category: ToolCategory,
-    /// Stakes-based routing for the takeover modal
+    /// Stakes-based routing for the compact approval card
     pub risk: RiskLevel,
     /// Derived impact summary for the approval prompt
     pub impacts: Vec<String>,
@@ -2686,11 +2686,10 @@ diff --git a/src/b.rs b/src/b.rs
 
     #[test]
     fn tab_toggles_collapsed_card_so_transcript_stays_visible() {
-        // Regression for PR #1455 / @tiger-dog: the approval modal
-        // rendered as a full-screen takeover that hid the transcript
-        // behind it, so users had to dismiss the prompt to remember
-        // what they were approving. Tab now flips between the full
-        // takeover card and a single-line bottom banner.
+        // Regression for PR #1455 / @tiger-dog: the approval modal once hid
+        // the transcript, so users had to dismiss the prompt to remember what
+        // they were approving. Tab flips between the expanded compact card
+        // and a single-line bottom banner.
         let mut view = ApprovalView::new(benign_request());
         assert!(
             !view.collapsed,
@@ -2703,7 +2702,7 @@ diff --git a/src/b.rs b/src/b.rs
 
         let action = view.handle_key(create_key_event(KeyCode::Tab));
         assert!(matches!(action, ViewAction::None));
-        assert!(!view.collapsed, "second Tab restores the takeover card");
+        assert!(!view.collapsed, "second Tab restores the expanded card");
     }
 
     #[test]
@@ -2844,6 +2843,61 @@ diff --git a/src/b.rs b/src/b.rs
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn tiny_localized_approval_keeps_every_action_and_hitbox() {
+        const WIDTH: u16 = 40;
+        const HEIGHT: u16 = 12;
+        let expected = [
+            ReviewDecision::Approved,
+            ReviewDecision::ApprovedForSession,
+            ReviewDecision::Denied,
+            ReviewDecision::Abort,
+        ];
+
+        for &locale in Locale::shipped() {
+            let rendered_view = ApprovalView::new_for_locale(destructive_request(), locale);
+            let rendered = render_lines(&rendered_view, WIDTH, HEIGHT).join("\n");
+            assert_approval_key_badges_visible(&rendered);
+            assert!(
+                rendered.contains(crate::tui::shell_key_routing::tool_details_chord().as_ref()),
+                "missing details chord for {locale:?}:\n{rendered}"
+            );
+
+            for (index, expected_decision) in expected.iter().enumerate() {
+                let mut view = ApprovalView::new_for_locale(destructive_request(), locale);
+                let mut terminal =
+                    Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("test terminal");
+                terminal
+                    .draw(|frame| view.render(frame.area(), frame.buffer_mut()))
+                    .expect("render localized approval prompt");
+
+                let hitboxes = view.row_hitboxes.borrow().clone();
+                assert_eq!(hitboxes.len(), expected.len(), "{locale:?}: {hitboxes:?}");
+                for hitbox in &hitboxes {
+                    assert!(hitbox.height > 0, "{locale:?}: {hitboxes:?}");
+                    assert!(hitbox.right() <= WIDTH, "{locale:?}: {hitboxes:?}");
+                    assert!(hitbox.bottom() <= HEIGHT, "{locale:?}: {hitboxes:?}");
+                }
+                for pair in hitboxes.windows(2) {
+                    assert!(pair[0].bottom() <= pair[1].y, "{locale:?}: {hitboxes:?}");
+                }
+
+                let rect = hitboxes[index];
+                let action = view.handle_mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: rect.x,
+                    row: rect.y,
+                    modifiers: KeyModifiers::NONE,
+                });
+                let ViewAction::EmitAndClose(ViewEvent::ApprovalDecision { decision, .. }) = action
+                else {
+                    panic!("click {index} did not decide for {locale:?}");
+                };
+                assert_eq!(decision, *expected_decision, "{locale:?} option {index}");
+            }
+        }
     }
 
     #[test]
@@ -3095,8 +3149,7 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     // ========================================================================
-    // Render takeover smoke tests — keep the visual contract honest so a
-    // future widget refactor cannot silently shrink back to a popup.
+    // Render approval-card smoke tests — keep the visual contract honest.
     // ========================================================================
 
     fn render_lines(view: &ApprovalView, w: u16, h: u16) -> Vec<String> {
@@ -3264,7 +3317,7 @@ diff --git a/src/b.rs b/src/b.rs
     fn render_elevated_write_is_calm_and_compact() {
         // Ordinary state-touching work (a file write) renders as a calm
         // APPROVAL ask: no DESTRUCTIVE badge, no policy dossier, no
-        // impact/category taxonomy — that detail stays one `v` away.
+        // impact/category taxonomy — that detail stays one details chord away.
         let view = ApprovalView::new(destructive_request());
         let lines = render_lines(&view, 100, 40);
         let joined = lines.join("\n");

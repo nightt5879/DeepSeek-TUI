@@ -2958,6 +2958,8 @@ fn forced_approval_prompt_bypasses_auto_mode_shortcut() {
 #[test]
 fn forced_approval_prompt_bypasses_session_approval_shortcut() {
     let mut app = create_test_app();
+    app.mode = AppMode::Agent;
+    app.approval_mode = ApprovalMode::Suggest;
     app.approval_session_approved
         .insert("shell:exec_shell:cargo test".to_string());
 
@@ -2970,7 +2972,7 @@ fn forced_approval_prompt_bypasses_session_approval_shortcut() {
 }
 
 #[test]
-fn approval_request_uses_session_cache_not_current_mode_shortcut() {
+fn full_access_auto_approves_requests_while_auto_review_does_not() {
     let mut app = create_test_app();
     app.approval_mode = ApprovalMode::Auto;
     assert!(!should_auto_approve_approval_request(
@@ -2981,21 +2983,35 @@ fn approval_request_uses_session_cache_not_current_mode_shortcut() {
     ));
 
     app.approval_mode = ApprovalMode::Bypass;
-    assert!(!should_auto_approve_approval_request(
+    assert!(should_auto_approve_approval_request(
         &app,
         "exec_shell",
         "shell:exec_shell:cargo test",
         false,
     ));
+    assert!(!should_auto_approve_approval_request(
+        &app,
+        "exec_shell",
+        "shell:exec_shell:cargo test",
+        true,
+    ));
+    assert!(should_auto_deny_forced_approval_request(&app, true));
 
     app.approval_mode = ApprovalMode::Suggest;
     app.mode = AppMode::Yolo;
-    assert!(!should_auto_approve_approval_request(
+    assert!(should_auto_approve_approval_request(
         &app,
         "exec_shell",
         "shell:exec_shell:cargo test",
         false,
     ));
+    assert!(!should_auto_approve_approval_request(
+        &app,
+        "exec_shell",
+        "shell:exec_shell:cargo test",
+        true,
+    ));
+    assert!(should_auto_deny_forced_approval_request(&app, true));
 
     app.mode = AppMode::Agent;
     app.approval_session_approved
@@ -3006,6 +3022,7 @@ fn approval_request_uses_session_cache_not_current_mode_shortcut() {
         "shell:exec_shell:cargo test",
         false,
     ));
+    assert!(!should_auto_deny_forced_approval_request(&app, true));
 }
 
 #[test]
@@ -3024,6 +3041,30 @@ fn app_auto_approval_helper_covers_yolo_and_bypass_only() {
     app.approval_mode = ApprovalMode::Suggest;
     app.mode = AppMode::Yolo;
     assert!(app_auto_approve_enabled(&app));
+}
+
+#[test]
+fn auto_review_suppresses_stale_question_prompts_while_other_postures_allow_them() {
+    let mut app = create_test_app();
+    for (posture, expected) in [
+        (ApprovalMode::Suggest, false),
+        (ApprovalMode::Auto, true),
+        (ApprovalMode::Bypass, false),
+        (ApprovalMode::Never, false),
+    ] {
+        app.approval_mode = posture;
+        assert_eq!(
+            should_suppress_user_input_prompt(&app),
+            expected,
+            "{posture:?}"
+        );
+    }
+
+    // Compatibility shape: legacy Yolo hosts can carry a stale Auto enum,
+    // but their effective posture is Full Access, where questions are valid.
+    app.mode = AppMode::Yolo;
+    app.approval_mode = ApprovalMode::Auto;
+    assert!(!should_suppress_user_input_prompt(&app));
 }
 
 fn create_test_options() -> TuiOptions {

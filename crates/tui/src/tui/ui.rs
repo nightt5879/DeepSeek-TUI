@@ -323,11 +323,35 @@ fn should_auto_approve_approval_request(
     grouping_key: &str,
     approval_force_prompt: bool,
 ) -> bool {
-    !approval_force_prompt && is_session_approved_for_tool(app, tool_name, grouping_key)
+    // Full Access is an explicit no-ordinary-approval-prompt contract. This
+    // UI backstop resolves a request emitted just before a posture update or
+    // by a child turn. A forced policy hold is never converted into approval.
+    !approval_force_prompt
+        && (app_auto_approve_enabled(app)
+            || is_session_approved_for_tool(app, tool_name, grouping_key))
+}
+
+fn should_auto_deny_forced_approval_request(app: &App, approval_force_prompt: bool) -> bool {
+    // Repository/managed-policy holds cannot be bypassed by Full Access, but
+    // Full Access must not open a contradictory approval modal either. Fail
+    // closed and let the model surface the policy constraint.
+    approval_force_prompt && app_auto_approve_enabled(app)
 }
 
 fn app_auto_approve_enabled(app: &App) -> bool {
     app.mode == AppMode::Yolo || app.approval_mode == ApprovalMode::Bypass
+}
+
+fn should_suppress_user_input_prompt(app: &App) -> bool {
+    // Legacy hosts may still report Yolo/auto-approve with a stale `Auto`
+    // enum. Canonicalize that shape to Full Access before applying the one
+    // posture that suppresses questions: genuine Auto-Review.
+    let effective_posture = if app_auto_approve_enabled(app) {
+        ApprovalMode::Bypass
+    } else {
+        app.approval_mode
+    };
+    !crate::core::authority::permission_posture_allows_questions(effective_posture)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3779,6 +3803,23 @@ async fn run_event_loop(
                                 &approval_key,
                             )
                             .await;
+                        } else if should_auto_deny_forced_approval_request(
+                            app,
+                            approval_force_prompt,
+                        ) {
+                            log_sensitive_event(
+                                "tool.approval.auto_deny_full_access_policy",
+                                serde_json::json!({
+                                    "tool_name": tool_name,
+                                    "session_id": app.current_session_id,
+                                    "mode": app.mode.label(),
+                                }),
+                            );
+                            let _ = engine_handle.deny_tool_call(id.clone()).await;
+                            let notice = app
+                                .tr(MessageId::ApprovalFullAccessPolicyBlocked)
+                                .replace("{tool}", &tool_name);
+                            app.push_status_toast(notice, StatusToastLevel::Warning, Some(12_000));
                         } else if should_auto_approve_approval_request(
                             app,
                             &tool_name,
@@ -3846,22 +3887,43 @@ async fn run_event_loop(
                         }
                     }
                     EngineEvent::UserInputRequired { id, request } => {
-                        app.pending_user_input_prompt = Some((id.clone(), request.clone()));
-                        app.view_stack.push(UserInputView::new(id.clone(), request));
-                        if let Some((method, _, _)) = crate::tui::notifications::settings(config) {
-                            let in_tmux = std::env::var("TMUX").is_ok_and(|v| !v.is_empty());
-                            crate::tui::notifications::notify_done(
-                                method,
-                                in_tmux,
-                                "Action required: please respond in the terminal",
-                                Duration::ZERO,
-                                Duration::ZERO,
+                        if should_suppress_user_input_prompt(app) {
+                            // A question may have been planned just before the
+                            // user switched to Auto-Review. Cancel the stale
+                            // request instead of opening a modal under an Auto
+                            // header; the tool result tells the model to keep
+                            // moving without inventing a user choice.
+                            log_sensitive_event(
+                                "tool.user_input.auto_cancelled_auto_review",
+                                serde_json::json!({
+                                    "tool_id": id.clone(),
+                                    "session_id": app.current_session_id,
+                                }),
+                            );
+                            let _ = engine_handle.cancel_user_input(id).await;
+                            app.pending_user_input_prompt = None;
+                            let notice = app.tr(MessageId::AutoReviewQuestionSkipped).into_owned();
+                            app.push_status_toast(notice, StatusToastLevel::Info, Some(6_000));
+                        } else {
+                            app.pending_user_input_prompt = Some((id.clone(), request.clone()));
+                            app.view_stack.push(UserInputView::new(id.clone(), request));
+                            if let Some((method, _, _)) =
+                                crate::tui::notifications::settings(config)
+                            {
+                                let in_tmux = std::env::var("TMUX").is_ok_and(|v| !v.is_empty());
+                                crate::tui::notifications::notify_done(
+                                    method,
+                                    in_tmux,
+                                    "Action required: please respond in the terminal",
+                                    Duration::ZERO,
+                                    Duration::ZERO,
+                                );
+                            }
+                            app.status_message = Some(
+                                "Action required: answer the popup with 1-4, arrows, or Enter"
+                                    .to_string(),
                             );
                         }
-                        app.status_message = Some(
-                            "Action required: answer the popup with 1-4, arrows, or Enter"
-                                .to_string(),
-                        );
                     }
                     EngineEvent::ElevationRequired {
                         tool_id,

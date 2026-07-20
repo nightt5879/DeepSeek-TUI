@@ -52,6 +52,22 @@ pub(super) fn registered_tool_approval_required(
     !auto_approve
 }
 
+pub(super) fn registered_tool_blocked_in_full_access(
+    tool_name: &str,
+    requirement: ApprovalRequirement,
+    auto_approve: bool,
+) -> bool {
+    auto_approve && registered_tool_forces_prompt(tool_name, requirement)
+}
+
+pub(super) fn registered_tool_forces_prompt(
+    tool_name: &str,
+    requirement: ApprovalRequirement,
+) -> bool {
+    requirement != ApprovalRequirement::Auto
+        && registered_tool_requires_non_bypassable_approval(tool_name)
+}
+
 pub(super) fn tool_error_degradation_runtime_hint(
     consecutive_tool_error_steps: u32,
     step_error_tool_names: &[String],
@@ -1794,11 +1810,29 @@ impl Engine {
                 }
 
                 if let Some(prepared) = prepared_policy {
-                    approval_required = registered_tool_approval_required(
+                    let registered_non_bypassable =
+                        registered_tool_forces_prompt(&tool_name, prepared.call.approval);
+                    if registered_tool_blocked_in_full_access(
                         &tool_name,
                         prepared.call.approval,
                         prepared.auto_approve,
-                    );
+                    ) {
+                        approval_required = false;
+                        blocked_error = Some(ToolError::permission_denied(format!(
+                            "Tool '{tool_name}' requires explicit approval and is blocked in Full Access because this posture does not open tool-approval prompts. Switch to Ask to review this call."
+                        )));
+                    } else {
+                        approval_required = registered_tool_approval_required(
+                            &tool_name,
+                            prepared.call.approval,
+                            prepared.auto_approve,
+                        );
+                        // Preserve the typed non-bypassable hold through UI
+                        // posture races: an Ask-planned request received after
+                        // switching to Full Access must fail closed, never take
+                        // the ordinary Full Access auto-approval path.
+                        approval_force_prompt = registered_non_bypassable;
+                    }
                     approval_description = prepared.call.description;
                     supports_parallel = prepared.call.supports_parallel;
                     read_only = prepared.call.read_only;
@@ -1899,9 +1933,9 @@ impl Engine {
                         AutoReviewPlanDecision::NoChange => {}
                         AutoReviewPlanDecision::ForcePrompt(reason) => {
                             // The built-in safety floor is deliberately
-                            // non-bypassable: YOLO auto-approves ordinary tool
-                            // calls, but publish-like and background/headless
-                            // destructive holds still require review.
+                            // non-bypassable. Ask/Auto-Review surface the hold;
+                            // Full Access turns this disposition into a hard
+                            // block below, without opening a modal.
                             approval_required = true;
                             approval_description = reason;
                             approval_force_prompt = true;
@@ -1939,9 +1973,17 @@ impl Engine {
                     }));
                     match decision {
                         crate::repo_law::RepoLawPlanDecision::ForcePrompt(reason) => {
-                            approval_required = true;
-                            approval_description = reason;
-                            approval_force_prompt = true;
+                            if self.session.auto_approve {
+                                approval_required = false;
+                                approval_force_prompt = false;
+                                blocked_error = Some(ToolError::permission_denied(format!(
+                                    "Repository law blocked tool '{tool_name}' in Full Access: {reason}. Switch to Ask to review this protected change."
+                                )));
+                            } else {
+                                approval_required = true;
+                                approval_description = reason;
+                                approval_force_prompt = true;
+                            }
                         }
                         crate::repo_law::RepoLawPlanDecision::Block(reason) => {
                             approval_required = false;
@@ -2402,16 +2444,30 @@ impl Engine {
 
                         if tool_name == REQUEST_USER_INPUT_NAME {
                             let started_at = Instant::now();
-                            let result = match UserInputRequest::from_value(&tool_input) {
-                                Ok(request) => self
-                                    .await_user_input(&tool_id, request)
-                                    .await
-                                    .and_then(|response| {
-                                        ToolResult::json(&response)
-                                            .map_err(|e| ToolError::execution_failed(e.to_string()))
-                                    }),
-                                Err(err) => Err(err),
-                            };
+                            let result =
+                                if crate::core::authority::permission_posture_allows_questions(
+                                    self.session.approval_mode,
+                                ) {
+                                    match UserInputRequest::from_value(&tool_input) {
+                                        Ok(request) => self
+                                            .await_user_input(&tool_id, request)
+                                            .await
+                                            .and_then(|response| {
+                                                ToolResult::json(&response).map_err(|e| {
+                                                    ToolError::execution_failed(e.to_string())
+                                                })
+                                            }),
+                                        Err(err) => Err(err),
+                                    }
+                                } else {
+                                    Ok(ToolResult::success(
+                                    "Auto-Review does not pause for user questions. Decide from the available context and continue autonomously.",
+                                )
+                                .with_metadata(json!({
+                                    "auto_resolved": true,
+                                    "permission_posture": "auto-review",
+                                })))
+                                };
 
                             let _ = self
                                 .tx_event

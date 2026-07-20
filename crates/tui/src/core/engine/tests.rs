@@ -1,7 +1,10 @@
 use super::*;
 
 use super::context::{COMPACTION_SUMMARY_MARKER, TURN_MAX_OUTPUT_TOKENS};
-use super::turn_loop::{registered_tool_approval_required, tool_error_degradation_runtime_hint};
+use super::turn_loop::{
+    registered_tool_approval_required, registered_tool_blocked_in_full_access,
+    registered_tool_forces_prompt, tool_error_degradation_runtime_hint,
+};
 use crate::config::ApiProvider;
 use crate::models::{SystemBlock, Usage};
 use crate::test_support::{EnvVarGuard, lock_test_env};
@@ -1722,19 +1725,40 @@ fn rlm_eval_required_approval_ignores_generic_auto_approve() {
 }
 
 #[test]
-fn start_mcp_server_approval_is_non_bypassable_even_under_auto_approve() {
+fn non_bypassable_registered_tools_block_without_prompt_in_full_access() {
     // Security invariant (#3866): the LLM can request a runtime MCP server
     // start, which spawns a child process / opens a network connection. That
-    // must never run without explicit user approval — not even in YOLO /
-    // auto-approve mode. The gate must force approval regardless of
-    // `auto_approve`, so an unapproved start cannot reach `execute` (and thus
-    // cannot spawn). A generic `Required` tool, by contrast, is auto-approved
-    // when `auto_approve` is set — this asserts `start_mcp_server` is treated
-    // as non-bypassable, not merely "Required".
+    // must never run without explicit user approval. Ask emits that approval;
+    // Full Access cannot show an approval modal, so planning fails closed
+    // before execute (and therefore before process/network side effects). A
+    // generic `Required` tool remains auto-approved in Full Access.
     assert!(
         registered_tool_approval_required("start_mcp_server", ApprovalRequirement::Required, true),
         "start_mcp_server must require approval even when auto_approve is enabled"
     );
+    assert!(registered_tool_blocked_in_full_access(
+        "start_mcp_server",
+        ApprovalRequirement::Required,
+        true,
+    ));
+    assert!(registered_tool_blocked_in_full_access(
+        "rlm_eval",
+        ApprovalRequirement::Required,
+        true,
+    ));
+    assert!(registered_tool_forces_prompt(
+        "start_mcp_server",
+        ApprovalRequirement::Required,
+    ));
+    assert!(registered_tool_forces_prompt(
+        "rlm_eval",
+        ApprovalRequirement::Required,
+    ));
+    assert!(!registered_tool_blocked_in_full_access(
+        "exec_shell",
+        ApprovalRequirement::Required,
+        true,
+    ));
     assert!(
         registered_tool_approval_required("start_mcp_server", ApprovalRequirement::Required, false),
         "start_mcp_server must require approval when auto_approve is disabled"
@@ -1816,7 +1840,7 @@ fn auto_review_policy_holds_background_destructive_under_suggest() {
 }
 
 #[test]
-fn auto_review_policy_holds_yolo_detached_destructive_tools() {
+fn full_access_blocks_detached_catastrophic_tools_without_prompting() {
     for run_origin in [
         crate::tui::auto_review::RunOrigin::Background,
         crate::tui::auto_review::RunOrigin::Headless,
@@ -1834,7 +1858,7 @@ fn auto_review_policy_holds_yolo_detached_destructive_tools() {
 
         assert_eq!(
             decision,
-            AutoReviewPlanDecision::ForcePrompt(
+            AutoReviewPlanDecision::Block(
                 "Built-in safety gate requires approval: destructive background/headless action requires durable review"
                     .to_string()
             )
@@ -3454,6 +3478,55 @@ fn request_user_input_stays_deferred_but_can_be_dynamically_activated() {
 }
 
 #[test]
+fn auto_review_hides_question_tool_while_other_postures_keep_it() {
+    use crate::tui::approval::ApprovalMode;
+
+    for (posture, expected) in [
+        (ApprovalMode::Suggest, true),
+        (ApprovalMode::Auto, false),
+        (ApprovalMode::Bypass, true),
+        (ApprovalMode::Never, true),
+    ] {
+        let mut catalog = vec![api_tool("read_file"), api_tool(REQUEST_USER_INPUT_NAME)];
+        filter_tool_catalog_for_permission_posture(&mut catalog, posture);
+        assert_eq!(
+            catalog
+                .iter()
+                .any(|tool| tool.name == REQUEST_USER_INPUT_NAME),
+            expected,
+            "{posture:?}"
+        );
+        assert!(catalog.iter().any(|tool| tool.name == "read_file"));
+    }
+}
+
+#[test]
+fn legacy_yolo_auto_shape_keeps_question_tool_as_effective_full_access() {
+    let authority = crate::core::authority::effective_input_policy(
+        UserInputProvenance::ExternalUser,
+        AppMode::Yolo,
+        "continue",
+        true,
+        true,
+        true,
+        crate::tui::approval::ApprovalMode::Auto,
+    );
+    assert_eq!(
+        authority.approval_mode_for_session(),
+        crate::tui::approval::ApprovalMode::Bypass
+    );
+
+    let mut catalog = vec![api_tool("read_file"), api_tool(REQUEST_USER_INPUT_NAME)];
+    filter_tool_catalog_for_permission_posture(&mut catalog, authority.approval_mode_for_session());
+    assert!(
+        catalog
+            .iter()
+            .any(|tool| tool.name == REQUEST_USER_INPUT_NAME),
+        "effective Full Access must keep the question tool"
+    );
+}
+
+#[test]
 fn model_tool_catalog_sorts_each_partition_for_prefix_cache_stability() {
     // Regression for #263: deterministic byte order of the tools array is a
     // hard requirement for DeepSeek's KV prefix cache. Built-ins stay as a
@@ -4136,7 +4209,7 @@ async fn operate_model_shell_uses_normal_approval_and_workspace_sandbox() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn yolo_mode_does_not_prompt_for_model_driven_typed_ask_rule() {
+async fn full_access_subagent_handoff_keeps_model_shell_free_of_approval_prompts() {
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -4205,8 +4278,8 @@ async fn yolo_mode_does_not_prompt_for_model_driven_typed_ask_rule() {
 
     handle
         .send(Op::SendMessage {
-            content: "please exercise the shell path".to_string(),
-            mode: AppMode::Yolo,
+            content: "continue from the completed child".to_string(),
+            mode: AppMode::Agent,
             route: resolved_route_for_test(&api_config, crate::config::DEFAULT_TEXT_MODEL),
             compaction: Box::new(CompactionConfig::default()),
             goal_objective: None,
@@ -4217,15 +4290,17 @@ async fn yolo_mode_does_not_prompt_for_model_driven_typed_ask_rule() {
             auto_model: false,
             allow_shell: true,
             trust_mode: true,
-            auto_approve: true,
-            approval_mode: crate::tui::approval::ApprovalMode::Auto,
+            // Exercise the valid legacy/host shape where the named posture is
+            // authoritative but the redundant bit is stale.
+            auto_approve: false,
+            approval_mode: crate::tui::approval::ApprovalMode::Bypass,
             translation_enabled: false,
             show_thinking: true,
             allowed_tools: None,
             dynamic_tools: Vec::new(),
             hook_executor: None,
             verbosity: None,
-            provenance: UserInputProvenance::ExternalUser,
+            provenance: UserInputProvenance::SubAgentHandoff,
         })
         .await
         .expect("send model turn");
@@ -4238,7 +4313,7 @@ async fn yolo_mode_does_not_prompt_for_model_driven_typed_ask_rule() {
     {
         match event {
             Event::ApprovalRequired { .. } => {
-                panic!("YOLO mode must not prompt for a model-driven typed ask-rule");
+                panic!("Full Access child handoff must not prompt for an ordinary shell call");
             }
             Event::ToolCallComplete { name, result, .. } if name == "exec_shell" => {
                 saw_complete = true;
@@ -4260,25 +4335,44 @@ async fn yolo_mode_does_not_prompt_for_model_driven_typed_ask_rule() {
     assert!(saw_complete);
 }
 
-#[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn yolo_mode_still_prompts_for_background_destructive_shell() {
+async fn assert_full_access_model_tool_batch_is_blocked(
+    engine_config: EngineConfig,
+    tool_calls: Vec<(&'static str, serde_json::Value)>,
+    expected_errors: &[(&str, &str)],
+    followup_fragment: &str,
+) {
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    let _lock = lock_test_env();
-    let workspace = tempdir().expect("tempdir");
     let server = MockServer::start().await;
-
-    let tool_call_sse = concat!(
-        "data: {\"id\":\"chatcmpl-bg\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
-        "{\"index\":0,\"id\":\"call_bg\",\"type\":\"function\",\"function\":{\"name\":\"exec_shell\",",
-        "\"arguments\":\"{\\\"command\\\":\\\"rm -rf ~/\\\",\\\"background\\\":true}\"}}",
-        "]},\"finish_reason\":null}]}\n\n",
-        "data: {\"id\":\"chatcmpl-bg\",\"choices\":[{\"index\":0,\"delta\":{},",
-        "\"finish_reason\":\"tool_calls\"}]}\n\n",
-        "data: [DONE]\n\n",
-    );
+    let model_tool_calls = tool_calls
+        .iter()
+        .enumerate()
+        .map(|(index, (name, arguments))| {
+            json!({
+                "index": index,
+                "id": format!("call_full_access_{index}"),
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments.to_string(),
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let tool_delta = json!({
+        "id": "chatcmpl-full-access-blocked",
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": model_tool_calls},
+            "finish_reason": serde_json::Value::Null,
+        }],
+    });
+    let tool_finish = json!({
+        "id": "chatcmpl-full-access-blocked",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+    });
+    let tool_call_sse = format!("data: {tool_delta}\n\ndata: {tool_finish}\n\ndata: [DONE]\n\n");
     let done_sse = concat!(
         "data: {\"id\":\"chatcmpl-done\",\"choices\":[{\"index\":0,",
         "\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
@@ -4289,7 +4383,246 @@ async fn yolo_mode_still_prompts_for_background_destructive_shell() {
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .and(body_string_contains("denied by user"))
+        .and(body_string_contains(followup_fragment))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(done_sse),
+        )
+        .expect(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(tool_call_sse),
+        )
+        .expect(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let api_config = Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(server.uri()),
+        ..Config::default()
+    };
+    let (engine, handle) = Engine::new(engine_config, &api_config);
+    let run_task = tokio::spawn(engine.run());
+
+    handle
+        .send(Op::SendMessage {
+            content: "exercise the Full Access execution boundary".to_string(),
+            mode: AppMode::Agent,
+            route: resolved_route_for_test(&api_config, crate::config::DEFAULT_TEXT_MODEL),
+            compaction: Box::new(CompactionConfig::default()),
+            goal_objective: None,
+            goal_token_budget: None,
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: false,
+            allow_shell: true,
+            trust_mode: true,
+            auto_approve: true,
+            approval_mode: crate::tui::approval::ApprovalMode::Bypass,
+            translation_enabled: false,
+            show_thinking: true,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+        })
+        .await
+        .expect("send Full Access model turn");
+
+    let expected = expected_errors.iter().copied().collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    let mut saw_turn_complete = false;
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+        .await
+        .expect("timed out waiting for Full Access boundary event")
+    {
+        match event {
+            Event::ApprovalRequired { tool_name, .. } => {
+                panic!("Full Access must not open an approval modal for blocked tool {tool_name}")
+            }
+            Event::ToolCallComplete { name, result, .. }
+                if expected.contains_key(name.as_str()) =>
+            {
+                let error = result.expect_err("blocked tool must return an error");
+                let fragment = expected[name.as_str()];
+                assert!(
+                    error.to_string().contains(fragment),
+                    "unexpected {name} denial: {error:?}"
+                );
+                seen.insert(name);
+            }
+            Event::TurnComplete { status, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed);
+                saw_turn_complete = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(rx);
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+    assert_eq!(seen.len(), expected.len(), "missing blocked tool results");
+    assert!(saw_turn_complete);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn full_access_blocks_non_bypassable_registered_tools_at_engine_boundary() {
+    let _lock = lock_test_env();
+    let workspace = tempdir().expect("tempdir");
+    let marker = workspace.path().join("runtime-tool-must-not-run");
+    let marker_literal = marker
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'");
+    let start_probe =
+        format!("python3 -c \"__import__('pathlib').Path('{marker_literal}').write_text('ran')\"");
+    let rlm_probe = format!("__import__('pathlib').Path('{marker_literal}').write_text('ran')");
+    let engine_config = EngineConfig {
+        model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+        workspace: workspace.path().to_path_buf(),
+        mcp_config_path: workspace.path().join("mcp.json"),
+        snapshots_enabled: false,
+        subagents_enabled: false,
+        ..EngineConfig::default()
+    };
+    let denial = "requires explicit approval and is blocked in Full Access";
+
+    assert_full_access_model_tool_batch_is_blocked(
+        engine_config,
+        vec![
+            (
+                "start_mcp_server",
+                json!({"server": start_probe, "name": "must-not-start"}),
+            ),
+            (
+                "rlm_eval",
+                json!({"name": "missing-context", "code": rlm_probe}),
+            ),
+        ],
+        &[("start_mcp_server", denial), ("rlm_eval", denial)],
+        denial,
+    )
+    .await;
+
+    assert!(
+        !marker.exists(),
+        "blocked runtime tools must not start a process or evaluate code"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn full_access_blocks_repo_law_ask_without_prompt_or_write() {
+    let _lock = lock_test_env();
+    let workspace = tempdir().expect("tempdir");
+    let law_dir = workspace.path().join(".codewhale");
+    fs::create_dir_all(&law_dir).expect("create law directory");
+    fs::write(
+        law_dir.join("constitution.json"),
+        r#"{
+            "protected_invariants": [{
+                "text": "Release notes need human review",
+                "paths": ["CHANGELOG.md"]
+            }]
+        }"#,
+    )
+    .expect("write repo law fixture");
+    let target = workspace.path().join("CHANGELOG.md");
+    let engine_config = EngineConfig {
+        model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+        workspace: workspace.path().to_path_buf(),
+        snapshots_enabled: false,
+        subagents_enabled: false,
+        ..EngineConfig::default()
+    };
+
+    assert_full_access_model_tool_batch_is_blocked(
+        engine_config,
+        vec![(
+            "write_file",
+            json!({"path": "CHANGELOG.md", "content": "must not be written\n"}),
+        )],
+        &[(
+            "write_file",
+            "Repository law blocked tool 'write_file' in Full Access: Repo law holds this write: \"Release notes need human review\"",
+        )],
+        "Repository law blocked tool 'write_file' in Full Access: Repo law holds this write:",
+    )
+    .await;
+
+    assert!(!target.exists(), "repo-law block must prevent the write");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn auto_review_auto_resolves_hallucinated_question_without_prompting() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = lock_test_env();
+    let workspace = tempdir().expect("tempdir");
+    let server = MockServer::start().await;
+    let arguments = json!({
+        "questions": [{
+            "header": "Choice",
+            "id": "choice",
+            "question": "Which path should I take?",
+            "options": [
+                {"label": "A", "description": "Take path A"},
+                {"label": "B", "description": "Take path B"}
+            ]
+        }]
+    })
+    .to_string();
+    let tool_delta = json!({
+        "id": "chatcmpl-auto-review-question",
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_auto_review_question",
+                "type": "function",
+                "function": {
+                    "name": REQUEST_USER_INPUT_NAME,
+                    "arguments": arguments,
+                },
+            }]},
+            "finish_reason": serde_json::Value::Null,
+        }],
+    });
+    let tool_finish = json!({
+        "id": "chatcmpl-auto-review-question",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+    });
+    let tool_call_sse = format!("data: {tool_delta}\n\ndata: {tool_finish}\n\ndata: [DONE]\n\n");
+    let done_sse = concat!(
+        "data: {\"id\":\"chatcmpl-done\",\"choices\":[{\"index\":0,",
+        "\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-done\",\"choices\":[{\"index\":0,\"delta\":{},",
+        "\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains(
+            "Auto-Review does not pause for user questions",
+        ))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
@@ -4326,13 +4659,184 @@ async fn yolo_mode_still_prompts_for_background_destructive_shell() {
         },
         &api_config,
     );
-    let handle_for_approval = handle.clone();
+    let run_task = tokio::spawn(engine.run());
+
+    handle
+        .send(Op::SendMessage {
+            content: "continue autonomously".to_string(),
+            mode: AppMode::Agent,
+            route: resolved_route_for_test(&api_config, crate::config::DEFAULT_TEXT_MODEL),
+            compaction: Box::new(CompactionConfig::default()),
+            goal_objective: None,
+            goal_token_budget: None,
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: false,
+            allow_shell: true,
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: crate::tui::approval::ApprovalMode::Auto,
+            translation_enabled: false,
+            show_thinking: true,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+        })
+        .await
+        .expect("send Auto-Review model turn");
+
+    let mut saw_tool_result = false;
+    let mut saw_turn_complete = false;
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+        .await
+        .expect("timed out waiting for Auto-Review question event")
+    {
+        match event {
+            Event::UserInputRequired { .. } => {
+                panic!("Auto-Review must not emit a user question")
+            }
+            Event::ApprovalRequired { .. } => {
+                panic!("Auto-Review question guard must not become an approval")
+            }
+            Event::ToolCallComplete { name, result, .. } if name == REQUEST_USER_INPUT_NAME => {
+                let result = result.expect("question should auto-resolve successfully");
+                assert!(result.success, "{result:?}");
+                assert!(
+                    result.content.contains("continue autonomously"),
+                    "{result:?}"
+                );
+                assert_eq!(
+                    result
+                        .metadata
+                        .as_ref()
+                        .and_then(|value| value.get("auto_resolved"))
+                        .and_then(serde_json::Value::as_bool),
+                    Some(true)
+                );
+                assert_eq!(
+                    result
+                        .metadata
+                        .as_ref()
+                        .and_then(|value| value.get("permission_posture"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("auto-review")
+                );
+                saw_tool_result = true;
+            }
+            Event::TurnComplete { status, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed);
+                saw_turn_complete = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(rx);
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+    assert!(saw_tool_result);
+    assert!(saw_turn_complete);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn full_access_blocks_background_catastrophic_shell_without_prompt_or_side_effect() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = lock_test_env();
+    let workspace = tempdir().expect("tempdir");
+    let server = MockServer::start().await;
+    let victim = workspace.path().join("must-survive");
+    fs::write(&victim, "guarded\n").expect("write guarded fixture");
+    // Keep the engine-boundary regression intrinsically harmless on every
+    // runner: the quoted payload trips the same built-in catastrophic-command
+    // detector, while an execution regression would only overwrite the
+    // sentinel. The policy-level sibling tests exercise real destructive
+    // command shapes directly without ever dispatching them to a shell.
+    let command = format!("echo \"rm -rf /\" > \"{}\"", victim.display());
+    let arguments = serde_json::to_string(&json!({
+        "command": command,
+        "background": true,
+    }))
+    .expect("serialize tool arguments");
+
+    let tool_delta = json!({
+        "id": "chatcmpl-bg",
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_bg",
+                "type": "function",
+                "function": {"name": "exec_shell", "arguments": arguments},
+            }]},
+            "finish_reason": serde_json::Value::Null,
+        }],
+    });
+    let tool_finish = json!({
+        "id": "chatcmpl-bg",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+    });
+    let tool_call_sse = format!("data: {tool_delta}\n\ndata: {tool_finish}\n\ndata: [DONE]\n\n");
+    let done_sse = concat!(
+        "data: {\"id\":\"chatcmpl-done\",\"choices\":[{\"index\":0,",
+        "\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-done\",\"choices\":[{\"index\":0,\"delta\":{},",
+        "\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("destructive background/headless"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(done_sse),
+        )
+        .expect(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(tool_call_sse),
+        )
+        .expect(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let api_config = Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(server.uri()),
+        ..Config::default()
+    };
+    let (engine, handle) = Engine::new(
+        EngineConfig {
+            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            workspace: workspace.path().to_path_buf(),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            ..EngineConfig::default()
+        },
+        &api_config,
+    );
     let run_task = tokio::spawn(engine.run());
 
     handle
         .send(Op::SendMessage {
             content: "please run a background shell".to_string(),
-            mode: AppMode::Yolo,
+            mode: AppMode::Agent,
             route: resolved_route_for_test(&api_config, crate::config::DEFAULT_TEXT_MODEL),
             compaction: Box::new(CompactionConfig::default()),
             goal_objective: None,
@@ -4344,7 +4848,7 @@ async fn yolo_mode_still_prompts_for_background_destructive_shell() {
             allow_shell: true,
             trust_mode: true,
             auto_approve: true,
-            approval_mode: crate::tui::approval::ApprovalMode::Auto,
+            approval_mode: crate::tui::approval::ApprovalMode::Bypass,
             translation_enabled: false,
             show_thinking: true,
             allowed_tools: None,
@@ -4356,7 +4860,6 @@ async fn yolo_mode_still_prompts_for_background_destructive_shell() {
         .await
         .expect("send model turn");
 
-    let mut saw_approval_prompt = false;
     let mut saw_tool_result = false;
     let mut saw_complete = false;
     let mut rx = handle.rx_event.write().await;
@@ -4365,31 +4868,15 @@ async fn yolo_mode_still_prompts_for_background_destructive_shell() {
         .expect("timed out waiting for engine event")
     {
         match event {
-            Event::ApprovalRequired {
-                id,
-                tool_name,
-                description,
-                approval_force_prompt,
-                ..
-            } => {
-                saw_approval_prompt = true;
-                assert_eq!(tool_name, "exec_shell");
-                assert!(approval_force_prompt);
-                assert!(
-                    description.contains("destructive background/headless"),
-                    "unexpected approval description: {description}"
-                );
-                handle_for_approval
-                    .deny_tool_call(id)
-                    .await
-                    .expect("deny background shell");
+            Event::ApprovalRequired { .. } => {
+                panic!("Full Access safety holds must fail closed without prompting")
             }
             Event::ToolCallComplete { name, result, .. } => {
                 if name == "exec_shell" {
                     saw_tool_result = true;
-                    let err = result.expect_err("denied shell should not execute");
+                    let err = result.expect_err("blocked shell should not execute");
                     assert!(
-                        err.to_string().contains("denied by user"),
+                        err.to_string().contains("Built-in safety gate"),
                         "unexpected shell denial: {err:?}"
                     );
                 }
@@ -4406,9 +4893,13 @@ async fn yolo_mode_still_prompts_for_background_destructive_shell() {
 
     handle.send(Op::Shutdown).await.expect("shutdown engine");
     run_task.await.expect("engine task");
-    assert!(saw_approval_prompt);
     assert!(saw_tool_result);
     assert!(saw_complete);
+    assert_eq!(
+        fs::read_to_string(&victim).expect("read guarded fixture"),
+        "guarded\n",
+        "blocked command must not touch its target"
+    );
 }
 
 #[tokio::test]
@@ -5410,11 +5901,11 @@ fn mode_invariant_matrix_covers_provenance_authority_narrowing() {
         ProvenanceCase {
             name: "sub-agent handoff",
             provenance: UserInputProvenance::SubAgentHandoff,
-            expected_mode: AppMode::Agent,
-            expected_trust: false,
-            expected_auto: false,
-            expected_approval: ApprovalMode::Suggest,
-            expect_status: true,
+            expected_mode: AppMode::Yolo,
+            expected_trust: true,
+            expected_auto: true,
+            expected_approval: ApprovalMode::Bypass,
+            expect_status: false,
         },
         ProvenanceCase {
             name: "imported transcript",
@@ -6992,7 +7483,7 @@ fn turn_metadata_includes_auto_model_route() {
 }
 
 #[test]
-fn provenance_gate_preserves_standing_yolo_only_for_runtime_continuations() {
+fn provenance_gate_preserves_standing_yolo_for_runtime_and_subagent_continuations() {
     let all_provenances = [
         UserInputProvenance::ExternalUser,
         UserInputProvenance::Runtime,
@@ -7004,6 +7495,7 @@ fn provenance_gate_preserves_standing_yolo_only_for_runtime_continuations() {
     let inheriting_provenances = [
         UserInputProvenance::ExternalUser,
         UserInputProvenance::Runtime,
+        UserInputProvenance::SubAgentHandoff,
     ];
 
     for provenance in all_provenances {
@@ -7081,6 +7573,27 @@ fn provenance_gate_never_invents_auto_authority_for_non_yolo_sessions() {
         );
         assert!(policy.status.is_none(), "{provenance:?}");
     }
+}
+
+#[test]
+fn full_access_posture_normalizes_a_stale_auto_approve_bit() {
+    let policy = effective_input_policy(
+        UserInputProvenance::SubAgentHandoff,
+        AppMode::Agent,
+        "continue",
+        true,
+        true,
+        false,
+        crate::tui::approval::ApprovalMode::Bypass,
+    );
+
+    assert_eq!(policy.mode, AppMode::Agent);
+    assert_eq!(
+        policy.approval_mode,
+        crate::tui::approval::ApprovalMode::Bypass
+    );
+    assert!(policy.auto_approve);
+    assert!(policy.status.is_none());
 }
 
 #[test]
@@ -7267,7 +7780,7 @@ fn turn_metadata_projects_effective_permission_question_discipline() {
         (
             ApprovalMode::Auto,
             "Auto-Review",
-            "Proceed on reversible implementation details",
+            "Do not ask the user questions or pause for a user decision",
         ),
         (
             ApprovalMode::Bypass,
@@ -7308,7 +7821,7 @@ fn turn_metadata_projects_effective_permission_question_discipline() {
 }
 
 #[test]
-fn turn_metadata_uses_provenance_narrowed_permission_posture() {
+fn turn_metadata_preserves_standing_full_access_for_subagent_handoff() {
     use crate::tui::approval::ApprovalMode;
 
     let tmp = tempdir().expect("tempdir");
@@ -7319,7 +7832,7 @@ fn turn_metadata_uses_provenance_narrowed_permission_posture() {
     let (mut engine, _handle) = Engine::new(config, &Config::default());
     let authority = effective_input_policy(
         UserInputProvenance::SubAgentHandoff,
-        AppMode::Yolo,
+        AppMode::Agent,
         "continue from child",
         true,
         true,
@@ -7340,9 +7853,13 @@ fn turn_metadata_uses_provenance_narrowed_permission_posture() {
         panic!("expected text turn metadata");
     };
 
+    // Act mode and the permission posture are independent: the child handoff
+    // must keep the visible Act mode and the standing Full Access authority.
     assert!(text.contains("Current mode: agent"), "{text}");
-    assert!(text.contains("Current permission posture: Ask"), "{text}");
-    assert!(!text.contains("Current permission posture: Full Access"));
+    assert!(
+        text.contains("Current permission posture: Full Access"),
+        "{text}"
+    );
     assert!(
         text.contains("Input authority: non_authoritative"),
         "{text}"

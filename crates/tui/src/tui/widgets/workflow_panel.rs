@@ -906,11 +906,11 @@ impl WorkflowPanel {
                 Style::default().fg(palette::TEXT_MUTED),
             )));
         } else if self.lifecycle.is_terminal() {
+            let details = crate::tui::shell_key_routing::tool_details_chord();
+            let transcript_hint = tr(self.locale, MessageId::WorkflowTranscriptDetails)
+                .replace("{details}", details.as_ref());
             lines.push(Line::from(Span::styled(
-                truncate_line_to_width(
-                    "transcript: full run JSON available via tool details (v)",
-                    content_width,
-                ),
+                truncate_line_to_width(&transcript_hint, content_width),
                 Style::default().fg(palette::TEXT_MUTED),
             )));
         }
@@ -2258,6 +2258,11 @@ mod tests {
         assert!(joined.contains("children:"), "{joined}");
         assert!(joined.contains("result:"), "{joined}");
         assert!(joined.contains("found 3 call sites"), "{joined}");
+        assert!(
+            joined.contains(crate::tui::shell_key_routing::tool_details_chord().as_ref()),
+            "history details hint must use the platform chord: {joined}"
+        );
+        assert!(!joined.contains("details (v)"), "{joined}");
     }
 
     #[test]

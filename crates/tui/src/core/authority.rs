@@ -153,6 +153,13 @@ pub(crate) fn effective_input_policy(
         }
     }
 
+    // The named permission posture is authoritative. Normalize legacy or
+    // host inputs that carry `Bypass` with a stale false auto-approve bit so
+    // every engine surface observes the same Full Access contract.
+    if approval_mode == ApprovalMode::Bypass {
+        auto_approve = true;
+    }
+
     TurnAuthority {
         mode,
         allow_shell,
@@ -170,8 +177,19 @@ pub(crate) fn provenance_can_inherit_standing_auto_authority(
 ) -> bool {
     matches!(
         provenance,
-        UserInputProvenance::ExternalUser | UserInputProvenance::Runtime
+        UserInputProvenance::ExternalUser
+            | UserInputProvenance::Runtime
+            | UserInputProvenance::SubAgentHandoff
     )
+}
+
+/// Whether the active permission posture may pause the turn for a user
+/// decision. Auto-Review is the fully autonomous posture: it must decide from
+/// available context and keep moving. Tool approval and user-question policy
+/// stay deliberately separate in every other posture.
+#[must_use]
+pub(crate) fn permission_posture_allows_questions(approval_mode: ApprovalMode) -> bool {
+    approval_mode != ApprovalMode::Auto
 }
 
 #[must_use]

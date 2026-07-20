@@ -1797,12 +1797,12 @@ impl Renderable for ComposerWidget<'_> {
     }
 }
 
-/// Codex-style full-screen approval takeover (#129).
+/// Compact, bottom-anchored approval card.
 ///
 /// The widget reads its selected option and locale directly from the
-/// [`ApprovalView`]. Rendering reflows to fill most of the transcript
-/// area instead of a centered popup; on small terminals it falls back to
-/// a 65×22 card so existing snapshot tests still see a coherent layout.
+/// [`ApprovalView`]. Rendering preserves transcript context while reserving
+/// the complete action set and at least one load-bearing command/preview row
+/// on ordinary terminal sizes.
 pub struct ApprovalWidget<'a> {
     request: &'a ApprovalRequest,
     view: &'a ApprovalView,
@@ -1907,8 +1907,19 @@ impl<'a> ApprovalWidget<'a> {
                 let is_change_preview = matches!(detail.label.as_str(), "Preview" | "预览");
                 if let Some(shell_lines) = detail.shell_lines.as_deref() {
                     let command_width = area.width.saturating_sub(10) as usize;
+                    // A short approval band has room for only one detail row
+                    // before its truncation hint. Project the most useful
+                    // command/change into that row instead of spending it on
+                    // setup (`cd`, `set`) or diff metadata. The complete,
+                    // original-order value remains available in the details
+                    // pager.
+                    let inline_shell_lines = prioritize_inline_shell_lines(
+                        shell_lines,
+                        is_change_preview,
+                        area.height <= 24,
+                    );
                     // Bound every multi-line preview so one huge command cannot
-                    // grow the band without limit; the [v] pager shows the rest.
+                    // grow the band without limit; the details chord opens the rest.
                     let max_rows = if is_change_preview {
                         if self.request.intent_summary.is_some() {
                             Some(3)
@@ -1921,7 +1932,7 @@ impl<'a> ApprovalWidget<'a> {
                     push_shell_command_lines(
                         &mut body,
                         &detail.label,
-                        shell_lines,
+                        &inline_shell_lines,
                         command_width.max(20),
                         max_rows,
                     );
@@ -1983,7 +1994,7 @@ impl<'a> ApprovalWidget<'a> {
 
         // Secondary context: what it is and what it touches. Only critical
         // prompts carry the full about/impact/category dossier by default —
-        // everything stays one `v` away in the details pager. Keep a single
+        // everything stays one details chord away in the pager. Keep a single
         // About line as fallback context when nothing else was rendered.
         if critical || details.is_empty() {
             body.push(Line::from(vec![
@@ -2166,9 +2177,10 @@ impl Renderable for ApprovalWidget<'_> {
         };
 
         let mut hitboxes = Vec::new();
-        let option_count = controls.len().saturating_sub(4);
+        let option_count =
+            approval_options_for_request(self.request, self.request.risk, self.view.locale()).len();
         for index in 0..option_count {
-            let first_line = 2 + index;
+            let first_line = 1 + index;
             let y_offset = measure_wrapped_rows(&controls[..first_line], region.width);
             let next_offset = measure_wrapped_rows(&controls[..first_line + 1], region.width);
             let y = control_rect.y.saturating_add(y_offset);
@@ -2187,7 +2199,7 @@ impl Renderable for ApprovalWidget<'_> {
         let body_rows = measure_wrapped_rows(&body, region.width);
         if body_rows > body_height && body_height > 0 {
             // Body does not fit (short terminal): show as much as we can and
-            // point at the params pager ([v]) for the full content.
+            // point at the params pager through the platform-aware details chord.
             let shown = body_height.saturating_sub(1);
             if shown > 0 {
                 Paragraph::new(body).wrap(Wrap { trim: false }).render(
@@ -2221,8 +2233,10 @@ impl Renderable for ApprovalWidget<'_> {
 }
 
 /// Bottom-anchored band the inline approval prompt occupies within `area`.
-/// Sized to the measured content but never taller than the frame, and always
-/// tall enough to show the reserved controls (#3799).
+/// Sized to the measured content, capped to half the frame like the compact
+/// permission surfaces in peer coding agents, and always tall enough to show
+/// the reserved controls (#3799). Full details remain available through the
+/// platform-aware details chord.
 fn inline_region_for(area: Rect, body: &[Line<'static>], controls: &[Line<'static>]) -> Rect {
     if area.width == 0 || area.height == 0 {
         return Rect {
@@ -2237,9 +2251,27 @@ fn inline_region_for(area: Rect, body: &[Line<'static>], controls: &[Line<'stati
     let control_rows = measure_wrapped_rows(controls, width);
     // +1 for the top separator rule.
     let desired = 1u16.saturating_add(body_rows).saturating_add(control_rows);
-    // Never shrink below the rule + controls; never exceed the frame.
-    let min_height = 1u16.saturating_add(control_rows).min(area.height);
-    let height = desired.clamp(min_height, area.height);
+    // Never shrink below the rule + controls. At normal terminal heights,
+    // reserve four body rows: header, detail label, at least one command or
+    // preview row, and the truncation hint. Half a viewport is the preferred
+    // cap; up to three quarters is allowed only when necessary to retain that
+    // load-bearing preview on a short frame. Truly tiny frames prioritize the
+    // complete action set and details chord.
+    let controls_floor = 1u16.saturating_add(control_rows).min(area.height);
+    let preview_rows = if area.height >= 16 {
+        body_rows.min(4)
+    } else {
+        0
+    };
+    let preview_floor = controls_floor.saturating_add(preview_rows).min(area.height);
+    let preferred_cap = area.height.div_ceil(2);
+    let short_frame_cap = area.height.saturating_mul(3).div_ceil(4);
+    let max_height = preferred_cap
+        .max(preview_floor.min(short_frame_cap))
+        .max(controls_floor)
+        .min(area.height);
+    let min_height = controls_floor;
+    let height = desired.clamp(min_height, max_height);
     Rect {
         x: area.x,
         y: area.y.saturating_add(area.height.saturating_sub(height)),
@@ -2248,22 +2280,17 @@ fn inline_region_for(area: Rect, body: &[Line<'static>], controls: &[Line<'stati
     }
 }
 
-/// Terminal rows `lines` occupy when wrapped to `width`, using display width
-/// (CJK/emoji aware). The controls reserve a trailing blank row of headroom so
-/// that even if ratatui word-wrap rounds up past this estimate, the action row
-/// is never clipped.
+/// Terminal rows `lines` occupy under the exact ratatui word-wrap used by the
+/// renderer. Exact measurement keeps localized controls and their mouse
+/// hitboxes aligned without padding the compact approval band.
 fn measure_wrapped_rows(lines: &[Line<'static>], width: u16) -> u16 {
     if width == 0 {
         return lines.len() as u16;
     }
-    let w = width as usize;
-    lines
-        .iter()
-        .map(|line| {
-            let dw: usize = line.spans.iter().map(|s| s.content.as_ref().width()).sum();
-            dw.div_ceil(w).max(1) as u16
-        })
-        .fold(0u16, |acc, rows| acc.saturating_add(rows))
+    let rows = Paragraph::new(lines.to_vec())
+        .wrap(Wrap { trim: false })
+        .line_count(width);
+    u16::try_from(rows).unwrap_or(u16::MAX)
 }
 
 /// Build the always-visible approval controls: a "proceed?" prompt, the
@@ -2277,8 +2304,7 @@ fn build_approval_controls(
     accent: Color,
     shortcut: Color,
 ) -> Vec<Line<'static>> {
-    let mut controls: Vec<Line<'static>> = Vec::with_capacity(8);
-    controls.push(Line::from(""));
+    let mut controls: Vec<Line<'static>> = Vec::with_capacity(6);
     controls.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
@@ -2326,9 +2352,6 @@ fn build_approval_controls(
             Span::raw("")
         },
     ]));
-    // Trailing blank: bottom padding plus a row of headroom so word-wrap of the
-    // hint line can never push a control row out of the reserved region.
-    controls.push(Line::from(""));
     controls
 }
 
@@ -2339,11 +2362,9 @@ fn approval_proceed_question(locale: Locale) -> &'static str {
     }
 }
 
-fn approval_truncation_hint(locale: Locale) -> &'static str {
-    match locale {
-        Locale::ZhHans => "  … 已截断 · 按 [v] 查看完整内容",
-        _ => "  … truncated · press [v] for full details",
-    }
+fn approval_truncation_hint(locale: Locale) -> Cow<'static, str> {
+    let details = crate::tui::shell_key_routing::tool_details_chord();
+    Cow::Owned(tr(locale, MessageId::ApprovalTruncationHint).replace("{details}", details.as_ref()))
 }
 
 /// Approval palette per risk variant.
@@ -2565,6 +2586,114 @@ fn push_shell_command_lines(
     }
 }
 
+/// Put one representative command/change first for compact inline rendering.
+/// This is a display-only projection: approval parameters and the details
+/// pager retain the exact original order.
+fn prioritize_inline_shell_lines(
+    command_lines: &[String],
+    is_change_preview: bool,
+    compact: bool,
+) -> Vec<String> {
+    if !compact || command_lines.len() < 2 {
+        return command_lines.to_vec();
+    }
+
+    let representative = if is_change_preview {
+        command_lines
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, line)| (preview_line_priority(line), std::cmp::Reverse(*index)))
+            .map(|(index, _)| index)
+    } else {
+        command_lines
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, line)| (command_line_priority(line), std::cmp::Reverse(*index)))
+            .map(|(index, _)| index)
+    };
+    let Some(representative) = representative.filter(|index| *index > 0) else {
+        return command_lines.to_vec();
+    };
+
+    let mut projected = Vec::with_capacity(command_lines.len());
+    projected.push(command_lines[representative].clone());
+    projected.extend(
+        command_lines
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != representative)
+            .map(|(_, line)| line.clone()),
+    );
+    projected
+}
+
+fn preview_line_priority(line: &str) -> u8 {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
+        4
+    } else if trimmed.starts_with('-') && !trimmed.starts_with("---") {
+        3
+    } else if trimmed.starts_with("@@") {
+        2
+    } else if trimmed.starts_with("diff ")
+        || trimmed.starts_with("---")
+        || trimmed.starts_with("+++")
+    {
+        0
+    } else {
+        1
+    }
+}
+
+fn command_line_priority(line: &str) -> u8 {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return 0;
+    }
+
+    let tokens = trimmed
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')'))
+        .filter(|token| !token.is_empty())
+        .map(|token| token.rsplit('/').next().unwrap_or(token))
+        .collect::<Vec<_>>();
+    if tokens.iter().any(|token| {
+        matches!(
+            *token,
+            "rm" | "rmdir"
+                | "unlink"
+                | "mv"
+                | "dd"
+                | "chmod"
+                | "chown"
+                | "kill"
+                | "pkill"
+                | "shutdown"
+                | "reboot"
+                | "mkfs"
+        )
+    }) || tokens.windows(2).any(|pair| {
+        matches!(
+            pair,
+            ["git", "push"] | ["cargo", "publish"] | ["npm", "publish"]
+        )
+    }) || trimmed.contains('>')
+    {
+        return 4;
+    }
+
+    let first = tokens.first().copied().unwrap_or_default();
+    if matches!(
+        first,
+        "cd" | "pushd" | "popd" | "set" | "export" | "unset" | "pwd" | ":" | "true"
+    ) {
+        1
+    } else if matches!(first, "echo" | "printf") {
+        2
+    } else {
+        3
+    }
+}
+
 fn push_destructive_approval_semantics(
     lines: &mut Vec<Line<'static>>,
     locale: Locale,
@@ -2624,12 +2753,7 @@ fn destructive_approval_semantics(locale: Locale) -> [(&'static str, &'static st
 fn footer_controls(locale: Locale) -> Cow<'static, str> {
     // Platform-aware details chord (⌥V on macOS, Alt+V elsewhere). Bare `v`
     // is never advertised as a details shortcut (TUI-DOG-002).
-    let details = crate::tui::shell_key_routing::display_chord(
-        crate::tui::shell_key_routing::binding(
-            crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
-        )
-        .footer_chord,
-    );
+    let details = crate::tui::shell_key_routing::tool_details_chord();
     Cow::Owned(tr(locale, MessageId::ApprovalControlsHint).replace("{details}", details.as_ref()))
 }
 
@@ -4134,13 +4258,14 @@ mod tests {
         ACTIVE_REVISION_DOMAIN, ApprovalWidget, COMPOSER_PANEL_HEIGHT, COMPOSER_PLACEHOLDER,
         ChatWidget, ComposerWidget, Renderable, SlashMenuEntry, active_entry_revision,
         ambient_ping_pong, apply_detail_target_highlight, apply_selection_to_line,
-        apply_send_flash, approval_palette, build_empty_state_lines, composer_content_geometry,
-        composer_empty_hint_text, composer_height, composer_max_height, composer_min_input_rows,
-        composer_top_padding, cursor_row_col, empty_composer_visual_rows, fish_flee_offset,
-        fish_heading, fish_mark, history_entry_revision, layout_input, layout_input_with_scroll,
-        pad_lines_to_bottom, placeholder_visual_lines, push_command_entry, receipt_is_settling,
-        revision_in_domain, should_render_empty_state, slash_completion_hints,
-        tool_run_summary_revision, wrap_input_lines, wrap_input_lines_for_mouse, wrap_text,
+        apply_send_flash, approval_palette, approval_truncation_hint, build_empty_state_lines,
+        composer_content_geometry, composer_empty_hint_text, composer_height, composer_max_height,
+        composer_min_input_rows, composer_top_padding, cursor_row_col, empty_composer_visual_rows,
+        fish_flee_offset, fish_heading, fish_mark, history_entry_revision, layout_input,
+        layout_input_with_scroll, pad_lines_to_bottom, placeholder_visual_lines,
+        push_command_entry, receipt_is_settling, revision_in_domain, should_render_empty_state,
+        slash_completion_hints, tool_run_summary_revision, wrap_input_lines,
+        wrap_input_lines_for_mouse, wrap_text,
     };
     use crate::config::{ApiProvider, Config};
     use crate::localization::Locale;
@@ -6514,6 +6639,85 @@ mod tests {
     }
 
     #[test]
+    fn approval_inline_band_caps_at_half_the_viewport_and_keeps_actions_visible() {
+        let command = (0..24)
+            .map(|index| format!("printf command-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let request = crate::tui::approval::ApprovalRequest::new(
+            "approval-long",
+            "exec_shell",
+            "Run a long shell command",
+            &serde_json::json!({ "command": command }),
+            "exec_shell:long",
+        );
+        let view = crate::tui::approval::ApprovalView::new(request.clone());
+        let widget = ApprovalWidget::new(&request, &view);
+        let area = Rect::new(0, 0, 100, 30);
+        let region = widget.inline_region(area);
+
+        assert_eq!(region.bottom(), area.bottom());
+        assert!(region.height <= area.height.div_ceil(2), "{region:?}");
+
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        let rendered = buffer_text(&buf, area);
+        assert!(rendered.contains("[1 / y]"), "{rendered}");
+        assert!(rendered.contains("[Esc]"), "{rendered}");
+        assert!(rendered.contains("truncated"), "{rendered}");
+    }
+
+    #[test]
+    fn approval_compact_tiers_preserve_command_before_falling_back_to_details() {
+        let request = crate::tui::approval::ApprovalRequest::new(
+            "approval-tiers",
+            "exec_shell",
+            "Print a localized verification marker",
+            &serde_json::json!({ "command": "printf '安全確認'" }),
+            "exec_shell:printf",
+        );
+        let view = crate::tui::approval::ApprovalView::new(request.clone());
+        let widget = ApprovalWidget::new(&request, &view);
+
+        for area in [Rect::new(0, 0, 80, 24), Rect::new(0, 0, 60, 16)] {
+            let region = widget.inline_region(area);
+            assert_eq!(region.bottom(), area.bottom());
+            assert!(region.height < area.height, "{area:?}: {region:?}");
+
+            let mut buf = Buffer::empty(area);
+            widget.render(area, &mut buf);
+            let rendered = buffer_text(&buf, area);
+            assert!(rendered.contains("Command:"), "{area:?}: {rendered}");
+            for marker in ['安', '全', '確', '認'] {
+                assert!(rendered.contains(marker), "{area:?}: {rendered}");
+            }
+            assert!(rendered.contains("[1 / y]"), "{area:?}: {rendered}");
+            assert!(rendered.contains("[Esc]"), "{area:?}: {rendered}");
+        }
+
+        let tiny = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(tiny);
+        widget.render(tiny, &mut buf);
+        let rendered = buffer_text(&buf, tiny);
+        assert!(rendered.contains("[1 / y]"), "{rendered}");
+        assert!(rendered.contains("[Esc]"), "{rendered}");
+        assert!(
+            rendered.contains(crate::tui::shell_key_routing::tool_details_chord().as_ref()),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn approval_truncation_hint_uses_platform_details_chord_in_every_locale() {
+        let details = crate::tui::shell_key_routing::tool_details_chord();
+        for locale in Locale::shipped() {
+            let hint = approval_truncation_hint(*locale);
+            assert!(hint.contains(details.as_ref()), "{locale:?}: {hint}");
+            assert!(!hint.contains("[v]"), "{locale:?}: {hint}");
+        }
+    }
+
+    #[test]
     fn repo_law_approval_has_distinct_authority_grammar() {
         let request = crate::tui::approval::ApprovalRequest::new(
             "approval-law",
@@ -6532,7 +6736,7 @@ mod tests {
         let rendered = buffer_text(&buf, area);
         assert!(rendered.contains("REPO LAW"), "{rendered}");
         assert!(rendered.contains("Repository constitution"), "{rendered}");
-        assert!(rendered.contains("even in Full Access"), "{rendered}");
+        assert!(rendered.contains("approval-gated postures"), "{rendered}");
         assert!(rendered.contains("Cargo.toml"), "{rendered}");
         assert!((0..area.height).any(|y| {
             let cell = &buf[(1, y)];
@@ -6944,9 +7148,15 @@ diff --git a/src/b.rs b/src/b.rs\n\
         widget.render(area, &mut buf);
         let rendered = buffer_text(&buf, area);
 
-        // The change preview renders (bounded), and the action row is reserved
-        // off the bottom of the band so it can never be clipped (#3799).
+        // At 20 rows the compact band preserves both a load-bearing preview
+        // row and the complete action set.
         assert!(rendered.contains("Preview:"), "{rendered}");
+        assert!(rendered.contains("+new"), "{rendered}");
+        assert!(rendered.contains("truncated"), "{rendered}");
+        assert!(
+            rendered.contains(crate::tui::shell_key_routing::tool_details_chord().as_ref()),
+            "{rendered}"
+        );
         assert!(rendered.contains("[1 / y]"), "{rendered}");
         assert!(rendered.contains("[3 / d / n]"), "{rendered}");
     }
@@ -7010,10 +7220,15 @@ diff --git a/src/b.rs b/src/b.rs\n\
             !rendered.contains("Impact: Command"),
             "command should only render in the command block:\n{rendered}"
         );
-        // The command is the prioritized body content, so it stays visible even
-        // when the band is short and secondary context scrolls away.
+        // The compact band keeps the transcript visible without hiding the
+        // load-bearing command; full content remains one details chord away.
         assert!(rendered.contains("Command:"), "{rendered}");
         assert!(rendered.contains("cargo clippy"), "{rendered}");
+        assert!(rendered.contains("truncated"), "{rendered}");
+        assert!(
+            rendered.contains(crate::tui::shell_key_routing::tool_details_chord().as_ref()),
+            "{rendered}"
+        );
         // Action row is reserved off the bottom and always visible (#3799).
         assert!(rendered.contains("[1 / y]"), "{rendered}");
         assert!(rendered.contains("[2 / a]"), "{rendered}");

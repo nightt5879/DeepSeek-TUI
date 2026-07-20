@@ -162,8 +162,9 @@ An enforced entry has this shape:
 - `paths` — workspace-relative globs (globset syntax, e.g. `crates/protocol/**`,
   `**/secrets.toml`, `CHANGELOG.md`). An object with no usable `paths` stays
   advisory-only despite the object shape.
-- `action` — optional, defaults to `ask`. `ask` **force-prompts** for approval;
-  `block` **denies the write outright**.
+- `action` — optional, defaults to `ask`. `ask` force-prompts in Ask and
+  Auto-Review; in Full Access it denies the protected write without opening a
+  modal. `block` **denies the write outright** in every posture.
 
 Semantics:
 
@@ -171,8 +172,9 @@ Semantics:
   holds — a crafted constitution can never grant authority or weaken a gate
   above it.
 - **Not bypassable by mode.** Like the built-in safety floor, an `ask` hold
-  force-prompts in every mode, including Full Access; `block` always denies. Mode
-  cannot turn a hold off.
+  force-prompts in Ask and Auto-Review. Full Access never opens approval
+  modals, so the same hold fails closed as a hard block; `block` always denies.
+  Mode cannot turn a hold off.
 - **Repo-local only.** Only the repo's `.codewhale/constitution.json`
   participates. The user-global constitution stays advisory prose and never
   reaches this mechanism.
@@ -881,8 +883,9 @@ unrecognized `decision` string logs a warning and is treated as allow.
 
 - `deny` blocks the tool; the model receives a permission-denied tool
   result containing `reason`.
-- `ask` forces the interactive approval prompt even for tools that
-  would otherwise auto-run.
+- `ask` forces the interactive approval prompt in Ask and Auto-Review even for
+  tools that would otherwise auto-run. Full Access does not open tool-approval
+  prompts, so hook `ask` does not downgrade that posture.
 - `updatedInput` must be a JSON object; it replaces the tool input
   before execution. When several hooks supply it, the last hook wins.
 - `additionalContext` is appended to the tool result sent back to the
@@ -1316,12 +1319,13 @@ If you are upgrading from older releases:
   action = "session.compact"
   ```
 - `[auto_review]` (table, optional): deterministic tool-call review policy.
-  This layer sits on top of existing approval modes; it can force a prompt or
-  block a tool call, but it is not an auto-push, auto-merge, or hosted review
-  service. Block rules are checked first, then the built-in safety floor, then
-  allow rules. The safety floor still holds publish-like actions and
-  destructive background/headless actions for review even if an allow rule
-  matches.
+  This layer sits on top of existing approval modes; it can hold or block a
+  tool call, but it is not an auto-push, auto-merge, or hosted review service.
+  Block rules are checked first, then the built-in safety floor, then allow
+  rules. In Ask and Auto-Review, a safety hold opens approval; in Full Access
+  or a non-interactive `never` posture it fails closed as a hard block. The
+  safety floor still covers publish-like actions and destructive
+  background/headless actions even if an allow rule matches.
 
   ```toml
   [auto_review]

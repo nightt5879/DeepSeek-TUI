@@ -333,13 +333,15 @@ impl AutoReviewPolicy {
     }
 }
 
-/// The non-bypassable floor beneath rules and modes. It keys on
+/// The non-bypassable floor beneath rules and modes. Ask and Auto-Review
+/// surface a hold for approval; Full Access and other non-interactive
+/// approval postures convert the same hold into a hard block. It keys on
 /// `ToolActionKind` — what the call actually does — not on `RiskLevel`,
 /// whose `Destructive` bucket means "not provably read-only" and exists for
 /// modal styling. Keying the floor on that bucket held ordinary background
 /// test runs and read-only sub-agent fanout for durable review even in YOLO
 /// (#3883). Genuinely destructive, secret-touching, and publish-like actions
-/// still hold in every mode.
+/// remain enforced in every mode.
 fn safety_floor(ctx: &AutoReviewContext<'_>) -> Option<AutoReviewDecision> {
     match (ctx.action_kind, ctx.run_origin) {
         // Full Access (Bypass) means exactly that: the user granted publish

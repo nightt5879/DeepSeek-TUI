@@ -294,9 +294,9 @@ struct EnforcedInvariant {
     action: RepoLawAction,
 }
 
-/// Enforcement level for a protected path. `Ask` force-prompts (in every
-/// mode, including YOLO — law can add holds, never remove them); `Block`
-/// denies outright.
+/// Enforcement level for a protected path. `Ask` force-prompts in
+/// approval-gated postures and fails closed without a modal in Full Access;
+/// `Block` denies outright in every posture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RepoLawAction {

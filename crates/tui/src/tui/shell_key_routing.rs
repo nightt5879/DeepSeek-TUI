@@ -67,6 +67,12 @@ pub fn binding(id: ShellBindingId) -> &'static ShellBinding {
         .expect("shell binding catalog is exhaustive")
 }
 
+/// Platform-aware chord for opening complete tool or approval details.
+#[must_use]
+pub fn tool_details_chord() -> Cow<'static, str> {
+    display_chord(binding(ShellBindingId::ToolDetails).footer_chord)
+}
+
 /// Render a portable `Alt+X` chord for the current platform. macOS shows
 /// `⌥X` — never `Alt` or `Cmd` (TUI-DOG-002 acceptance).
 #[must_use]

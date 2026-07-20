@@ -770,7 +770,7 @@ impl Engine {
                 "Tool approvals and user decisions are separate. Ask a concise question when an unresolved choice materially affects authority, cost, requested scope, or outcome; otherwise continue under the active approval policy."
             }
             ApprovalMode::Auto => {
-                "Proceed on reversible implementation details and minimize interruptions. Ask one concise question before an unresolved choice materially changes authority, cost, requested scope, or outcome; do not suppress a necessary question merely because a tool can run automatically."
+                "Auto-Review is fully autonomous. Do not ask the user questions or pause for a user decision. Resolve ambiguity from the available context, choose the safest reversible interpretation that still advances the request, and continue; if no safe in-scope action exists, report the constraint without opening a question prompt."
             }
             ApprovalMode::Bypass => {
                 "Tool calls do not need approval, but Full Access does not authorize invented intent. Ask one concise, deliberate question when a consequential choice cannot be recovered safely from context; otherwise proceed autonomously within the current sandbox, repository, and managed-policy boundaries."
@@ -1545,8 +1545,9 @@ impl Engine {
         self.config.allow_shell = authority.allow_shell;
         self.session.trust_mode = authority.trust_mode;
         self.config.trust_mode = authority.trust_mode;
-        self.session.auto_approve = authority.auto_approve;
         self.session.approval_mode = authority.approval_mode_for_session();
+        self.session.auto_approve = authority.auto_approve
+            || self.session.approval_mode == crate::tui::approval::ApprovalMode::Bypass;
     }
 
     /// Run the engine event loop
@@ -3074,6 +3075,10 @@ impl Engine {
                 self.config.allowed_tools.as_deref(),
                 self.config.disallowed_tools.as_deref(),
             );
+            filter_tool_catalog_for_permission_posture(
+                &mut catalog,
+                input_policy.approval_mode_for_session(),
+            );
             catalog
         });
         let tool_catalog_for_event = tools.clone();
@@ -4275,7 +4280,15 @@ pub(super) fn auto_review_plan_decision(
                 "Built-in safety gate requires approval: {}",
                 decision.reason
             );
-            if matches!(approval_mode, crate::tui::approval::ApprovalMode::Never) {
+            if matches!(
+                approval_mode,
+                crate::tui::approval::ApprovalMode::Never
+                    | crate::tui::approval::ApprovalMode::Bypass
+            ) {
+                // Never and Full Access are both non-interactive postures for
+                // approval holds. Full Access auto-runs ordinary calls, but a
+                // non-bypassable safety floor fails closed instead of opening
+                // a contradictory modal or being silently auto-approved.
                 AutoReviewPlanDecision::Block(reason)
             } else {
                 AutoReviewPlanDecision::ForcePrompt(reason)
@@ -4588,6 +4601,18 @@ fn filter_tool_catalog_for_gates(
         !turn_loop::command_denies_tool(disallowed_tools, &tool.name)
             && turn_loop::command_allows_tool(allowed_tools, &tool.name)
     });
+}
+
+/// Auto-Review is the one fully autonomous posture. Hiding the question tool
+/// keeps both the eager and deferred/tool-search surfaces aligned with the
+/// runtime question guard in `turn_loop`.
+fn filter_tool_catalog_for_permission_posture(
+    catalog: &mut Vec<Tool>,
+    approval_mode: crate::tui::approval::ApprovalMode,
+) {
+    if !super::authority::permission_posture_allows_questions(approval_mode) {
+        catalog.retain(|tool| tool.name != REQUEST_USER_INPUT_NAME);
+    }
 }
 
 use self::approval::{ApprovalDecision, ApprovalResult, UserInputDecision};

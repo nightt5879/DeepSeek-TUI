@@ -10,8 +10,9 @@
 //!
 //! - Law can only ADD holds. There is no allow/widen shape in the schema, so
 //!   a crafted constitution cannot grant authority.
-//! - `ask` force-prompts in every mode, including YOLO — like the built-in
-//!   safety floor, law is not bypassable by mode. `block` denies outright.
+//! - `ask` force-prompts in approval-gated postures. Full Access never opens
+//!   tool-approval prompts, so the same law fails closed there. `block` denies
+//!   outright in every posture.
 //! - Any failure (missing file, parse error, bad glob) degrades to fewer or
 //!   zero rules — never a poisoned gate, never a hold on unprotected paths.
 //! - Only the repo-local constitution participates. The user-global
@@ -33,7 +34,8 @@ const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "apply_patch", "fim_ed
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RepoLawPlanDecision {
-    /// Force an approval prompt naming the law, in every mode.
+    /// Request a policy-forced approval naming the law. The engine converts
+    /// this to a hard block in non-interactive Full Access.
     ForcePrompt(String),
     /// Deny the call outright, naming the law.
     Block(String),

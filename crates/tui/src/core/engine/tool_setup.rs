@@ -39,13 +39,22 @@ impl Engine {
     ) -> ToolRegistryBuilder {
         let shell_policy = shell_policy_for_mode(mode, self.session.allow_shell);
         if mode != AppMode::Plan {
-            return ToolRegistryBuilder::new().with_agent_runtime_surface(
+            let mut builder = ToolRegistryBuilder::new().with_agent_runtime_surface(
                 self.deepseek_client.clone(),
                 self.session.model.clone(),
                 self.agent_tool_surface_options(shell_policy),
                 todo_list,
                 plan_state,
             );
+            // `start_mcp_server` belongs to every executable mode. Keep its
+            // handler aligned with the model catalog, which always loads the
+            // tool while MCP is enabled. The former early return registered
+            // it only in Plan mode, so Agent/Full Access advertised a tool
+            // that could never cross the execution boundary.
+            if let Some(ref pool) = self.mcp_pool {
+                builder = builder.with_runtime_mcp_tool(Arc::clone(pool));
+            }
+            return builder;
         }
 
         let mut builder = {
