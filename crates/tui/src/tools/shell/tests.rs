@@ -1892,18 +1892,26 @@ async fn default_cwd_uses_context_workspace_not_shell_manager_default() {
         // ...but whose ShellManager's default_workspace is sm_dir.
         .with_shell_manager(new_shared_shell_manager(sm_dir.path().to_path_buf()));
 
+    // Assert directory identity through marker files instead of comparing the
+    // shell's printed path. PowerShell and `canonicalize` can spell the same
+    // Windows path differently (for example, with a verbatim-path prefix).
+    let command = if cfg!(windows) {
+        "if (Test-Path -LiteralPath 'I_AM_CTX_DIR') { Write-Output 'context-workspace' } elseif (Test-Path -LiteralPath 'I_AM_SM_DIR') { Write-Output 'manager-workspace' } else { Write-Output 'missing-workspace' }"
+    } else {
+        "if [ -f I_AM_CTX_DIR ]; then printf 'context-workspace'; elif [ -f I_AM_SM_DIR ]; then printf 'manager-workspace'; else printf 'missing-workspace'; fi"
+    };
     let result = BashTool::new("Bash")
-        .execute(json!({"command": "pwd"}), &ctx)
+        .execute(json!({"command": command}), &ctx)
         .await
         .expect("shell execute");
     assert!(result.success, "command failed: {:?}", result.content);
 
-    let cwd = result.content.trim();
-    let ctx_path = std::fs::canonicalize(ctx_dir.path()).unwrap();
-    let ctx_str = ctx_path.to_string_lossy().to_string();
-
     assert!(
-        cwd.contains(&ctx_str),
-        "Expected cwd to be context.workspace ({ctx_str}), but was: {cwd}"
+        result
+            .content
+            .lines()
+            .any(|line| line.trim() == "context-workspace"),
+        "expected context.workspace marker, but shell reported: {:?}",
+        result.content
     );
 }
