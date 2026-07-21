@@ -48,6 +48,7 @@ use crate::tui::app::ReasoningEffort;
 use crate::utils::spawn_supervised;
 use crate::worker_profile::{ModelRoute, ShellPolicy, ToolScope, WorkerRuntimeProfile};
 
+pub mod coord;
 pub mod mailbox;
 #[allow(unused_imports)]
 pub use mailbox::{Mailbox, MailboxEnvelope, MailboxMessage, MailboxReceiver};
