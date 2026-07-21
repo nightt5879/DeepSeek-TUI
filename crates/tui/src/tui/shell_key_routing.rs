@@ -73,15 +73,31 @@ pub fn tool_details_chord() -> Cow<'static, str> {
     display_chord(binding(ShellBindingId::ToolDetails).footer_chord)
 }
 
-/// Render a portable `Alt+X` chord for the current platform. macOS shows
-/// `⌥X` — never `Alt` or `Cmd` (TUI-DOG-002 acceptance).
+/// Render a portable `Alt+X` chord for the current platform. macOS normally
+/// shows `⌥X`; ASCII-safe terminals retain the portable `Alt+X` spelling.
 #[must_use]
 pub fn display_chord(chord: &'static str) -> Cow<'static, str> {
-    display_chord_for_platform(chord, cfg!(target_os = "macos"))
+    display_chord_for_platform_and_ascii(
+        chord,
+        cfg!(target_os = "macos"),
+        crate::tui::color_compat::ascii_safe_enabled(),
+    )
 }
 
+#[cfg(test)]
 #[must_use]
 pub fn display_chord_for_platform(chord: &'static str, is_macos: bool) -> Cow<'static, str> {
+    display_chord_for_platform_and_ascii(chord, is_macos, false)
+}
+
+fn display_chord_for_platform_and_ascii(
+    chord: &'static str,
+    is_macos: bool,
+    ascii_safe: bool,
+) -> Cow<'static, str> {
+    if ascii_safe {
+        return Cow::Borrowed(chord);
+    }
     if !is_macos {
         return Cow::Borrowed(chord);
     }
@@ -97,14 +113,34 @@ pub fn display_chord_for_platform(chord: &'static str, is_macos: bool) -> Cow<'s
 /// `{keys}`) are localized by the caller.
 #[must_use]
 pub fn footer_action_hints(include_context: bool) -> String {
-    footer_action_hints_for_platform(include_context, cfg!(target_os = "macos"))
+    footer_action_hints_for_platform_and_ascii(
+        include_context,
+        cfg!(target_os = "macos"),
+        crate::tui::color_compat::ascii_safe_enabled(),
+    )
 }
 
+#[cfg(test)]
 #[must_use]
 pub fn footer_action_hints_for_platform(include_context: bool, is_macos: bool) -> String {
-    let details =
-        display_chord_for_platform(binding(ShellBindingId::ToolDetails).footer_chord, is_macos);
-    let help = display_chord_for_platform(binding(ShellBindingId::Help).footer_chord, is_macos);
+    footer_action_hints_for_platform_and_ascii(include_context, is_macos, false)
+}
+
+fn footer_action_hints_for_platform_and_ascii(
+    include_context: bool,
+    is_macos: bool,
+    ascii_safe: bool,
+) -> String {
+    let details = display_chord_for_platform_and_ascii(
+        binding(ShellBindingId::ToolDetails).footer_chord,
+        is_macos,
+        ascii_safe,
+    );
+    let help = display_chord_for_platform_and_ascii(
+        binding(ShellBindingId::Help).footer_chord,
+        is_macos,
+        ascii_safe,
+    );
     if include_context {
         format!(
             "{details}:{{output}} · {}:{{context}} · {help}:{{keys}}",
@@ -185,6 +221,18 @@ mod tests {
         assert!(!macos.contains("Cmd"), "{macos}");
         let other = footer_action_hints_for_platform(true, false);
         assert!(other.starts_with("Alt+V:"), "{other}");
+    }
+
+    #[test]
+    fn ascii_safe_macos_hints_keep_portable_chords() {
+        assert_eq!(
+            display_chord_for_platform_and_ascii("Alt+V", true, true),
+            "Alt+V"
+        );
+        let hints = footer_action_hints_for_platform_and_ascii(true, true, true);
+        assert!(hints.starts_with("Alt+V:"), "{hints}");
+        assert!(hints.contains("F1:"), "{hints}");
+        assert!(!hints.contains('⌥'), "{hints}");
     }
 
     #[test]
