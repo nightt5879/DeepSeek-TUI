@@ -269,6 +269,26 @@ impl Default for WorkerRuntimeProfile {
     }
 }
 
+/// Unified pre-launch manifest for a child agent (#414).
+///
+/// Everything needed to provision, launch, and resume a child — prompt, role,
+/// model, tools, permissions, workspace boundary, budget, and identity — comes
+/// from this single persisted record. No field is derived ad-hoc at launch time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChildLaunchManifest {
+    pub owner_session: String,
+    pub child_id: String,
+    pub profile: WorkerRuntimeProfile,
+    pub prompt: String,
+    pub cwd: Option<String>,
+    pub worktree: bool,
+    pub writable_roots: Vec<String>,
+    pub token_budget: Option<u64>,
+    pub resume_identity: Option<String>,
+    #[serde(default)]
+    pub generation: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
