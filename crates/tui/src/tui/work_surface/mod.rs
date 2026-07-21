@@ -366,15 +366,42 @@ mod tests {
     }
 
     #[test]
-    fn active_session_without_work_renders_truthful_empty_state() {
+    fn active_session_without_work_keeps_surface_invisible() {
         let mut app = app();
         app.current_session_id = Some(SESSION.to_string());
 
         let rows = super::model::project(&mut app);
 
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].label, "Work · empty");
-        assert!(!rows[0].selectable);
+        assert!(rows.is_empty());
+        assert_eq!(super::height(&mut app, 120, 32, false), 0);
+    }
+
+    #[test]
+    fn empty_work_stays_hidden_after_cached_session_state_is_cleared() {
+        let mut app = app();
+        app.current_session_id = Some(SESSION.to_string());
+        app.work_surface.cached_graph = Some(operation_graph(NodeState::Active));
+
+        let rows = super::model::project(&mut app);
+
+        assert!(rows.is_empty());
+        assert!(app.work_surface.cached_graph.is_none());
+    }
+
+    #[test]
+    fn empty_work_reserves_no_side_rail() {
+        for placement in [
+            super::WorkSurfacePlacement::Left,
+            super::WorkSurfacePlacement::Right,
+        ] {
+            let mut app = app();
+            app.current_session_id = Some(SESSION.to_string());
+            app.work_surface.placement = placement;
+            let area = ratatui::layout::Rect::new(0, 0, 120, 32);
+
+            assert_eq!(super::height(&mut app, area.width, area.height, false), 0);
+            assert_eq!(super::split_chat(&mut app, area, false), (area, None));
+        }
     }
 
     #[test]

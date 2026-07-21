@@ -73,7 +73,6 @@ pub(super) struct WorkHitbox {
 
 #[derive(Debug, Clone)]
 enum WorkSourceState {
-    Empty,
     Error(String),
     Disconnected,
 }
@@ -81,7 +80,6 @@ enum WorkSourceState {
 impl WorkSourceState {
     const fn label(&self) -> &'static str {
         match self {
-            Self::Empty => "empty",
             Self::Error(_) => "error",
             Self::Disconnected => "disconnected",
         }
@@ -89,7 +87,6 @@ impl WorkSourceState {
 
     fn detail(&self) -> &str {
         match self {
-            Self::Empty => "No graph-owned work in the active session",
             Self::Error(error) => error,
             Self::Disconnected => "Work Graph runtime is not attached",
         }
@@ -208,7 +205,7 @@ pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
         }
         Some(Ok(None)) => {
             app.work_surface.cached_graph = None;
-            (None, active_session.then_some(WorkSourceState::Empty))
+            (None, None)
         }
         Some(Err(error)) => (
             app.work_surface.cached_graph.clone(),
