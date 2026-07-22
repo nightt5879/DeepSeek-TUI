@@ -26,7 +26,10 @@ mod tests {
         AgentWorkerStatus, SubAgentAssignment, SubAgentResult, SubAgentStatus, SubAgentType,
     };
     use crate::tools::todo::TodoStatus;
-    use crate::tui::app::{App, SidebarRowAction, ToolDetailRecord, TuiOptions};
+    use crate::tui::app::{
+        AgentCurrentActivity, AgentCurrentActivityStatus, App, SidebarRowAction, ToolDetailRecord,
+        TuiOptions,
+    };
     use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus};
     use crate::work_graph::{
         AcceptanceRequirement, ChangeCtx, EdgeKind, EvidenceKindTag, NodeKind, NodeState,
@@ -342,6 +345,12 @@ mod tests {
         app.agent_progress_meta.insert(
             "agent_worker".to_string(),
             crate::tui::app::AgentProgressMeta {
+                current_activity: Some(AgentCurrentActivity::bounded(
+                    AgentCurrentActivityStatus::RunningTool,
+                    None,
+                    Some("File.apply_patch".to_string()),
+                    Some(2),
+                )),
                 current_tool: Some("apply_patch".to_string()),
                 files_touched: 2,
                 ..crate::tui::app::AgentProgressMeta::default()
@@ -355,7 +364,8 @@ mod tests {
             .expect("agent work row");
         assert_eq!(row.label, "Agent Blue Whale · worker");
         assert!(row.detail.contains("Wire settled file activity"));
-        assert!(row.detail.contains("using apply_patch"));
+        assert!(row.detail.contains("using File.apply_patch"));
+        assert!(row.detail.contains("step 2"));
         assert!(row.detail.contains("2 files changed"));
         assert_eq!(
             row.primary_action,
@@ -363,6 +373,45 @@ mod tests {
                 agent_id: "agent_worker".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn progress_only_work_rows_use_typed_activity_not_display_substrings() {
+        let mut app = app();
+        app.current_session_id = Some(SESSION.to_string());
+        app.agent_progress.insert(
+            "agent_progress_only".to_string(),
+            "queued waiting failed completed".to_string(),
+        );
+
+        let rows = super::model::project(&mut app);
+        let row = rows
+            .iter()
+            .find(|row| row.id.0 == "worker:agent_progress_only")
+            .expect("progress-only work row");
+        assert_eq!(row.detail, "running");
+
+        app.agent_progress_meta.insert(
+            "agent_progress_only".to_string(),
+            crate::tui::app::AgentProgressMeta {
+                current_activity: Some(AgentCurrentActivity::bounded(
+                    AgentCurrentActivityStatus::Waiting,
+                    Some("approval required".to_string()),
+                    None,
+                    Some(5),
+                )),
+                ..crate::tui::app::AgentProgressMeta::default()
+            },
+        );
+
+        let rows = super::model::project(&mut app);
+        let row = rows
+            .iter()
+            .find(|row| row.id.0 == "worker:agent_progress_only")
+            .expect("typed progress-only work row");
+        assert!(row.detail.contains("waiting for input"), "{}", row.detail);
+        assert!(row.detail.contains("approval required"), "{}", row.detail);
+        assert!(row.detail.contains("step 5"), "{}", row.detail);
     }
 
     #[test]

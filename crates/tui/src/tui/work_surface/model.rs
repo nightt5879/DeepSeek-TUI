@@ -5,7 +5,7 @@ use std::path::{Component, Path};
 use ratatui::layout::Rect;
 
 use crate::tools::subagent::{AgentWorkerStatus, SubAgentStatus};
-use crate::tui::app::{App, SidebarRowAction};
+use crate::tui::app::{AgentCurrentActivityStatus, App, SidebarRowAction};
 use crate::tui::history::{FileActivityKind, FileActivitySummary, HistoryCell};
 use crate::work_graph::{
     AcceptanceRequirement, EdgeKind, EvidenceKind, EvidenceKindTag, NodeKind, NodeState,
@@ -383,15 +383,16 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
         .filter(|agent| !agent.from_prior_session)
         .enumerate()
         .map(|(order, agent)| {
-            let status = agent
-                .worker_status
-                .map(worker_status_label)
-                .unwrap_or_else(|| subagent_status_label(&agent.status));
-            let bucket = agent
-                .worker_status
-                .map(worker_status_bucket)
-                .unwrap_or_else(|| subagent_status_bucket(&agent.status));
             let meta = app.agent_progress_meta.get(&agent.agent_id);
+            let current_activity = meta.and_then(|meta| meta.current_activity.as_ref());
+            let status = current_activity
+                .map(|activity| current_activity_status_label(activity.status))
+                .or_else(|| agent.worker_status.map(worker_status_label))
+                .unwrap_or_else(|| subagent_status_label(&agent.status));
+            let bucket = current_activity
+                .map(|activity| current_activity_status_bucket(activity.status))
+                .or_else(|| agent.worker_status.map(worker_status_bucket))
+                .unwrap_or_else(|| subagent_status_bucket(&agent.status));
             let role = agent
                 .assignment
                 .role
@@ -408,8 +409,16 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
                 status.to_string(),
                 summarize_assignment(&agent.assignment.objective),
             ];
-            if let Some(tool) = meta.and_then(|meta| meta.current_tool.as_deref()) {
+            if let Some(detail) = current_activity.and_then(|activity| activity.detail.as_deref()) {
+                facts.push(detail.to_string());
+            }
+            if let Some(tool) =
+                current_activity.and_then(|activity| activity.current_tool.as_deref())
+            {
                 facts.push(format!("using {tool}"));
+            }
+            if let Some(step) = current_activity.and_then(|activity| activity.step) {
+                facts.push(format!("step {step}"));
             }
             if let Some(files) = meta
                 .map(|meta| meta.files_touched)
@@ -445,22 +454,33 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
         progress_only
             .into_iter()
             .enumerate()
-            .map(|(order, (id, progress))| {
+            .map(|(order, (id, _progress))| {
                 let meta = app.agent_progress_meta.get(id);
-                let waiting = progress.to_ascii_lowercase().contains("waiting");
-                let bucket = if waiting {
-                    WorkBucket::Attention
-                } else {
-                    WorkBucket::Active
-                };
+                let current_activity = meta.and_then(|meta| meta.current_activity.as_ref());
+                let status = current_activity
+                    .map(|activity| current_activity_status_label(activity.status))
+                    .unwrap_or("running");
+                let bucket = current_activity
+                    .map(|activity| current_activity_status_bucket(activity.status))
+                    .unwrap_or(WorkBucket::Active);
                 let name = app
                     .agent_label_map
                     .get(id)
                     .cloned()
                     .unwrap_or_else(|| id.clone());
-                let mut facts = vec![progress.clone()];
-                if let Some(tool) = meta.and_then(|meta| meta.current_tool.as_deref()) {
+                let mut facts = vec![status.to_string()];
+                if let Some(detail) =
+                    current_activity.and_then(|activity| activity.detail.as_deref())
+                {
+                    facts.push(detail.to_string());
+                }
+                if let Some(tool) =
+                    current_activity.and_then(|activity| activity.current_tool.as_deref())
+                {
                     facts.push(format!("using {tool}"));
+                }
+                if let Some(step) = current_activity.and_then(|activity| activity.step) {
+                    facts.push(format!("step {step}"));
                 }
                 if let Some(files) = meta
                     .map(|meta| meta.files_touched)
@@ -490,6 +510,37 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
 
 fn summarize_assignment(value: &str) -> String {
     crate::tui::history::summarize_tool_output(value)
+}
+
+fn current_activity_status_bucket(status: AgentCurrentActivityStatus) -> WorkBucket {
+    match status {
+        AgentCurrentActivityStatus::Waiting
+        | AgentCurrentActivityStatus::Interrupted
+        | AgentCurrentActivityStatus::Failed => WorkBucket::Attention,
+        AgentCurrentActivityStatus::Queued => WorkBucket::Ready,
+        AgentCurrentActivityStatus::Done | AgentCurrentActivityStatus::Canceled => {
+            WorkBucket::Recent
+        }
+        AgentCurrentActivityStatus::Starting
+        | AgentCurrentActivityStatus::Running
+        | AgentCurrentActivityStatus::ModelWait
+        | AgentCurrentActivityStatus::RunningTool => WorkBucket::Active,
+    }
+}
+
+fn current_activity_status_label(status: AgentCurrentActivityStatus) -> &'static str {
+    match status {
+        AgentCurrentActivityStatus::Queued => "queued",
+        AgentCurrentActivityStatus::Starting => "starting",
+        AgentCurrentActivityStatus::Running => "running",
+        AgentCurrentActivityStatus::ModelWait => "waiting for model",
+        AgentCurrentActivityStatus::RunningTool => "running tool",
+        AgentCurrentActivityStatus::Waiting => "waiting for input",
+        AgentCurrentActivityStatus::Done => "completed",
+        AgentCurrentActivityStatus::Failed => "failed",
+        AgentCurrentActivityStatus::Canceled => "cancelled",
+        AgentCurrentActivityStatus::Interrupted => "interrupted",
+    }
 }
 
 fn worker_status_bucket(status: AgentWorkerStatus) -> WorkBucket {

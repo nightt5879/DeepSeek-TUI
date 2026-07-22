@@ -13,7 +13,7 @@ use crate::error_taxonomy::ErrorEnvelope;
 use crate::models::{Message, SystemPrompt, Tool, Usage};
 use crate::tools::goal::GoalSnapshot;
 use crate::tools::spec::{ToolError, ToolResult};
-use crate::tools::subagent::SubAgentResult;
+use crate::tools::subagent::{AgentWorkerStatus, SubAgentResult};
 use crate::tools::user_input::UserInputRequest;
 
 /// Final status for a turn.
@@ -37,6 +37,43 @@ pub struct TurnRoute {
     pub provider_identity: String,
     pub model: String,
     pub auto_model: bool,
+}
+
+/// Structured lifecycle metadata paired with a human-readable
+/// [`Event::AgentProgress`] message.
+///
+/// Producers own this classification. UI consumers may bound the display
+/// message, but must never recover lifecycle state by parsing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentProgressEventMeta {
+    pub worker_status: AgentWorkerStatus,
+    pub step: Option<u32>,
+    /// Canonical action/tool name. Presentation aliases are applied by the UI
+    /// when it creates the bounded current-activity projection.
+    pub tool_name: Option<String>,
+}
+
+impl AgentProgressEventMeta {
+    #[must_use]
+    pub const fn new(worker_status: AgentWorkerStatus) -> Self {
+        Self {
+            worker_status,
+            step: None,
+            tool_name: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_step(mut self, step: u32) -> Self {
+        self.step = Some(step);
+        self
+    }
+
+    #[must_use]
+    pub fn with_tool(mut self, tool_name: impl Into<String>) -> Self {
+        self.tool_name = Some(tool_name.into());
+        self
+    }
 }
 
 /// Events emitted by the engine to update the UI.
@@ -195,6 +232,7 @@ pub enum Event {
     AgentProgress {
         id: String,
         status: String,
+        activity: AgentProgressEventMeta,
         parent_run_id: Option<String>,
         spawn_depth: u32,
     },

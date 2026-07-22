@@ -80,7 +80,7 @@ use crate::task_manager::{
 use crate::tools::goal::{GoalSnapshot, GoalStatus};
 use crate::tools::shell::{ShellJobSnapshot, ShellStatus};
 use crate::tools::spec::{RuntimeToolServices, ToolResult};
-use crate::tools::subagent::{MailboxMessage, SubAgentStatus};
+use crate::tools::subagent::{MailboxMessage, SubAgentStatus, subagent_progress_tool_display_name};
 use crate::tui::auto_router;
 use crate::tui::color_compat::ColorCompatBackend;
 use crate::tui::command_palette::{
@@ -139,10 +139,11 @@ use crate::tui::workspace_context;
 use super::key_actions;
 
 use super::app::{
-    ActiveTurnMetadata, App, AppAction, AppMode, HuntVerdict, OnboardingState,
-    PendingProviderSwitch, QueuedMessage, ReasoningEffort, SidebarFocus, StatusToastLevel,
-    SubmitDisposition, TaskPanelEntry, TaskPanelEntryKind, ToolEvidence, TuiOptions,
-    looks_like_slash_command_input, shell_command_from_bang_input,
+    ActiveTurnMetadata, AgentCurrentActivity, AgentCurrentActivityStatus, App, AppAction, AppMode,
+    HuntVerdict, OnboardingState, PendingProviderSwitch, QueuedMessage, ReasoningEffort,
+    SidebarFocus, StatusToastLevel, SubmitDisposition, TaskPanelEntry, TaskPanelEntryKind,
+    ToolEvidence, TuiOptions, bound_agent_activity_text, looks_like_slash_command_input,
+    shell_command_from_bang_input,
 };
 use super::approval::{
     ApprovalMode, ApprovalRequest, ApprovalView, ElevationRequest, ElevationView, ReviewDecision,
@@ -3600,7 +3601,7 @@ async fn run_event_loop(
                         parent_run_id,
                         spawn_depth,
                     } => {
-                        let prompt_summary = summarize_tool_output(&prompt);
+                        let prompt_summary = bound_agent_activity_text(&prompt);
                         execute_subagent_observer_hook(
                             app,
                             HookEvent::SubagentSpawn,
@@ -3613,6 +3614,13 @@ async fn run_event_loop(
                         let meta = app.agent_progress_meta.entry(id.clone()).or_default();
                         meta.parent_run_id = parent_run_id;
                         meta.spawn_depth = spawn_depth;
+                        meta.current_activity = Some(AgentCurrentActivity::bounded(
+                            AgentCurrentActivityStatus::Starting,
+                            Some(prompt_summary.clone()),
+                            None,
+                            None,
+                        ));
+                        meta.current_tool = None;
                         if app.agent_activity_started_at.is_none() {
                             app.agent_activity_started_at = Some(Instant::now());
                         }
@@ -3625,10 +3633,13 @@ async fn run_event_loop(
                     EngineEvent::AgentProgress {
                         id,
                         status,
+                        activity,
                         parent_run_id,
                         spawn_depth,
                     } => {
-                        let display = friendly_subagent_progress(app, &id, &status);
+                        let display = bound_agent_activity_text(&friendly_subagent_progress(
+                            app, &id, &status,
+                        ));
                         if is_noisy_subagent_progress(&status) {
                             app.agent_progress
                                 .entry(id.clone())
@@ -3639,6 +3650,18 @@ async fn run_event_loop(
                         let meta = app.agent_progress_meta.entry(id.clone()).or_default();
                         meta.parent_run_id = parent_run_id;
                         meta.spawn_depth = spawn_depth;
+                        let current_tool = activity
+                            .tool_name
+                            .as_deref()
+                            .map(subagent_progress_tool_display_name)
+                            .map(str::to_string);
+                        meta.current_activity = Some(AgentCurrentActivity::bounded(
+                            activity.worker_status.into(),
+                            Some(display.clone()),
+                            current_tool.clone(),
+                            activity.step,
+                        ));
+                        meta.current_tool = current_tool;
                         if app.agent_activity_started_at.is_none() {
                             app.agent_activity_started_at = Some(Instant::now());
                         }
@@ -3695,20 +3718,19 @@ async fn run_event_loop(
                                         && matches!(agent.status, SubAgentStatus::Running)
                                 });
                         app.agent_progress.remove(&id);
-                        app.agent_progress_meta.remove(&id);
                         let terminal_status = subagent_status_from_completion_result(&result);
                         let terminal_verb = subagent_terminal_verb(&terminal_status);
                         apply_subagent_terminal_projection(
                             app,
                             &id,
                             terminal_status.clone(),
-                            Some(summarize_tool_output(&result)),
+                            Some(bound_agent_activity_text(&result)),
                         );
                         // #3030: stable label with raw-id fallback.
                         let label = app.agent_display_label(&id);
                         app.status_message = Some(format!(
                             "{label} {terminal_verb}: {}",
-                            summarize_tool_output(&result)
+                            bound_agent_activity_text(&result)
                         ));
                         let should_recapture_terminal =
                             !has_other_running_subagents && app.use_alt_screen;

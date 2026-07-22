@@ -4619,6 +4619,40 @@ fn onboarding_provider_copy_is_provider_neutral_in_en() {
 }
 
 #[test]
+fn agent_current_activity_bounds_redacts_and_strips_control_sequences() {
+    let secret = "sk-activity-secret-1234567890";
+    let raw = format!(
+        "\u{1b}[31mrunning\u{1b}[0m\napi_key={secret}\n\u{1b}]8;;https://example.invalid\u{7}details\u{1b}]8;;\u{7}\u{1}"
+    );
+    let activity = AgentCurrentActivity::bounded(
+        AgentCurrentActivityStatus::Running,
+        Some(raw.clone()),
+        Some(format!("\u{1b}[33mFile.read\u{1b}[0m {secret}")),
+        Some(4),
+    );
+
+    let detail = activity.detail.expect("bounded detail");
+    let tool = activity.current_tool.expect("bounded tool");
+    assert!(detail.contains("running"), "{detail:?}");
+    assert!(detail.contains("api_key=[redacted]"), "{detail:?}");
+    assert!(detail.contains("details"), "{detail:?}");
+    assert!(tool.contains("File.read"), "{tool:?}");
+    assert!(tool.contains("[redacted]"), "{tool:?}");
+    for safe in [&detail, &tool] {
+        assert!(!safe.contains(secret), "{safe:?}");
+        assert!(!safe.contains('\u{1b}'), "{safe:?}");
+        assert!(!safe.contains('\u{1}'), "{safe:?}");
+        assert!(!safe.contains("example.invalid"), "{safe:?}");
+    }
+    assert_eq!(activity.step, Some(4));
+    assert_eq!(
+        raw.matches(secret).count(),
+        1,
+        "source text stays untouched"
+    );
+}
+
+#[test]
 fn onboarding_submit_api_key_routes_non_deepseek_provider_table() -> std::io::Result<()> {
     use crate::config::SavedCredential;
     use std::fs;

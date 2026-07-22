@@ -35,7 +35,7 @@ use crate::settings::Settings;
 use crate::tools::plan::{PlanState, SharedPlanState, new_shared_plan_state};
 use crate::tools::shell::new_shared_shell_manager;
 use crate::tools::spec::RuntimeToolServices;
-use crate::tools::subagent::SubAgentResult;
+use crate::tools::subagent::{AgentWorkerStatus, SubAgentResult};
 use crate::tools::todo::{SharedTodoList, TodoList, new_shared_todo_list};
 use crate::tui::active_cell::ActiveCell;
 use crate::tui::approval::ApprovalMode;
@@ -506,10 +506,90 @@ pub struct ProviderPickerMemory {
     pub selected_provider_id: Option<String>,
 }
 
+/// Bounded status vocabulary for the per-agent current-activity projection.
+///
+/// This is presentation state derived from structured worker/mailbox events;
+/// renderers map these variants to labels but never infer them from strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentCurrentActivityStatus {
+    Queued,
+    Starting,
+    Running,
+    ModelWait,
+    RunningTool,
+    Waiting,
+    Done,
+    Failed,
+    Canceled,
+    Interrupted,
+}
+
+impl From<AgentWorkerStatus> for AgentCurrentActivityStatus {
+    fn from(status: AgentWorkerStatus) -> Self {
+        match status {
+            AgentWorkerStatus::Queued => Self::Queued,
+            AgentWorkerStatus::Starting => Self::Starting,
+            AgentWorkerStatus::Running => Self::Running,
+            AgentWorkerStatus::WaitingForUser => Self::Waiting,
+            AgentWorkerStatus::ModelWait => Self::ModelWait,
+            AgentWorkerStatus::RunningTool => Self::RunningTool,
+            AgentWorkerStatus::Completed => Self::Done,
+            AgentWorkerStatus::Failed => Self::Failed,
+            AgentWorkerStatus::Cancelled => Self::Canceled,
+            AgentWorkerStatus::Interrupted => Self::Interrupted,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCurrentActivity {
+    pub status: AgentCurrentActivityStatus,
+    /// Safe bounded context, never a raw child transcript or tool result.
+    pub detail: Option<String>,
+    /// Safe display name for the one tool currently executing.
+    pub current_tool: Option<String>,
+    pub step: Option<u32>,
+}
+
+impl AgentCurrentActivity {
+    #[must_use]
+    pub fn bounded(
+        status: AgentCurrentActivityStatus,
+        detail: Option<String>,
+        current_tool: Option<String>,
+        step: Option<u32>,
+    ) -> Self {
+        fn bounded_nonempty(value: Option<String>) -> Option<String> {
+            value
+                .map(|value| bound_agent_activity_text(&value))
+                .filter(|value| !value.trim().is_empty())
+        }
+
+        Self {
+            status,
+            detail: bounded_nonempty(detail),
+            current_tool: bounded_nonempty(current_tool),
+            step,
+        }
+    }
+}
+
+/// Convert untrusted child-agent text into a compact UI-safe projection.
+/// Full transcript artifacts remain the source of truth; only summaries that
+/// can enter the parent transcript/sidebar pass through this seam.
+pub(crate) fn bound_agent_activity_text(value: &str) -> String {
+    let mut visible = String::with_capacity(value.len());
+    crate::tui::osc8::strip_ansi_into(value, &mut visible);
+    let redacted = codewhale_config::persistence::redact_secrets(&visible);
+    crate::tui::history::summarize_tool_output(&redacted)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentProgressMeta {
     pub parent_run_id: Option<String>,
     pub spawn_depth: u32,
+    /// Structured, bounded answer to "what is this agent doing now?".
+    pub current_activity: Option<AgentCurrentActivity>,
     /// Last tool observed running for this child. Cleared by the matching
     /// completion envelope so Work never presents a settled tool as live.
     pub current_tool: Option<String>,

@@ -24,14 +24,12 @@ use ratatui::{
 use crate::deepseek_theme::Theme;
 use crate::palette;
 use crate::tools::plan::StepStatus;
-use crate::tools::subagent::{
-    AgentWorkerStatus, SubAgentStatus, agent_worker_status_name, localized_whale_display_names,
-};
+use crate::tools::subagent::{AgentWorkerStatus, SubAgentStatus, localized_whale_display_names};
 use crate::tools::todo::TodoStatus;
 
 use super::app::{
-    App, SidebarFocus, SidebarHoverRow, SidebarHoverSection, SidebarHoverState, SidebarRowAction,
-    TaskPanelEntry, TaskPanelEntryKind,
+    AgentCurrentActivity, AgentCurrentActivityStatus, App, SidebarFocus, SidebarHoverRow,
+    SidebarHoverSection, SidebarHoverState, SidebarRowAction, TaskPanelEntry, TaskPanelEntryKind,
 };
 use super::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus, summarize_tool_output};
 use super::spinner::braille_spinner_frame_for_duration_ms;
@@ -2522,7 +2520,7 @@ fn render_sidebar_subagents(f: &mut Frame, area: Rect, app: &mut App) {
     let cached_running = app
         .subagent_cache
         .iter()
-        .filter(|agent| matches!(agent.status, SubAgentStatus::Running))
+        .filter(|agent| cached_agent_activity_is_live(app, agent))
         .count();
     let role_counts: std::collections::BTreeMap<String, usize> =
         app.subagent_cache
@@ -2622,17 +2620,11 @@ fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
         .subagent_cache
         .iter()
         .map(|agent| {
-            let progress = app
-                .agent_progress
+            let current_activity = app
+                .agent_progress_meta
                 .get(&agent.agent_id)
-                .cloned()
-                .or_else(|| {
-                    agent
-                        .result
-                        .as_deref()
-                        .map(summarize_tool_output)
-                        .filter(|summary| !summary.trim().is_empty())
-                });
+                .and_then(|meta| meta.current_activity.as_ref());
+            let progress = current_activity.map(sidebar_current_activity_text);
             // Generated whales are locale-derived from the neutral agent id;
             // never replay a persisted label from another language.
             let display_name = display_names
@@ -2647,9 +2639,9 @@ fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
                 name: display_name,
                 role: agent.agent_type.as_str().to_string(),
                 model: Some(agent.model.clone()).filter(|model| !model.trim().is_empty()),
-                status: agent
-                    .worker_status
-                    .map(sidebar_worker_status_text)
+                status: current_activity
+                    .map(|activity| sidebar_current_activity_status_text(activity.status))
+                    .or_else(|| agent.worker_status.map(sidebar_worker_status_text))
                     .unwrap_or_else(|| subagent_status_text(&agent.status))
                     .to_string(),
                 objective: Some(agent.assignment.objective.clone())
@@ -2667,7 +2659,7 @@ fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
         app.agent_progress
             .iter()
             .filter(|(id, _)| !cached_ids.contains(id.as_str()))
-            .map(|(id, progress)| {
+            .map(|(id, _progress)| {
                 // Progress-only rows do not carry a generated whale name yet;
                 // keep their existing stable Agent-N placeholder until the
                 // manager snapshot arrives.
@@ -2678,6 +2670,7 @@ fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
                     .unwrap_or_else(|| id.clone());
                 let meta = app.agent_progress_meta.get(id.as_str());
                 let spawn_depth = meta.map(|meta| meta.spawn_depth).unwrap_or_default();
+                let current_activity = meta.and_then(|meta| meta.current_activity.as_ref());
                 SidebarAgentRow {
                     id: id.clone(),
                     parent_run_id: meta.and_then(|meta| meta.parent_run_id.clone()),
@@ -2689,10 +2682,13 @@ fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
                         "agent".to_string()
                     },
                     model: None,
-                    status: sidebar_progress_status_text(progress).to_string(),
+                    status: current_activity
+                        .map(|activity| sidebar_current_activity_status_text(activity.status))
+                        .unwrap_or(sidebar_worker_status_text(AgentWorkerStatus::Running))
+                        .to_string(),
                     objective: None,
                     git_branch: None,
-                    progress: Some(progress.clone()),
+                    progress: current_activity.map(sidebar_current_activity_text),
                     steps_taken: 0,
                     duration_ms: None,
                     expanded: app.expanded_sidebar_agents.contains(id),
@@ -2783,24 +2779,69 @@ fn sidebar_worker_status_text(status: AgentWorkerStatus) -> &'static str {
     }
 }
 
-fn sidebar_progress_status_text(progress: &str) -> &'static str {
-    let lower = progress.to_ascii_lowercase();
-    if lower.contains("queued") {
-        "queued"
-    } else if lower.contains("waiting for user") || lower.contains("waiting for follow-up") {
-        "waiting"
-    } else if lower.contains("waiting for model") || lower.contains("requesting model") {
-        "model wait"
-    } else if lower.contains("running tool")
-        || lower.contains("executing tool")
-        || lower.contains("tool:")
-    {
-        "tool"
-    } else if lower.contains("starting") {
-        "starting"
-    } else {
-        agent_worker_status_name(AgentWorkerStatus::Running)
+fn sidebar_current_activity_status_text(status: AgentCurrentActivityStatus) -> &'static str {
+    match status {
+        AgentCurrentActivityStatus::Queued => "queued",
+        AgentCurrentActivityStatus::Starting => "starting",
+        AgentCurrentActivityStatus::Running => "running",
+        AgentCurrentActivityStatus::ModelWait => "model wait",
+        AgentCurrentActivityStatus::RunningTool => "tool",
+        AgentCurrentActivityStatus::Waiting => "waiting",
+        AgentCurrentActivityStatus::Done => "done",
+        AgentCurrentActivityStatus::Failed => "failed",
+        AgentCurrentActivityStatus::Canceled => "canceled",
+        AgentCurrentActivityStatus::Interrupted => "interrupted",
     }
+}
+
+fn cached_agent_activity_is_live(
+    app: &App,
+    agent: &crate::tools::subagent::SubAgentResult,
+) -> bool {
+    if let Some(status) = app
+        .agent_progress_meta
+        .get(&agent.agent_id)
+        .and_then(|meta| meta.current_activity.as_ref())
+        .map(|activity| activity.status)
+    {
+        return matches!(
+            status,
+            AgentCurrentActivityStatus::Queued
+                | AgentCurrentActivityStatus::Starting
+                | AgentCurrentActivityStatus::Running
+                | AgentCurrentActivityStatus::ModelWait
+                | AgentCurrentActivityStatus::RunningTool
+                | AgentCurrentActivityStatus::Waiting
+        );
+    }
+    if let Some(status) = agent.worker_status {
+        return matches!(
+            status,
+            AgentWorkerStatus::Queued
+                | AgentWorkerStatus::Starting
+                | AgentWorkerStatus::Running
+                | AgentWorkerStatus::WaitingForUser
+                | AgentWorkerStatus::ModelWait
+                | AgentWorkerStatus::RunningTool
+        );
+    }
+    matches!(agent.status, SubAgentStatus::Running)
+}
+
+fn sidebar_current_activity_text(activity: &AgentCurrentActivity) -> String {
+    let mut parts = vec![sidebar_current_activity_status_text(activity.status).to_string()];
+    if let Some(tool) = activity.current_tool.as_deref() {
+        parts.push(tool.to_string());
+    }
+    if let Some(step) = activity.step {
+        parts.push(format!("step {step}"));
+    }
+    if let Some(detail) = activity.detail.as_deref()
+        && detail != parts[0]
+    {
+        parts.push(detail.to_string());
+    }
+    parts.join(" · ")
 }
 
 /// Build sub-agent sidebar lines from summary + per-agent rows. Public
@@ -3212,7 +3253,7 @@ fn agent_row_hover_text(row: &SidebarAgentRow) -> String {
     }
     let _ = write!(text, "\n{status_line}");
     if let Some(objective) = row.objective.as_deref() {
-        let _ = write!(text, "\nobjective: {}", objective.trim());
+        let _ = write!(text, "\nobjective: {}", summarize_tool_output(objective));
     }
     if let Some(branch) = row.git_branch.as_deref() {
         let _ = write!(text, "\nbranch: {branch}");
@@ -3220,7 +3261,11 @@ fn agent_row_hover_text(row: &SidebarAgentRow) -> String {
     if let Some(progress) = row.progress.as_deref()
         && !progress.trim().is_empty()
     {
-        let _ = write!(text, "\nprogress: {}", progress.trim());
+        let _ = write!(
+            text,
+            "\ncurrent activity: {}",
+            summarize_tool_output(progress)
+        );
     }
     text
 }
@@ -3546,13 +3591,13 @@ mod tests {
         SidebarHoverSection, SidebarHoverState, SidebarSubagentSummary, SidebarToolRow,
         SidebarWorkChecklistItem, SidebarWorkStrategyStep, SidebarWorkSummary, ToolRowOrder,
         agent_row_hover_text, auto_sidebar_panels, background_task_spinner_prefix,
-        context_panel_cost_line, editorial_tool_rows, hotbar_panel_enabled,
-        hotbar_panel_hover_texts, hotbar_panel_lines, hotbar_panel_slots, is_hotbar_disabled,
-        normalize_activity_text, render_sidebar, sidebar_agent_rows, sidebar_hover_rows,
-        sidebar_work_summary, sort_sidebar_agent_rows_as_tree, subagent_output_handle,
-        subagent_panel_hover_texts, subagent_panel_lines, subagent_panel_rows,
-        task_panel_hover_texts, task_panel_lines, task_panel_row_sets, task_panel_rows,
-        work_panel_empty_hint, work_panel_hover_texts, work_panel_lines,
+        cached_agent_activity_is_live, context_panel_cost_line, editorial_tool_rows,
+        hotbar_panel_enabled, hotbar_panel_hover_texts, hotbar_panel_lines, hotbar_panel_slots,
+        is_hotbar_disabled, normalize_activity_text, render_sidebar, sidebar_agent_rows,
+        sidebar_hover_rows, sidebar_work_summary, sort_sidebar_agent_rows_as_tree,
+        subagent_output_handle, subagent_panel_hover_texts, subagent_panel_lines,
+        subagent_panel_rows, task_panel_hover_texts, task_panel_lines, task_panel_row_sets,
+        task_panel_rows, work_panel_empty_hint, work_panel_hover_texts, work_panel_lines,
     };
     use crate::config::Config;
     use crate::localization::Locale;
@@ -3562,8 +3607,8 @@ mod tests {
     use crate::tools::todo::TodoStatus;
     use crate::tui::active_cell::ActiveCell;
     use crate::tui::app::{
-        AgentProgressMeta, App, AppMode, HuntVerdict, SidebarRowAction, TaskPanelEntry,
-        TaskPanelEntryKind, TuiOptions,
+        AgentCurrentActivity, AgentCurrentActivityStatus, AgentProgressMeta, App, AppMode,
+        HuntVerdict, SidebarRowAction, TaskPanelEntry, TaskPanelEntryKind, TuiOptions,
     };
     use crate::tui::history::{
         ExecCell, ExecSource, GenericToolCell, HistoryCell, ToolCell, ToolStatus,
@@ -7301,22 +7346,163 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, "model wait");
+        assert_eq!(rows[0].progress.as_deref(), None);
     }
 
     #[test]
-    fn sidebar_progress_only_rows_parse_status_instead_of_hardcoding_running() {
+    fn sidebar_agent_rows_project_typed_lifecycle_fixtures() {
+        let mut app = create_test_app();
+        let fixtures = [
+            (
+                "agent_running",
+                "Running",
+                crate::tools::subagent::SubAgentStatus::Running,
+                crate::tools::subagent::AgentWorkerStatus::RunningTool,
+                AgentCurrentActivityStatus::RunningTool,
+                "tool",
+            ),
+            (
+                "agent_waiting",
+                "Waiting",
+                crate::tools::subagent::SubAgentStatus::Interrupted("approval".to_string()),
+                crate::tools::subagent::AgentWorkerStatus::WaitingForUser,
+                AgentCurrentActivityStatus::Waiting,
+                "waiting",
+            ),
+            (
+                "agent_failed",
+                "Failed",
+                crate::tools::subagent::SubAgentStatus::Failed("verification".to_string()),
+                crate::tools::subagent::AgentWorkerStatus::Failed,
+                AgentCurrentActivityStatus::Failed,
+                "failed",
+            ),
+            (
+                "agent_done",
+                "Done",
+                crate::tools::subagent::SubAgentStatus::Completed,
+                crate::tools::subagent::AgentWorkerStatus::Completed,
+                AgentCurrentActivityStatus::Done,
+                "done",
+            ),
+        ];
+        for (id, nickname, status, worker_status, activity_status, _) in &fixtures {
+            let mut agent = cached_agent(id, Some(nickname));
+            agent.status = status.clone();
+            agent.worker_status = Some(*worker_status);
+            app.subagent_cache.push(agent);
+            app.agent_progress_meta.insert(
+                (*id).to_string(),
+                AgentProgressMeta {
+                    current_activity: Some(AgentCurrentActivity::bounded(
+                        *activity_status,
+                        (*id == "agent_waiting").then_some("approval required".to_string()),
+                        (*id == "agent_running").then_some("read_file".to_string()),
+                        Some(2),
+                    )),
+                    ..AgentProgressMeta::default()
+                },
+            );
+        }
+
+        let rows = sidebar_agent_rows(&app);
+        for (id, _, _, _, _, expected_status) in fixtures {
+            let row = rows
+                .iter()
+                .find(|row| row.id == id)
+                .expect("typed lifecycle row");
+            assert_eq!(row.status, expected_status);
+        }
+        let waiting = app
+            .subagent_cache
+            .iter()
+            .find(|agent| agent.agent_id == "agent_waiting")
+            .expect("waiting agent");
+        assert!(cached_agent_activity_is_live(&app, waiting));
+    }
+
+    #[test]
+    fn structured_agent_details_fit_the_80x24_sidebar_budget() {
+        let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Agents;
+        let mut waiting = cached_agent("agent_waiting", Some("Wait"));
+        waiting.status =
+            crate::tools::subagent::SubAgentStatus::Interrupted("approval required".to_string());
+        waiting.worker_status = Some(crate::tools::subagent::AgentWorkerStatus::WaitingForUser);
+        app.subagent_cache.push(waiting);
+        app.agent_progress_meta.insert(
+            "agent_waiting".to_string(),
+            AgentProgressMeta {
+                current_activity: Some(AgentCurrentActivity::bounded(
+                    AgentCurrentActivityStatus::Waiting,
+                    Some("approval required".to_string()),
+                    None,
+                    Some(2),
+                )),
+                ..AgentProgressMeta::default()
+            },
+        );
+        app.expanded_sidebar_agents
+            .insert("agent_waiting".to_string());
+        let config = Config {
+            hotbar: Some(Vec::new()),
+            ..Config::default()
+        };
+
+        // At an 80-column terminal the standard split grants the sidebar 20
+        // columns, so render that exact 20x24 Agent Details budget directly.
+        let backend = TestBackend::new(20, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_sidebar(frame, frame.area(), &mut app, &config))
+            .expect("draw sidebar");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Agents"), "{rendered:?}");
+        assert!(rendered.contains("Wait"), "{rendered:?}");
+        assert!(rendered.contains("waiting"), "{rendered:?}");
+    }
+
+    #[test]
+    fn sidebar_progress_only_rows_never_infer_status_from_display_text() {
         let mut app = create_test_app();
         app.ensure_agent_label("agent_queued");
         app.agent_progress.insert(
             "agent_queued".to_string(),
-            "queued for launch permit".to_string(),
+            "queued waiting failed completed".to_string(),
         );
 
         let rows = sidebar_agent_rows(&app);
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "Agent 1");
+        assert_eq!(rows[0].status, "running");
+        assert_eq!(rows[0].progress, None);
+
+        app.agent_progress_meta.insert(
+            "agent_queued".to_string(),
+            AgentProgressMeta {
+                current_activity: Some(AgentCurrentActivity::bounded(
+                    AgentCurrentActivityStatus::Queued,
+                    Some("waiting for launch permit".to_string()),
+                    None,
+                    None,
+                )),
+                ..AgentProgressMeta::default()
+            },
+        );
+        let rows = sidebar_agent_rows(&app);
         assert_eq!(rows[0].status, "queued");
+        assert_eq!(
+            rows[0].progress.as_deref(),
+            Some("queued · waiting for launch permit")
+        );
     }
 
     #[test]

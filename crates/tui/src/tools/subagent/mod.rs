@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use crate::client::DeepSeekClient;
 use crate::config::MAX_SUBAGENTS;
-use crate::core::events::Event;
+use crate::core::events::{AgentProgressEventMeta, Event};
 use crate::dependencies::{ExternalTool, Git};
 use crate::llm_client::{LlmClient, LlmError};
 use crate::models::{
@@ -166,8 +166,9 @@ const SUBAGENT_STATE_SCHEMA_VERSION: u32 = 1;
 const SUBAGENT_STATE_FILE: &str = "subagents.v1.json";
 const SUBAGENT_WORKTREE_ROOT_DIR: &str = ".codewhale-worktrees";
 const SUBAGENT_RESTART_REASON: &str = "Interrupted by process restart";
-const SUBAGENT_QUEUED_LAUNCH_REASON: &str = "queued: waiting for a sub-agent launch slot";
+#[cfg(test)]
 const SUBAGENT_MODEL_WAIT_REASON: &str = "waiting for model response";
+const SUBAGENT_QUEUED_LAUNCH_REASON: &str = "queued: waiting for a sub-agent launch slot";
 /// #freeze: minimum spacing between hot-path (per-step checkpoint) state
 /// persists. `update_checkpoint` fires on every step of every agent; at high
 /// fanout an unconditional full-fleet rewrite under the manager write lock
@@ -3360,11 +3361,6 @@ impl SubAgentManager {
                 "failed to reconcile sub-agent Work lifecycle"
             );
         }
-    }
-
-    fn record_worker_progress(&mut self, worker_id: &str, message: String) {
-        let (status, step, tool_name) = worker_progress_event_parts(&message);
-        self.record_worker_event(worker_id, status, Some(message), step, tool_name);
     }
 
     fn complete_worker_from_result(&mut self, worker_id: &str, result: &SubAgentResult) {
@@ -6569,6 +6565,7 @@ async fn acquire_queued_launch_permit(
             record_agent_progress(
                 &task.runtime,
                 &task.agent_id,
+                AgentProgressEventMeta::new(AgentWorkerStatus::Cancelled),
                 "cancelled while queued for a sub-agent launch slot".to_string(),
             );
             None
@@ -6595,6 +6592,7 @@ async fn record_queued_launch_progress(task: &SubAgentTask) {
         task.runtime.event_tx.as_ref(),
         &task.agent_id,
         SUBAGENT_QUEUED_LAUNCH_REASON.to_string(),
+        AgentProgressEventMeta::new(AgentWorkerStatus::Queued),
         task.runtime.parent_agent_id.clone(),
         task.runtime.spawn_depth,
     );
@@ -7154,6 +7152,7 @@ async fn request_subagent_model_response_with_retries(
                 record_agent_progress(
                     runtime,
                     agent_id,
+                    AgentProgressEventMeta::new(AgentWorkerStatus::ModelWait).with_step(steps),
                     format!(
                         "{}: {}; retrying API request {}/{} in {}ms ({err})",
                         format_step_counter(steps, max_steps),
@@ -7178,16 +7177,28 @@ async fn request_subagent_model_response_with_retries(
     }
 }
 
-fn record_agent_progress(runtime: &SubAgentRuntime, agent_id: &str, message: impl Into<String>) {
+fn record_agent_progress(
+    runtime: &SubAgentRuntime,
+    agent_id: &str,
+    activity: AgentProgressEventMeta,
+    message: impl Into<String>,
+) {
     let message = message.into();
     if let Ok(mut manager) = runtime.manager.try_write() {
         manager.touch(agent_id);
-        manager.record_worker_progress(agent_id, message.clone());
+        manager.record_worker_event(
+            agent_id,
+            activity.worker_status,
+            Some(message.clone()),
+            activity.step,
+            activity.tool_name.clone(),
+        );
     }
     emit_agent_progress(
         runtime.event_tx.as_ref(),
         agent_id,
         message,
+        activity,
         runtime.parent_agent_id.clone(),
         runtime.spawn_depth,
     );
@@ -7338,6 +7349,7 @@ async fn run_subagent(
     record_agent_progress(
         runtime,
         &agent_id,
+        AgentProgressEventMeta::new(AgentWorkerStatus::Starting),
         format!("started ({})", agent_type.as_str()),
     );
 
@@ -7379,6 +7391,7 @@ async fn run_subagent(
             record_agent_progress(
                 runtime,
                 &agent_id,
+                AgentProgressEventMeta::new(AgentWorkerStatus::Cancelled).with_step(steps),
                 format!("{}: cancelled", format_step_counter(steps, max_steps)),
             );
             let status = SubAgentStatus::Cancelled;
@@ -7431,6 +7444,7 @@ async fn run_subagent(
         record_agent_progress(
             runtime,
             &agent_id,
+            AgentProgressEventMeta::new(AgentWorkerStatus::ModelWait).with_step(steps),
             format!(
                 "{}: requesting model response",
                 format_step_counter(steps, max_steps)
@@ -7462,6 +7476,7 @@ async fn run_subagent(
             record_agent_progress(
                 runtime,
                 &agent_id,
+                AgentProgressEventMeta::new(AgentWorkerStatus::Running).with_step(steps),
                 format!(
                     "{}: received {count} child sub-agent completion(s)",
                     format_step_counter(steps, max_steps)
@@ -7520,6 +7535,7 @@ async fn run_subagent(
                 record_agent_progress(
                     runtime,
                     &agent_id,
+                    AgentProgressEventMeta::new(AgentWorkerStatus::Cancelled).with_step(steps),
                     format!("{}: cancelled mid-request", format_step_counter(steps, max_steps)),
                 );
                 let status = SubAgentStatus::Cancelled;
@@ -7585,6 +7601,8 @@ async fn run_subagent(
                         record_agent_progress(
                             runtime,
                             &agent_id,
+                            AgentProgressEventMeta::new(AgentWorkerStatus::Interrupted)
+                                .with_step(steps),
                             format!("{}: interrupted; {reason}", format_step_counter(steps, max_steps)),
                         );
                         let status = SubAgentStatus::Interrupted(reason.clone());
@@ -7610,6 +7628,8 @@ async fn run_subagent(
                         record_agent_progress(
                             runtime,
                             &agent_id,
+                            AgentProgressEventMeta::new(AgentWorkerStatus::WaitingForUser)
+                                .with_step(steps),
                             format!(
                                 "{}: waiting for user; {}",
                                 format_step_counter(steps, max_steps),
@@ -7678,6 +7698,7 @@ async fn run_subagent(
             record_agent_progress(
                 runtime,
                 &agent_id,
+                AgentProgressEventMeta::new(AgentWorkerStatus::Failed).with_step(steps),
                 format!(
                     "{}: token budget exhausted ({tokens_used}/{budget})",
                     format_step_counter(steps, max_steps)
@@ -7798,6 +7819,7 @@ async fn run_subagent(
             record_agent_progress(
                 runtime,
                 &agent_id,
+                AgentProgressEventMeta::new(AgentWorkerStatus::Running).with_step(steps),
                 format!("{}: {progress}", format_step_counter(steps, max_steps)),
             );
             messages.push(Message {
@@ -7844,6 +7866,7 @@ async fn run_subagent(
                 record_agent_progress(
                     runtime,
                     &agent_id,
+                    AgentProgressEventMeta::new(AgentWorkerStatus::Running).with_step(steps),
                     format!(
                         "{}: resuming with {count} child sub-agent completion(s)",
                         format_step_counter(steps, max_steps)
@@ -7887,6 +7910,7 @@ async fn run_subagent(
                 record_agent_progress(
                     runtime,
                     &agent_id,
+                    AgentProgressEventMeta::new(AgentWorkerStatus::Completed).with_step(steps),
                     format!("{}: complete", format_step_counter(steps, max_steps)),
                 );
                 stopped_naturally = true;
@@ -7898,6 +7922,7 @@ async fn run_subagent(
         record_agent_progress(
             runtime,
             &agent_id,
+            AgentProgressEventMeta::new(AgentWorkerStatus::Running).with_step(steps),
             format!(
                 "{}: executing {} tool call(s)",
                 format_step_counter(steps, max_steps),
@@ -7911,6 +7936,9 @@ async fn run_subagent(
             record_agent_progress(
                 runtime,
                 &agent_id,
+                AgentProgressEventMeta::new(AgentWorkerStatus::RunningTool)
+                    .with_step(steps)
+                    .with_tool(activity_tool_name.clone()),
                 format!(
                     "{}: running tool '{tool_display_name}'",
                     format_step_counter(steps, max_steps)
@@ -7947,6 +7975,9 @@ async fn run_subagent(
                 record_agent_progress(
                     runtime,
                     &agent_id,
+                    AgentProgressEventMeta::new(AgentWorkerStatus::RunningTool)
+                        .with_step(steps)
+                        .with_tool(activity_tool_name.clone()),
                     format!(
                         "{}: tool '{tool_display_name}' output spilled to {}",
                         format_step_counter(steps, max_steps),
@@ -7957,6 +7988,7 @@ async fn run_subagent(
             record_agent_progress(
                 runtime,
                 &agent_id,
+                AgentProgressEventMeta::new(AgentWorkerStatus::Running).with_step(steps),
                 format!(
                     "{}: finished tool '{tool_display_name}'",
                     format_step_counter(steps, max_steps)
@@ -9777,51 +9809,7 @@ fn worker_status_from_subagent_result(result: &SubAgentResult) -> AgentWorkerSta
     }
 }
 
-fn worker_progress_event_parts(message: &str) -> (AgentWorkerStatus, Option<u32>, Option<String>) {
-    let step = parse_progress_step(message);
-    let lower = message.to_ascii_lowercase();
-    let status = if lower.contains("queued") {
-        AgentWorkerStatus::Queued
-    } else if lower.contains("waiting for user") || lower.contains("waiting for follow-up") {
-        AgentWorkerStatus::WaitingForUser
-    } else if lower.contains("requesting model response")
-        || lower.contains(SUBAGENT_MODEL_WAIT_REASON)
-    {
-        AgentWorkerStatus::ModelWait
-    } else if lower.contains("running tool") || lower.contains("executing") {
-        AgentWorkerStatus::RunningTool
-    } else if lower.contains("cancelled") {
-        AgentWorkerStatus::Cancelled
-    } else if lower.contains("interrupted") || lower.contains("timed out") {
-        AgentWorkerStatus::Interrupted
-    } else if lower.contains("complete") {
-        AgentWorkerStatus::Completed
-    } else if lower.contains("started") {
-        AgentWorkerStatus::Starting
-    } else {
-        AgentWorkerStatus::Running
-    };
-    (status, step, parse_progress_tool_name(message))
-}
-
-fn parse_progress_step(message: &str) -> Option<u32> {
-    let rest = message.strip_prefix("step ")?;
-    let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-    (!digits.is_empty())
-        .then(|| digits.parse::<u32>().ok())
-        .flatten()
-}
-
-fn parse_progress_tool_name(message: &str) -> Option<String> {
-    let marker = "tool '";
-    let start = message.find(marker)? + marker.len();
-    let rest = &message[start..];
-    let end = rest.find('\'')?;
-    let tool = rest[..end].trim();
-    (!tool.is_empty()).then(|| tool.to_string())
-}
-
-fn subagent_progress_tool_display_name(name: &str) -> &str {
+pub(crate) fn subagent_progress_tool_display_name(name: &str) -> &str {
     match name {
         "exec_shell"
         | "exec_shell_wait"
@@ -9839,28 +9827,30 @@ fn emit_agent_progress(
     event_tx: Option<&mpsc::Sender<Event>>,
     agent_id: &str,
     status: String,
+    activity: AgentProgressEventMeta,
     parent_run_id: Option<String>,
     spawn_depth: u32,
 ) {
     if let Some(event_tx) = event_tx {
         if event_tx.max_capacity() > MIN_EVENT_CHANNEL_HEADROOM_FOR_ROUTINE_PROGRESS
             && event_tx.capacity() <= MIN_EVENT_CHANNEL_HEADROOM_FOR_ROUTINE_PROGRESS
-            && routine_agent_progress_can_preserve_event_headroom(&status)
+            && routine_agent_progress_can_preserve_event_headroom(activity.worker_status)
         {
             return;
         }
         let _ = event_tx.try_send(Event::AgentProgress {
             id: agent_id.to_string(),
             status,
+            activity,
             parent_run_id,
             spawn_depth,
         });
     }
 }
 
-fn routine_agent_progress_can_preserve_event_headroom(status: &str) -> bool {
+fn routine_agent_progress_can_preserve_event_headroom(status: AgentWorkerStatus) -> bool {
     matches!(
-        worker_progress_event_parts(status).0,
+        status,
         AgentWorkerStatus::Running | AgentWorkerStatus::ModelWait | AgentWorkerStatus::RunningTool
     )
 }

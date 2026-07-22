@@ -3,9 +3,13 @@
 use std::time::{Duration, Instant};
 
 use crate::task_manager::{TaskRecord, TaskStatus, TaskSummary};
-use crate::tools::subagent::{AgentWorkerStatus, MailboxMessage, SubAgentResult, SubAgentStatus};
+use crate::tools::subagent::{
+    AgentWorkerStatus, MailboxMessage, SubAgentResult, SubAgentStatus,
+    subagent_progress_tool_display_name,
+};
 use crate::tui::app::{
-    AgentProgressMeta, App, AppMode, SidebarFocus, TaskPanelEntry, TaskPanelEntryKind,
+    AgentCurrentActivity, AgentCurrentActivityStatus, AgentProgressMeta, App, AppMode,
+    SidebarFocus, TaskPanelEntry, TaskPanelEntryKind, bound_agent_activity_text,
 };
 use crate::tui::history::{HistoryCell, SubAgentCell, summarize_tool_output};
 use crate::tui::pager::PagerView;
@@ -127,7 +131,34 @@ pub(super) fn apply_subagent_terminal_projection(
     result: Option<String>,
 ) -> bool {
     app.agent_progress.remove(agent_id);
-    app.agent_progress_meta.remove(agent_id);
+
+    let worker_status = worker_status_for_terminal_projection(&status);
+    let safe_result = result.map(|result| bound_agent_activity_text(&result));
+    let meta = app
+        .agent_progress_meta
+        .entry(agent_id.to_string())
+        .or_default();
+    let activity_status = if worker_status == AgentWorkerStatus::Interrupted
+        && meta
+            .current_activity
+            .as_ref()
+            .is_some_and(|activity| activity.status == AgentCurrentActivityStatus::Waiting)
+    {
+        AgentCurrentActivityStatus::Waiting
+    } else {
+        worker_status.into()
+    };
+    let step = meta
+        .current_activity
+        .as_ref()
+        .and_then(|activity| activity.step);
+    meta.current_activity = Some(AgentCurrentActivity::bounded(
+        activity_status,
+        safe_result.clone(),
+        None,
+        step,
+    ));
+    meta.current_tool = None;
 
     let Some(agent) = app
         .subagent_cache
@@ -138,9 +169,9 @@ pub(super) fn apply_subagent_terminal_projection(
         return false;
     };
 
-    agent.worker_status = Some(worker_status_for_terminal_projection(&status));
+    agent.worker_status = Some(worker_status);
     agent.status = status;
-    if let Some(result) = result {
+    if let Some(result) = safe_result {
         agent.result = Some(result);
     }
     reconcile_subagent_activity_state(app);
@@ -161,8 +192,8 @@ fn worker_status_for_terminal_projection(status: &SubAgentStatus) -> AgentWorker
 pub(super) fn reconcile_subagent_activity_state_at(app: &mut App, now: Instant) {
     reconcile_terminal_subagent_card_retention(app, now);
 
-    let running_agents: Vec<(String, String)> = app
-        .subagent_cache
+    let cached_agents = app.subagent_cache.clone();
+    let running_agents: Vec<(String, String)> = cached_agents
         .iter()
         .filter(|agent| matches!(agent.status, SubAgentStatus::Running))
         .map(|agent| {
@@ -180,26 +211,81 @@ pub(super) fn reconcile_subagent_activity_state_at(app: &mut App, now: Instant) 
     // whose AgentSpawned/AgentList delivery was dropped under channel
     // pressure so the cache has never seen it — must survive until the cache
     // supersedes it, or spawned agents flicker in and out of the sidebar.
-    let cached_ids: std::collections::HashSet<&str> = app
-        .subagent_cache
+    let cached_ids: std::collections::HashSet<String> = cached_agents
         .iter()
-        .map(|agent| agent.agent_id.as_str())
+        .map(|agent| agent.agent_id.clone())
         .collect();
     app.agent_progress
-        .retain(|id, _| running_ids.contains(id.as_str()) || !cached_ids.contains(id.as_str()));
+        .retain(|id, _| running_ids.contains(id) || !cached_ids.contains(id));
+    let progress_ids: std::collections::HashSet<String> =
+        app.agent_progress.keys().cloned().collect();
     app.agent_progress_meta
-        .retain(|id, _| running_ids.contains(id.as_str()) || !cached_ids.contains(id.as_str()));
-    for (id, objective) in running_agents {
-        app.agent_progress.entry(id.clone()).or_insert(objective);
-        if let Some(agent) = app.subagent_cache.iter().find(|agent| agent.agent_id == id) {
-            app.agent_progress_meta
-                .entry(id.clone())
-                .or_insert_with(|| AgentProgressMeta {
-                    parent_run_id: agent.parent_run_id.clone(),
-                    spawn_depth: agent.spawn_depth,
-                    ..AgentProgressMeta::default()
-                });
+        .retain(|id, _| cached_ids.contains(id) || progress_ids.contains(id));
+
+    for (id, objective) in &running_agents {
+        app.agent_progress
+            .entry(id.clone())
+            .or_insert_with(|| objective.clone());
+    }
+
+    for agent in &cached_agents {
+        let meta = app
+            .agent_progress_meta
+            .entry(agent.agent_id.clone())
+            .or_insert_with(|| AgentProgressMeta {
+                parent_run_id: agent.parent_run_id.clone(),
+                spawn_depth: agent.spawn_depth,
+                ..AgentProgressMeta::default()
+            });
+        meta.parent_run_id = agent.parent_run_id.clone();
+        meta.spawn_depth = agent.spawn_depth;
+
+        let existing = meta.current_activity.clone();
+        let mut structured_status = if agent.needs_input.is_some() {
+            AgentCurrentActivityStatus::Waiting
+        } else if let Some(worker_status) = agent.worker_status {
+            worker_status.into()
+        } else if matches!(agent.status, SubAgentStatus::Running) {
+            existing
+                .as_ref()
+                .map(|activity| activity.status)
+                .unwrap_or(AgentCurrentActivityStatus::Running)
+        } else {
+            worker_status_for_terminal_projection(&agent.status).into()
+        };
+        if structured_status == AgentCurrentActivityStatus::Interrupted
+            && existing
+                .as_ref()
+                .is_some_and(|activity| activity.status == AgentCurrentActivityStatus::Waiting)
+        {
+            structured_status = AgentCurrentActivityStatus::Waiting;
         }
+
+        let detail = agent
+            .needs_input
+            .as_ref()
+            .map(|needs_input| needs_input.question.clone())
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .filter(|activity| activity.status == structured_status)
+                    .and_then(|activity| activity.detail.clone())
+            })
+            .or_else(|| agent.result.clone());
+        let current_tool = existing
+            .as_ref()
+            .filter(|_| structured_status == AgentCurrentActivityStatus::RunningTool)
+            .and_then(|activity| activity.current_tool.clone());
+        let step = (agent.steps_taken > 0)
+            .then_some(agent.steps_taken)
+            .or_else(|| existing.as_ref().and_then(|activity| activity.step));
+        meta.current_activity = Some(AgentCurrentActivity::bounded(
+            structured_status,
+            detail,
+            current_tool.clone(),
+            step,
+        ));
+        meta.current_tool = current_tool;
     }
 
     if running_ids.is_empty() {
@@ -386,8 +472,9 @@ pub(super) fn handle_subagent_mailbox(app: &mut App, seq: u64, message: &Mailbox
     // Resolve (or allocate) the target cell for this envelope. ChildSpawned
     // is special — it always belongs to the active fanout card if one
     // exists; otherwise it seeds a new one.
-    let agent_id = message.agent_id().to_string();
-    record_agent_tool_activity(app, message);
+    let display_message = bounded_mailbox_message(message);
+    let agent_id = display_message.agent_id().to_string();
+    record_agent_current_activity(app, message);
     if subagent_message_refreshes_workspace_context(message) {
         workspace_context::refresh_now(app, Instant::now());
     }
@@ -396,7 +483,7 @@ pub(super) fn handle_subagent_mailbox(app: &mut App, seq: u64, message: &Mailbox
         && let Some(idx) = app.last_fanout_card_index
         && let Some(HistoryCell::SubAgent(SubAgentCell::Fanout(card))) = app.history.get_mut(idx)
     {
-        let updated = apply_to_fanout(card, message);
+        let updated = apply_to_fanout(card, &display_message);
         app.subagent_card_index.insert(agent_id, idx);
         if updated {
             app.bump_history_cell(idx);
@@ -408,10 +495,10 @@ pub(super) fn handle_subagent_mailbox(app: &mut App, seq: u64, message: &Mailbox
     if let Some(&idx) = app.subagent_card_index.get(&agent_id) {
         let updated = match app.history.get_mut(idx) {
             Some(HistoryCell::SubAgent(SubAgentCell::Delegate(card))) => {
-                apply_to_delegate(card, message)
+                apply_to_delegate(card, &display_message)
             }
             Some(HistoryCell::SubAgent(SubAgentCell::Fanout(card))) => {
-                apply_to_fanout(card, message)
+                apply_to_fanout(card, &display_message)
             }
             _ => false,
         };
@@ -426,7 +513,7 @@ pub(super) fn handle_subagent_mailbox(app: &mut App, seq: u64, message: &Mailbox
     // No existing card — only `Started` reasonably opens one. Anything else
     // for an unknown agent_id is dropped (likely arrived after the cell was
     // cleared, e.g. session-resume edge cases).
-    let agent_type = match message {
+    let agent_type = match &display_message {
         MailboxMessage::Started { agent_type, .. } => agent_type.clone(),
         MailboxMessage::Completed { .. }
         | MailboxMessage::Failed { .. }
@@ -463,7 +550,7 @@ pub(super) fn handle_subagent_mailbox(app: &mut App, seq: u64, message: &Mailbox
         }
     } else {
         let mut card = DelegateCard::new(agent_id.clone(), agent_type.clone());
-        apply_to_delegate(&mut card, message);
+        apply_to_delegate(&mut card, &display_message);
         app.add_message(HistoryCell::SubAgent(SubAgentCell::Delegate(card)));
         let idx = app.history.len().saturating_sub(1);
         app.subagent_card_index.insert(agent_id.clone(), idx);
@@ -476,32 +563,142 @@ pub(super) fn handle_subagent_mailbox(app: &mut App, seq: u64, message: &Mailbox
     }
 }
 
-fn record_agent_tool_activity(app: &mut App, message: &MailboxMessage) {
-    let (agent_id, tool_name, completed_ok) = match message {
+fn bounded_mailbox_message(message: &MailboxMessage) -> MailboxMessage {
+    match message {
+        MailboxMessage::Progress { agent_id, status } => MailboxMessage::Progress {
+            agent_id: agent_id.clone(),
+            status: bound_agent_activity_text(status),
+        },
         MailboxMessage::ToolCallStarted {
             agent_id,
             tool_name,
-            ..
-        } => (agent_id, tool_name, None),
+            step,
+        } => MailboxMessage::ToolCallStarted {
+            agent_id: agent_id.clone(),
+            tool_name: bound_agent_activity_text(subagent_progress_tool_display_name(tool_name)),
+            step: *step,
+        },
         MailboxMessage::ToolCallCompleted {
             agent_id,
             tool_name,
+            step,
+            ok,
+        } => MailboxMessage::ToolCallCompleted {
+            agent_id: agent_id.clone(),
+            tool_name: bound_agent_activity_text(subagent_progress_tool_display_name(tool_name)),
+            step: *step,
+            ok: *ok,
+        },
+        MailboxMessage::Completed { agent_id, summary } => MailboxMessage::Completed {
+            agent_id: agent_id.clone(),
+            summary: bound_agent_activity_text(summary),
+        },
+        MailboxMessage::Failed { agent_id, error } => MailboxMessage::Failed {
+            agent_id: agent_id.clone(),
+            error: bound_agent_activity_text(error),
+        },
+        MailboxMessage::Interrupted { agent_id, reason } => MailboxMessage::Interrupted {
+            agent_id: agent_id.clone(),
+            reason: bound_agent_activity_text(reason),
+        },
+        _ => message.clone(),
+    }
+}
+
+fn record_agent_current_activity(app: &mut App, message: &MailboxMessage) {
+    let agent_id = message.agent_id().to_string();
+    let meta = app.agent_progress_meta.entry(agent_id).or_default();
+    let previous = meta.current_activity.clone();
+
+    let (status, detail, current_tool, step) = match message {
+        MailboxMessage::Started { agent_type, .. } => (
+            AgentCurrentActivityStatus::Running,
+            Some(format!("started {agent_type}")),
+            None,
+            None,
+        ),
+        MailboxMessage::Progress { status, .. } => (
+            previous
+                .as_ref()
+                .map(|activity| activity.status)
+                .unwrap_or(AgentCurrentActivityStatus::Running),
+            Some(status.clone()),
+            previous
+                .as_ref()
+                .and_then(|activity| activity.current_tool.clone()),
+            previous.as_ref().and_then(|activity| activity.step),
+        ),
+        MailboxMessage::ToolCallStarted {
+            tool_name, step, ..
+        } => (
+            AgentCurrentActivityStatus::RunningTool,
+            None,
+            Some(subagent_progress_tool_display_name(tool_name).to_string()),
+            Some(*step),
+        ),
+        MailboxMessage::ToolCallCompleted {
+            tool_name,
+            step,
             ok,
             ..
-        } => (agent_id, tool_name, Some(*ok)),
-        _ => return,
+        } => (
+            AgentCurrentActivityStatus::Running,
+            Some(format!(
+                "{} {}",
+                subagent_progress_tool_display_name(tool_name),
+                if *ok { "completed" } else { "failed" }
+            )),
+            None,
+            Some(*step),
+        ),
+        MailboxMessage::ChildSpawned { parent_id, .. } => (
+            AgentCurrentActivityStatus::Starting,
+            Some(format!("spawned by {parent_id}")),
+            None,
+            None,
+        ),
+        MailboxMessage::Completed { summary, .. } => (
+            AgentCurrentActivityStatus::Done,
+            Some(summary.clone()),
+            None,
+            previous.as_ref().and_then(|activity| activity.step),
+        ),
+        MailboxMessage::Failed { error, .. } => (
+            AgentCurrentActivityStatus::Failed,
+            Some(error.clone()),
+            None,
+            previous.as_ref().and_then(|activity| activity.step),
+        ),
+        MailboxMessage::Interrupted { reason, .. } => (
+            AgentCurrentActivityStatus::Waiting,
+            Some(reason.clone()),
+            None,
+            previous.as_ref().and_then(|activity| activity.step),
+        ),
+        MailboxMessage::Cancelled { .. } => (
+            AgentCurrentActivityStatus::Canceled,
+            None,
+            None,
+            previous.as_ref().and_then(|activity| activity.step),
+        ),
+        MailboxMessage::TokenUsage { .. } => return,
     };
-    let meta = app.agent_progress_meta.entry(agent_id.clone()).or_default();
-    match completed_ok {
-        None => meta.current_tool = Some(tool_name.clone()),
-        Some(ok) => {
-            if meta.current_tool.as_deref() == Some(tool_name.as_str()) {
-                meta.current_tool = None;
-            }
-            if ok && is_file_mutation_tool(tool_name) {
-                meta.files_touched = meta.files_touched.saturating_add(1);
-            }
-        }
+
+    meta.current_activity = Some(AgentCurrentActivity::bounded(
+        status,
+        detail,
+        current_tool.clone(),
+        step,
+    ));
+    meta.current_tool = current_tool;
+    if let MailboxMessage::ToolCallCompleted {
+        tool_name,
+        ok: true,
+        ..
+    } = message
+        && is_file_mutation_tool(tool_name)
+    {
+        meta.files_touched = meta.files_touched.saturating_add(1);
     }
 }
 
@@ -892,7 +1089,7 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            record_agent_tool_activity(
+            record_agent_current_activity(
                 &mut app,
                 &MailboxMessage::ToolCallCompleted {
                     agent_id: "agent_files".to_string(),
@@ -908,7 +1105,7 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            record_agent_tool_activity(
+            record_agent_current_activity(
                 &mut app,
                 &MailboxMessage::ToolCallCompleted {
                     agent_id: "agent_files".to_string(),
@@ -920,7 +1117,7 @@ mod tests {
         }
         assert_eq!(app.agent_progress_meta["agent_files"].files_touched, 3);
 
-        record_agent_tool_activity(
+        record_agent_current_activity(
             &mut app,
             &MailboxMessage::ToolCallCompleted {
                 agent_id: "agent_files".to_string(),
@@ -930,6 +1127,155 @@ mod tests {
             },
         );
         assert_eq!(app.agent_progress_meta["agent_files"].files_touched, 3);
+    }
+
+    #[test]
+    fn typed_mailbox_lifecycle_projects_running_waiting_failed_and_done() {
+        let mut app = App::new(test_options(), &Config::default());
+
+        assert!(handle_subagent_mailbox(
+            &mut app,
+            1,
+            &MailboxMessage::started("agent_running", SubAgentType::General),
+        ));
+        assert_eq!(
+            app.agent_progress_meta["agent_running"]
+                .current_activity
+                .as_ref()
+                .map(|activity| activity.status),
+            Some(AgentCurrentActivityStatus::Running)
+        );
+
+        assert!(handle_subagent_mailbox(
+            &mut app,
+            2,
+            &MailboxMessage::ToolCallStarted {
+                agent_id: "agent_running".to_string(),
+                tool_name: "read_file".to_string(),
+                step: 3,
+            },
+        ));
+        let running = app.agent_progress_meta["agent_running"]
+            .current_activity
+            .as_ref()
+            .expect("running tool projection");
+        assert_eq!(running.status, AgentCurrentActivityStatus::RunningTool);
+        assert_eq!(running.current_tool.as_deref(), Some("read_file"));
+        assert_eq!(running.step, Some(3));
+
+        assert!(handle_subagent_mailbox(
+            &mut app,
+            3,
+            &MailboxMessage::Interrupted {
+                agent_id: "agent_running".to_string(),
+                reason: "approval needed".to_string(),
+            },
+        ));
+        let waiting = app.agent_progress_meta["agent_running"]
+            .current_activity
+            .as_ref()
+            .expect("waiting projection");
+        assert_eq!(waiting.status, AgentCurrentActivityStatus::Waiting);
+        assert_eq!(waiting.detail.as_deref(), Some("approval needed"));
+
+        for (seq, agent_id, terminal, expected) in [
+            (
+                4,
+                "agent_failed",
+                MailboxMessage::Failed {
+                    agent_id: "agent_failed".to_string(),
+                    error: "verification failed".to_string(),
+                },
+                AgentCurrentActivityStatus::Failed,
+            ),
+            (
+                5,
+                "agent_done",
+                MailboxMessage::Completed {
+                    agent_id: "agent_done".to_string(),
+                    summary: "verification complete".to_string(),
+                },
+                AgentCurrentActivityStatus::Done,
+            ),
+        ] {
+            assert!(handle_subagent_mailbox(&mut app, seq, &terminal));
+            assert_eq!(
+                app.agent_progress_meta[agent_id]
+                    .current_activity
+                    .as_ref()
+                    .map(|activity| activity.status),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_projects_typed_status_when_activity_detail_is_missing() {
+        let mut app = App::new(test_options(), &Config::default());
+        let mut agent = subagent_result("agent_model_wait", SubAgentStatus::Running);
+        agent.worker_status = Some(AgentWorkerStatus::ModelWait);
+        app.subagent_cache.push(agent);
+
+        reconcile_subagent_activity_state_at(&mut app, Instant::now());
+
+        let activity = app.agent_progress_meta["agent_model_wait"]
+            .current_activity
+            .as_ref()
+            .expect("typed activity fallback");
+        assert_eq!(activity.status, AgentCurrentActivityStatus::ModelWait);
+        assert_eq!(activity.detail, None);
+    }
+
+    #[test]
+    fn mailbox_compact_projection_redacts_secrets_and_control_sequences() {
+        let mut app = App::new(test_options(), &Config::default());
+        let agent_id = "agent_safe_projection";
+        assert!(handle_subagent_mailbox(
+            &mut app,
+            1,
+            &MailboxMessage::started(agent_id, SubAgentType::General),
+        ));
+        let secret = "sk-mailbox-secret-1234567890";
+        let raw = format!(
+            "\u{1b}[31mrunning\u{1b}[0m\napi_key={secret}\n\u{1b}]8;;https://example.invalid\u{7}details\u{1b}]8;;\u{7}\u{1}"
+        );
+        assert!(handle_subagent_mailbox(
+            &mut app,
+            2,
+            &MailboxMessage::progress(agent_id, raw.clone()),
+        ));
+
+        let activity = app.agent_progress_meta[agent_id]
+            .current_activity
+            .as_ref()
+            .expect("safe activity projection");
+        let detail = activity.detail.as_deref().expect("safe detail");
+        assert!(detail.contains("[redacted]"), "{detail:?}");
+        assert!(!detail.contains(secret), "{detail:?}");
+        assert!(!detail.contains('\u{1b}'), "{detail:?}");
+        assert!(!detail.contains("example.invalid"), "{detail:?}");
+
+        let card_index = app.subagent_card_index[agent_id];
+        let HistoryCell::SubAgent(SubAgentCell::Delegate(card)) = &app.history[card_index] else {
+            panic!("expected delegate card");
+        };
+        let rendered = card
+            .render_lines(120)
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter().map(|span| span.content.into_owned()))
+            .collect::<String>();
+        assert!(rendered.contains("[redacted]"), "{rendered:?}");
+        assert!(!rendered.contains(secret), "{rendered:?}");
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+        assert!(!rendered.contains("example.invalid"), "{rendered:?}");
+        assert!(
+            raw.contains(secret),
+            "source mailbox payload stays untouched"
+        );
+        assert!(
+            raw.contains('\u{1b}'),
+            "source mailbox payload stays untouched"
+        );
     }
 
     #[test]
@@ -979,9 +1325,13 @@ mod tests {
             !app.agent_progress.contains_key("agent_done"),
             "cache-known terminal agent progress must still be evicted"
         );
-        assert!(
-            !app.agent_progress_meta.contains_key("agent_done"),
-            "cache-known terminal agent meta must still be evicted"
+        assert_eq!(
+            app.agent_progress_meta["agent_done"]
+                .current_activity
+                .as_ref()
+                .map(|activity| activity.status),
+            Some(AgentCurrentActivityStatus::Done),
+            "cache-known terminal agents retain a bounded terminal projection"
         );
 
         // Once the authoritative cache reports the orphan as terminal, the
@@ -992,6 +1342,13 @@ mod tests {
         assert!(
             !app.agent_progress.contains_key("agent_orphan"),
             "cache supersedes the progress-only row once it knows the agent"
+        );
+        assert_eq!(
+            app.agent_progress_meta["agent_orphan"]
+                .current_activity
+                .as_ref()
+                .map(|activity| activity.status),
+            Some(AgentCurrentActivityStatus::Done)
         );
     }
 
@@ -1024,7 +1381,13 @@ mod tests {
         ));
 
         assert!(!app.agent_progress.contains_key("agent_done"));
-        assert!(!app.agent_progress_meta.contains_key("agent_done"));
+        assert_eq!(
+            app.agent_progress_meta["agent_done"]
+                .current_activity
+                .as_ref()
+                .map(|activity| activity.status),
+            Some(AgentCurrentActivityStatus::Canceled)
+        );
         let agent = app
             .subagent_cache
             .iter()
