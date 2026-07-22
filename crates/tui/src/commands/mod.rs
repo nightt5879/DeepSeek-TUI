@@ -496,8 +496,9 @@ mod tests {
             );
         }
 
+        let user_commands = user_registry::UserCommandRegistry::new();
         assert!(
-            suggest_command_names("slpo", 3, &user_registry::UserCommandRegistry::new())
+            suggest_command_names("slpo", 3, &user_commands)
                 .iter()
                 .any(|name| name == "debt"),
             "typo suggestions should consider the /slop alias"
@@ -505,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn debt_compat_alias_shadows_control_execution_help_and_suggestions() {
+    fn debt_alias_help_and_suggestions_respect_user_command_shadows() {
         let temp = tempdir().unwrap();
         let commands_dir = temp.path().join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).unwrap();
@@ -559,6 +560,30 @@ mod tests {
             assert!(message.contains(expected), "{message:?}");
             assert!(!message.contains("/debt"), "{message:?}");
         }
+
+        let debt_help = execute("/help debt", &mut app);
+        assert!(!debt_help.is_error);
+        let debt_message = debt_help
+            .message
+            .expect("canonical debt help should render");
+        assert!(debt_message.contains("cleanup"), "{debt_message:?}");
+        assert!(!debt_message.contains("slop"), "{debt_message:?}");
+        assert!(!debt_message.contains("canzha"), "{debt_message:?}");
+
+        let slop_typo = execute("/slpo", &mut app);
+        let slop_typo_message = slop_typo.message.expect("typo should return guidance");
+        assert!(!slop_typo_message.contains("/debt"), "{slop_typo_message}");
+
+        let canzha_typo = execute("/canzhaa", &mut app);
+        let canzha_typo_message = canzha_typo.message.expect("typo should return guidance");
+        assert!(
+            !canzha_typo_message.contains("/debt"),
+            "{canzha_typo_message}"
+        );
+
+        let debt_typo = execute("/detb", &mut app);
+        let debt_typo_message = debt_typo.message.expect("typo should return guidance");
+        assert!(debt_typo_message.contains("/debt"), "{debt_typo_message}");
     }
 
     #[test]

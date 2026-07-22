@@ -3600,7 +3600,7 @@ pub(crate) fn slash_completion_hints_with_model_candidates(
                     command_key,
                     &prefix_lower,
                     locale,
-                    &user_commands,
+                    &all_user_commands,
                 );
             }
 
@@ -3629,7 +3629,7 @@ pub(crate) fn slash_completion_hints_with_model_candidates(
                         cmd.name,
                         &prefix_lower,
                         locale,
-                        &user_commands,
+                        &all_user_commands,
                     );
                 }
             }
@@ -3647,7 +3647,7 @@ pub(crate) fn slash_completion_hints_with_model_candidates(
                         &cmd.name,
                         &prefix_lower,
                         locale,
-                        &user_commands,
+                        &all_user_commands,
                     );
                 }
             }
@@ -3676,7 +3676,7 @@ pub(crate) fn slash_completion_hints_with_model_candidates(
                         cmd.name,
                         &prefix_lower,
                         locale,
-                        &user_commands,
+                        &all_user_commands,
                     );
                 }
             }
@@ -3697,7 +3697,7 @@ pub(crate) fn slash_completion_hints_with_model_candidates(
                         &cmd.name,
                         &prefix_lower,
                         locale,
-                        &user_commands,
+                        &all_user_commands,
                     );
                 }
             }
@@ -3936,24 +3936,29 @@ fn push_command_entry(
         };
         (description, alias_hint)
     } else if let Some(info) = commands::get_command_info(command_key) {
+        let unshadowed_aliases = info
+            .aliases
+            .iter()
+            .copied()
+            .filter(|alias| !user_command_shadows_builtin_alias(alias, user_commands))
+            .collect::<Vec<_>>();
         let hint = if !command_key.to_ascii_lowercase().starts_with(prefix_lower) {
-            info.aliases
+            unshadowed_aliases
                 .iter()
+                .copied()
                 .find(|a| {
                     a.to_ascii_lowercase().starts_with(prefix_lower)
                         || a.to_ascii_lowercase().contains(prefix_lower)
                         || fuzzy_chars_in_order(prefix_lower, &a.to_ascii_lowercase())
                 })
-                .map(|a| a.to_string())
+                .map(str::to_string)
         } else {
             None
         };
         // Omit aliases already shown in the label (`/clear or /qingping`) so
         // the description does not repeat them (#3990).
-        let remaining_aliases: Vec<&str> = info
-            .aliases
-            .iter()
-            .copied()
+        let remaining_aliases: Vec<&str> = unshadowed_aliases
+            .into_iter()
             .filter(|alias| hint.as_deref() != Some(*alias))
             .collect();
         let desc = if remaining_aliases.is_empty() {
@@ -5303,9 +5308,15 @@ mod tests {
             ApiProvider::Deepseek,
         );
 
+        let attach = canonical_hints
+            .iter()
+            .find(|hint| hint.name == "/attach")
+            .expect(
+                "canonical /attach should remain visible when only its /image alias is shadowed",
+            );
         assert!(
-            canonical_hints.iter().any(|hint| hint.name == "/attach"),
-            "canonical /attach should remain visible when only its /image alias is shadowed"
+            !attach.description.contains("/image"),
+            "canonical completion must not advertise a user-shadowed alias"
         );
 
         let alias_hints = slash_completion_hints(
@@ -5325,6 +5336,41 @@ mod tests {
             !alias_hints.iter().any(|hint| hint.name == "/attach"),
             "built-in /attach should not complete through shadowed /image alias"
         );
+    }
+
+    #[test]
+    fn slash_completion_hints_hide_shadowed_debt_aliases_from_canonical_copy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("slop.md"),
+            "---\ndescription: Internal cleanup\nhidden: true\n---\ninternal cleanup",
+        )
+        .unwrap();
+        std::fs::write(
+            commands_dir.join("custom-debt.md"),
+            "---\ndescription: Custom debt flow\nalias: canzha\n---\ncustom debt",
+        )
+        .unwrap();
+
+        let hints = slash_completion_hints(
+            "/debt",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+        let debt = hints
+            .iter()
+            .find(|hint| hint.name == "/debt")
+            .expect("canonical /debt should remain visible when only aliases are shadowed");
+
+        assert_eq!(debt.alias_hint, None);
+        assert!(debt.description.contains("/cleanup"));
+        assert!(!debt.description.contains("/slop"));
+        assert!(!debt.description.contains("/canzha"));
     }
 
     #[test]

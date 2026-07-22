@@ -1334,7 +1334,8 @@ pub(crate) fn handle_context_menu_action(app: &mut App, action: ContextMenuActio
             open_context_inspector(app);
         }
         ContextMenuAction::OpenHelp => {
-            app.view_stack.push(HelpView::new_for_locale(app.ui_locale));
+            let help = HelpView::new_for_workspace(app.ui_locale, &app.workspace);
+            app.view_stack.push(help);
         }
         ContextMenuAction::OpenFileAtLine { cell_index } => {
             let width = app

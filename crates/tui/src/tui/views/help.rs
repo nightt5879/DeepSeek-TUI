@@ -17,6 +17,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -119,13 +120,30 @@ impl HelpView {
         Self::new_with_ordering(locale, HelpOrdering::CommandsFirst)
     }
 
+    pub fn new_for_workspace(locale: Locale, workspace: &Path) -> Self {
+        commands::user_registry::with_registry_for_workspace(Some(workspace), |registry| {
+            Self::new_with_registry(locale, HelpOrdering::CommandsFirst, registry)
+        })
+    }
+
     /// Open Help as the keyboard reference promised by shell shortcut hints.
-    pub fn new_for_shortcuts(locale: Locale) -> Self {
-        Self::new_with_ordering(locale, HelpOrdering::KeybindingsFirst)
+    pub fn new_for_shortcuts(locale: Locale, workspace: &Path) -> Self {
+        commands::user_registry::with_registry_for_workspace(Some(workspace), |registry| {
+            Self::new_with_registry(locale, HelpOrdering::KeybindingsFirst, registry)
+        })
     }
 
     fn new_with_ordering(locale: Locale, ordering: HelpOrdering) -> Self {
-        let entries = build_entries(locale);
+        let registry = commands::user_registry::UserCommandRegistry::new();
+        Self::new_with_registry(locale, ordering, &registry)
+    }
+
+    fn new_with_registry(
+        locale: Locale,
+        ordering: HelpOrdering,
+        registry: &commands::user_registry::UserCommandRegistry,
+    ) -> Self {
+        let entries = build_entries(locale, registry);
         let mut view = Self {
             locale,
             ordering,
@@ -235,20 +253,31 @@ impl HelpView {
     }
 }
 
-fn build_entries(locale: Locale) -> Vec<HelpEntry> {
+fn build_entries(
+    locale: Locale,
+    registry: &commands::user_registry::UserCommandRegistry,
+) -> Vec<HelpEntry> {
     let mut entries = Vec::new();
 
     for command in commands::command_infos() {
+        if registry.get(command.name).is_some() {
+            continue;
+        }
         let label = format!("/{}", command.name);
         let localized = command.description_for(locale);
-        let description = if command.aliases.is_empty() {
+        let visible_aliases = command
+            .aliases
+            .iter()
+            .copied()
+            .filter(|alias| registry.get(alias).is_none())
+            .collect::<Vec<_>>();
+        let description = if visible_aliases.is_empty() {
             localized.to_string()
         } else {
             format!(
                 "{}  (aliases: {})",
                 localized,
-                command
-                    .aliases
+                visible_aliases
                     .iter()
                     .map(|a| format!("/{a}"))
                     .collect::<Vec<_>>()
@@ -585,9 +614,61 @@ mod tests {
         assert_eq!(commands.ordering, HelpOrdering::CommandsFirst);
         assert_eq!(first_filtered_section(&commands), HelpSection::Command);
 
-        let shortcuts = HelpView::new_for_shortcuts(Locale::En);
+        let shortcuts = HelpView::new_with_ordering(Locale::En, HelpOrdering::KeybindingsFirst);
         assert_eq!(shortcuts.ordering, HelpOrdering::KeybindingsFirst);
         assert_eq!(first_filtered_section(&shortcuts), HelpSection::Keybinding);
+    }
+
+    #[test]
+    fn workspace_help_hides_user_shadowed_debt_aliases_from_copy_and_search() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("slop.md"),
+            "---\ndescription: Internal cleanup\nhidden: true\n---\ninternal cleanup",
+        )
+        .unwrap();
+        std::fs::write(
+            commands_dir.join("custom-debt.md"),
+            "---\ndescription: Custom debt flow\nalias: canzha\n---\ncustom debt",
+        )
+        .unwrap();
+
+        for (term, mut view) in [
+            ("slop", HelpView::new_for_workspace(Locale::En, tmp.path())),
+            (
+                "canzha",
+                HelpView::new_for_shortcuts(Locale::En, tmp.path()),
+            ),
+        ] {
+            let debt = view
+                .entries
+                .iter()
+                .find(|entry| entry.label == "/debt")
+                .expect("canonical /debt help should remain visible");
+            assert!(debt.description.contains("/cleanup"));
+            assert!(!debt.description.contains("/slop"));
+            assert!(!debt.description.contains("/canzha"));
+
+            type_filter(&mut view, term);
+            assert!(
+                view.filtered
+                    .iter()
+                    .all(|idx| view.entries[*idx].label != "/debt")
+            );
+        }
+    }
+
+    #[test]
+    fn help_hides_builtins_with_shadowed_canonical_names() {
+        let registry = commands::user_registry::UserCommandRegistry::from_loaded(vec![(
+            "debt".to_string(),
+            "---\ndescription: Custom debt\n---\ncustom debt".to_string(),
+        )]);
+        let entries = build_entries(Locale::En, &registry);
+
+        assert!(entries.iter().all(|entry| entry.label != "/debt"));
     }
 
     #[test]
@@ -899,7 +980,8 @@ mod tests {
 
     #[test]
     fn localized_help_keybinding_descriptions_use_zh_hans() {
-        let entries = build_entries(Locale::ZhHans);
+        let registry = commands::user_registry::UserCommandRegistry::new();
+        let entries = build_entries(Locale::ZhHans, &registry);
         let kb_entries: Vec<_> = entries
             .iter()
             .filter(|e| e.section == HelpSection::Keybinding)
@@ -942,7 +1024,10 @@ mod tests {
             }
 
             let mut stack = ViewStack::new();
-            stack.push(HelpView::new_for_shortcuts(Locale::En));
+            stack.push(HelpView::new_with_ordering(
+                Locale::En,
+                HelpOrdering::KeybindingsFirst,
+            ));
             stack.render(area, &mut buf);
 
             let rows: Vec<String> = (0..h)
