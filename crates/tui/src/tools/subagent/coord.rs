@@ -987,6 +987,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordination_resolution_survives_reload_and_resolving_claim_eviction() {
+        let tmp = tempdir().unwrap();
+        let state_path = tmp.path().join("subagents.v1.json");
+        let manager = Arc::new(tokio::sync::RwLock::new(
+            super::super::SubAgentManager::new(tmp.path().to_path_buf(), 4)
+                .with_state_path(state_path.clone()),
+        ));
+        let claimant = {
+            let mut guard = manager.write().await;
+            let claimant = guard.insert_test_running_agent("claimant", tmp.path());
+            let owner = guard.insert_test_running_agent("owner", tmp.path());
+            let active = [claimant.clone(), owner.clone()]
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            for claim in [
+                WriteScopeClaim {
+                    owner: claimant.clone(),
+                    roots: vec!["src/claimant".into()],
+                    exact_files: Vec::new(),
+                    contracts: Vec::new(),
+                },
+                WriteScopeClaim {
+                    owner: owner.clone(),
+                    roots: vec!["src/shared".into()],
+                    exact_files: Vec::new(),
+                    contracts: Vec::new(),
+                },
+            ] {
+                guard
+                    .coordination
+                    .register_claim(claim, false, |candidate| active.contains(candidate))
+                    .expect("initial non-overlapping claim");
+            }
+            claimant
+        };
+
+        AgentsCoordinateTool::new(Arc::clone(&manager), Some(claimant.clone()))
+            .execute(
+                json!({ "action": "claim", "roots": ["src/shared/nested"] }),
+                &ToolContext::new(tmp.path()),
+            )
+            .await
+            .expect_err("overlap must block and persist its receipt");
+
+        let resolution_sequence = {
+            let mut guard = manager.write().await;
+            let record = guard
+                .coordination
+                .register_claim(
+                    WriteScopeClaim {
+                        owner: claimant.clone(),
+                        roots: vec!["src/isolated".into()],
+                        exact_files: Vec::new(),
+                        contracts: Vec::new(),
+                    },
+                    true,
+                    |_| true,
+                )
+                .expect("later isolated claim resolves contention");
+            guard
+                .persist_state_synchronously()
+                .expect("persist resolved contention");
+            record.sequence
+        };
+
+        let mut replayed = super::super::SubAgentManager::new(tmp.path().to_path_buf(), 4)
+            .with_state_path(state_path.clone());
+        replayed.load_state().expect("reload resolved contention");
+        assert_eq!(replayed.coordination.contentions.len(), 1);
+        assert_eq!(
+            replayed.coordination.contentions[0].disposition,
+            WriteContentionDisposition::ResolvedBySuccessfulClaim
+        );
+        assert_eq!(
+            replayed.coordination.contentions[0].resolution_sequence,
+            Some(resolution_sequence)
+        );
+
+        let slots = COORDINATION_RECORD_LIMIT - replayed.coordination.write_claims.len();
+        for index in 0..slots {
+            replayed
+                .coordination
+                .register_claim(
+                    WriteScopeClaim {
+                        owner: format!("inactive-fill-{index:03}"),
+                        roots: vec![format!("pkg/fill-{index:03}")],
+                        exact_files: Vec::new(),
+                        contracts: Vec::new(),
+                    },
+                    true,
+                    |_| false,
+                )
+                .expect("fill inactive claim capacity");
+        }
+        for index in 0..2 {
+            replayed
+                .coordination
+                .register_claim(
+                    WriteScopeClaim {
+                        owner: format!("inactive-overflow-{index}"),
+                        roots: vec![format!("pkg/overflow-{index}")],
+                        exact_files: Vec::new(),
+                        contracts: Vec::new(),
+                    },
+                    true,
+                    |_| false,
+                )
+                .expect("evict oldest inactive claim at capacity");
+        }
+        assert!(
+            !replayed
+                .coordination
+                .write_claims
+                .iter()
+                .any(|claim| claim.claim.owner == claimant),
+            "the resolving claimant claim must be evicted for the durability regression"
+        );
+        replayed
+            .persist_state_synchronously()
+            .expect("persist after inactive claim eviction");
+
+        let mut final_replay = super::super::SubAgentManager::new(tmp.path().to_path_buf(), 4)
+            .with_state_path(state_path);
+        final_replay
+            .load_state()
+            .expect("reload after resolving claim eviction");
+        let projection = final_replay.coordination_detail_projection(None, 24);
+        assert!(
+            !projection
+                .write_claims
+                .iter()
+                .any(|claim| claim.claim.owner == claimant)
+        );
+        assert_eq!(projection.contentions.len(), 1);
+        assert_eq!(
+            projection.contentions[0].disposition,
+            WriteContentionDisposition::ResolvedBySuccessfulClaim
+        );
+        assert_eq!(
+            projection.contentions[0].resolution_sequence,
+            Some(resolution_sequence)
+        );
+        assert!(!crate::tui::coordination_detail::needs_attention(
+            &projection
+        ));
+        let pager =
+            crate::tui::coordination_detail::format(crate::localization::Locale::En, &projection);
+        assert!(
+            pager.contains("disposition resolved_by_successful_claim"),
+            "{pager}"
+        );
+        assert!(!pager.contains("disposition blocked_pending"), "{pager}");
+    }
+
+    #[tokio::test]
     async fn interrupt_fails_closed_on_self() {
         let tmp = tempdir().unwrap();
         let (manager, agent_id) = manager_with_running_child(tmp.path()).await;
@@ -1290,6 +1445,7 @@ pub struct ContextProjectionReceipt {
 #[serde(rename_all = "snake_case")]
 pub enum WriteContentionDisposition {
     BlockedPendingIsolationOrSerialization,
+    ResolvedBySuccessfulClaim,
 }
 
 impl WriteContentionDisposition {
@@ -1299,6 +1455,7 @@ impl WriteContentionDisposition {
             Self::BlockedPendingIsolationOrSerialization => {
                 "blocked_pending_isolation_or_serialization"
             }
+            Self::ResolvedBySuccessfulClaim => "resolved_by_successful_claim",
         }
     }
 
@@ -1318,6 +1475,11 @@ pub struct WriteContentionReceipt {
     pub exact_files: Vec<String>,
     pub contracts: Vec<String>,
     pub disposition: WriteContentionDisposition,
+    /// Sequence of the later successful claim that resolved this receipt.
+    /// It intentionally references that claim's sequence instead of consuming
+    /// another ledger sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_sequence: Option<u64>,
     pub sequence: u64,
 }
 
@@ -1593,6 +1755,7 @@ impl CoordinationLedger {
                     exact_files: claim.exact_files.clone(),
                     contracts: claim.contracts.clone(),
                     disposition: WriteContentionDisposition::BlockedPendingIsolationOrSerialization,
+                    resolution_sequence: None,
                     sequence: self.next_sequence(),
                 };
                 self.contentions.push(receipt);
@@ -1613,6 +1776,14 @@ impl CoordinationLedger {
             sequence: self.next_sequence(),
             isolated_worktree,
         };
+        for contention in &mut self.contentions {
+            if contention.claimant == record.claim.owner
+                && contention.disposition.blocks_admission()
+            {
+                contention.disposition = WriteContentionDisposition::ResolvedBySuccessfulClaim;
+                contention.resolution_sequence = Some(record.sequence);
+            }
+        }
         self.write_claims.push(record.clone());
         Ok(record)
     }
@@ -1979,6 +2150,22 @@ impl CoordinationLedger {
                 "contention conflicting owner",
                 &contention.conflicting_owner,
             )?;
+            match (contention.disposition, contention.resolution_sequence) {
+                (WriteContentionDisposition::BlockedPendingIsolationOrSerialization, None) => {}
+                (WriteContentionDisposition::ResolvedBySuccessfulClaim, Some(sequence))
+                    if sequence > contention.sequence && sequence <= self.sequence => {}
+                (WriteContentionDisposition::BlockedPendingIsolationOrSerialization, Some(_)) => {
+                    return Err(
+                        "blocked contention receipt cannot carry a resolution sequence".to_string(),
+                    );
+                }
+                (WriteContentionDisposition::ResolvedBySuccessfulClaim, _) => {
+                    return Err(
+                        "resolved contention receipt requires a later valid resolution sequence"
+                            .to_string(),
+                    );
+                }
+            }
             if normalize_claim_paths(&contention.roots)? != contention.roots
                 || normalize_claim_paths(&contention.exact_files)? != contention.exact_files
                 || normalize_claim_strings(&contention.contracts, 16, 128, "contracts")?
@@ -2580,6 +2767,27 @@ mod records_tests {
     }
 
     #[test]
+    fn legacy_blocked_contention_wire_defaults_to_unresolved() {
+        let receipt: WriteContentionReceipt = serde_json::from_value(json!({
+            "claimant": "agent-b",
+            "conflicting_owner": "agent-a",
+            "roots": ["src"],
+            "exact_files": [],
+            "contracts": ["public-api"],
+            "disposition": "blocked_pending_isolation_or_serialization",
+            "sequence": 3
+        }))
+        .expect("existing blocked wire receipt remains readable");
+
+        assert_eq!(
+            receipt.disposition,
+            WriteContentionDisposition::BlockedPendingIsolationOrSerialization
+        );
+        assert_eq!(receipt.resolution_sequence, None);
+        assert!(receipt.disposition.blocks_admission());
+    }
+
+    #[test]
     fn active_shared_claims_contend_but_isolated_claims_do_not() {
         let mut ledger = CoordinationLedger::default();
         let first = WriteScopeClaim {
@@ -2613,10 +2821,16 @@ mod records_tests {
             serde_json::to_value(&ledger.contentions[0]).unwrap()["disposition"],
             json!("blocked_pending_isolation_or_serialization")
         );
-        assert!(
-            ledger
-                .register_claim(second, true, |owner| owner == "agent-a")
-                .is_ok()
+        let resolving_claim = ledger
+            .register_claim(second, true, |owner| owner == "agent-a")
+            .expect("isolated claim resolves the blocked admission");
+        assert_eq!(
+            ledger.contentions[0].disposition,
+            WriteContentionDisposition::ResolvedBySuccessfulClaim
+        );
+        assert_eq!(
+            ledger.contentions[0].resolution_sequence,
+            Some(resolving_claim.sequence)
         );
     }
 

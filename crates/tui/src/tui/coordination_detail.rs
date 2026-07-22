@@ -33,16 +33,10 @@ pub(crate) fn needs_attention(projection: &CoordinationDetailProjection) -> bool
             .reconciliations
             .iter()
             .any(|receipt| receipt.verification_outcome != "verified")
-        || projection.contentions.iter().any(|contention| {
-            // The ledger's only disposition producer rejects admission. Its
-            // durable receipt remains current until this claimant records a
-            // later successful claim; sequence is the persisted ordering
-            // contract, so absent proof of resolution stays fail-closed.
-            contention.disposition.blocks_admission()
-                && !projection.write_claims.iter().any(|claim| {
-                    claim.claim.owner == contention.claimant && claim.sequence > contention.sequence
-                })
-        })
+        || projection
+            .contentions
+            .iter()
+            .any(|contention| contention.disposition.blocks_admission())
 }
 
 /// Format the durable coordination projection for the shared Work pager.
@@ -336,6 +330,7 @@ mod tests {
                 exact_files: vec!["Cargo.toml".to_string()],
                 contracts: vec!["ui-contract".to_string()],
                 disposition: WriteContentionDisposition::BlockedPendingIsolationOrSerialization,
+                resolution_sequence: None,
                 sequence: 5,
             }],
             metrics: CoordinationDetailMetrics {
@@ -423,20 +418,19 @@ mod tests {
     }
 
     #[test]
-    fn blocked_contention_needs_attention_until_a_newer_claim_resolves_it() {
+    fn blocked_contention_attention_uses_durable_resolution_state() {
         let mut value = projection();
         assert!(needs_attention(&value));
 
-        value.write_claims.push(PersistedWriteClaim {
-            claim: WriteScopeClaim {
-                owner: "worker-b".to_string(),
-                roots: vec!["crates/tui".to_string()],
-                exact_files: Vec::new(),
-                contracts: vec!["ui-contract".to_string()],
-            },
-            sequence: 6,
-            isolated_worktree: true,
-        });
+        value.contentions[0].disposition = WriteContentionDisposition::ResolvedBySuccessfulClaim;
+        value.contentions[0].resolution_sequence = Some(6);
         assert!(!needs_attention(&value));
+
+        let text = format(Locale::En, &value);
+        assert!(
+            text.contains("disposition resolved_by_successful_claim"),
+            "{text}"
+        );
+        assert!(!text.contains("disposition blocked_pending"), "{text}");
     }
 }

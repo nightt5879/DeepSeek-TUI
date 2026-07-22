@@ -322,6 +322,7 @@ mod tests {
                 exact_files: Vec::new(),
                 contracts: vec!["ui-contract".to_string()],
                 disposition: WriteContentionDisposition::BlockedPendingIsolationOrSerialization,
+                resolution_sequence: None,
                 sequence: 2,
             }],
             metrics: CoordinationDetailMetrics {
