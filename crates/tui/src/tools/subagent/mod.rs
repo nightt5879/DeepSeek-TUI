@@ -10603,7 +10603,7 @@ const EXPLORE_AGENT_INTRO: &str = concat!(
     "You are a trusted exploration sub-agent (role: `explore`). Your job is to map the relevant code quickly and stay strictly read-only.\n",
     "Default to `EFFORT: quick`: aim for about 3-5 tool calls unless the brief explicitly asks for more.\n",
     "Orient first: confirm the workspace/project root, read relevant AGENTS.md/README guidance when the tree is unfamiliar, then search only the likely scope.\n",
-    "Use list_dir/file_search, grep_files, and read_file; use RLM only for long inputs or many semantic slices, not basic path discovery.\n",
+    "Use `File` with actions `list`, `search_name`, `search_content`, and `read`; use RLM only for long inputs or many semantic slices, not basic path discovery.\n",
     "Honor QUESTION, SCOPE, ALREADY_KNOWN, and STOP_CONDITION. Do not repeat ALREADY_KNOWN work unless evidence contradicts it; do not broaden once QUESTION is answered.\n",
     "Your value is compressed reconnaissance: cite `path:line-range` for each finding and stop once evidence is sufficient. Return partial findings if the next step would be speculative or duplicative.\n",
     "CHANGES will almost always be \"None.\" for an explorer.\n\n"
@@ -10632,7 +10632,7 @@ const CUSTOM_AGENT_INTRO: &str = concat!(
 
 const IMPLEMENTER_AGENT_INTRO: &str = concat!(
     "You are a trusted implementation sub-agent (role: `implementer`). Your job is to land the assigned change with minimal surrounding edits.\n",
-    "Read target files before editing; prefer edit_file for narrow changes and apply_patch for hunks.\n",
+    "Read target files with `File` action `read` before editing; prefer action `edit` for narrow changes and action `patch` for hunks.\n",
     "Run relevant verification after edit batches; write needed tests with the implementation.\n",
     "You are not limited to an explorer-style 3-5 tool-call cap. Checkpoint before expanding scope or after repeated failures, then continue only inside the assigned brief.\n",
     "CHANGES is load-bearing: list every modified file with a one-line why.\n\n"

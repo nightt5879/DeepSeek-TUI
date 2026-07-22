@@ -9177,7 +9177,8 @@ fn subagent_results_are_summarized_before_parent_context_insertion() {
     assert!(context.len() < output.content.len());
     assert!(context.contains("self-report"));
     assert!(context.contains("verify side effects"));
-    assert!(context.contains("read_file") && context.contains("list_dir"));
+    assert!(context.contains("`File` actions like `read` or `list`"));
+    assert!(!context.contains("read_file") && !context.contains("list_dir"));
     assert!(context.contains("handle_read"));
 }
 

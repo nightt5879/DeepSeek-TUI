@@ -1157,6 +1157,35 @@ fn implementer_prompt_is_not_forced_into_explorer_cap() {
 }
 
 #[test]
+fn role_prompts_use_canonical_file_action_contract() {
+    let explore = SubAgentType::Explore.system_prompt();
+    assert!(
+        explore.contains("`File` with actions `list`, `search_name`, `search_content`, and `read`")
+    );
+
+    let implementer = SubAgentType::Implementer.system_prompt();
+    assert!(implementer.contains("`File` action `read`"));
+    assert!(implementer.contains("action `edit`"));
+    assert!(implementer.contains("action `patch`"));
+
+    for prompt in [&explore, &implementer] {
+        for legacy_name in [
+            "list_dir",
+            "file_search",
+            "grep_files",
+            "read_file",
+            "edit_file",
+            "apply_patch",
+        ] {
+            assert!(
+                !prompt.contains(legacy_name),
+                "live role prompt must not teach legacy File alias {legacy_name}: {prompt}"
+            );
+        }
+    }
+}
+
+#[test]
 fn review_and_verifier_prompts_stop_after_decisive_evidence() {
     let review = SubAgentType::Review.system_prompt();
     let verifier = SubAgentType::Verifier.system_prompt();
