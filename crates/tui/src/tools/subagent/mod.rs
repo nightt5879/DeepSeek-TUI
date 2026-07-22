@@ -36,6 +36,7 @@ use crate::models::{
     ContentBlock, Message, MessageRequest, MessageResponse, SystemPrompt, Tool, Usage,
 };
 use crate::request_tuning::RequestTuning;
+use crate::tools::canonical_action::{CANONICAL_ACTION_ALIASES, canonical_action_alias};
 use crate::tools::handle::VarHandle;
 use crate::tools::plan::{PlanState, SharedPlanState};
 use crate::tools::registry::{AgentToolSurfaceOptions, ToolRegistry, ToolRegistryBuilder};
@@ -7905,7 +7906,8 @@ async fn run_subagent(
         );
         let mut tool_results: Vec<ContentBlock> = Vec::new();
         for (tool_id, tool_name, tool_input) in tool_uses {
-            let tool_display_name = subagent_progress_tool_display_name(&tool_name);
+            let activity_tool_name = canonical_action_alias(&tool_name, &tool_input).to_string();
+            let tool_display_name = subagent_progress_tool_display_name(&activity_tool_name);
             record_agent_progress(
                 runtime,
                 &agent_id,
@@ -7917,7 +7919,7 @@ async fn run_subagent(
             if let Some(mb) = runtime.mailbox.as_ref() {
                 let _ = mb.send(MailboxMessage::ToolCallStarted {
                     agent_id: agent_id.clone(),
-                    tool_name: tool_name.clone(),
+                    tool_name: activity_tool_name.clone(),
                     step: steps,
                 });
             }
@@ -7963,7 +7965,7 @@ async fn run_subagent(
             if let Some(mb) = runtime.mailbox.as_ref() {
                 let _ = mb.send(MailboxMessage::ToolCallCompleted {
                     agent_id: agent_id.clone(),
-                    tool_name: tool_name.clone(),
+                    tool_name: activity_tool_name,
                     step: steps,
                     ok: tool_ok,
                 });
@@ -9824,6 +9826,7 @@ fn subagent_progress_tool_display_name(name: &str) -> &str {
         "exec_shell"
         | "exec_shell_wait"
         | "exec_shell_interact"
+        | "exec_shell_cancel"
         | "exec_wait"
         | "exec_interact"
         | "task_shell_start"
@@ -9940,29 +9943,8 @@ struct SubAgentToolRegistry {
 }
 
 impl SubAgentToolRegistry {
-    const ACTION_ALIASES: &'static [(&'static str, &'static str, &'static str)] = &[
-        ("Bash", "run", "exec_shell"),
-        ("Bash", "wait", "exec_shell_wait"),
-        ("Bash", "interact", "exec_shell_interact"),
-        ("Bash", "cancel", "exec_shell_cancel"),
-        ("File", "read", "read_file"),
-        ("File", "list", "list_dir"),
-        ("File", "search_name", "file_search"),
-        ("File", "search_content", "grep_files"),
-        ("File", "write", "write_file"),
-        ("File", "edit", "edit_file"),
-        ("File", "patch", "apply_patch"),
-        ("Git", "status", "git_status"),
-        ("Git", "diff", "git_diff"),
-        ("Git", "log", "git_log"),
-        ("Git", "show", "git_show"),
-        ("Git", "blame", "git_blame"),
-        ("Run", "tests", "run_tests"),
-        ("Run", "verifiers", "run_verifiers"),
-        ("Web", "search", "web_search"),
-        ("Web", "fetch", "fetch_url"),
-        ("Web", "wait", "wait_for_dev_server"),
-    ];
+    const ACTION_ALIASES: &'static [(&'static str, &'static str, &'static str)] =
+        CANONICAL_ACTION_ALIASES;
 
     #[cfg(test)]
     fn new(

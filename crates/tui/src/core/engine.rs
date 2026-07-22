@@ -4762,11 +4762,20 @@ pub(super) fn exec_shell_ask_rule_decision(
     workspace: &Path,
     approval_mode: crate::tui::approval::ApprovalMode,
 ) -> Option<ToolAskRuleDecision> {
-    if tool_name != "exec_shell" {
+    let policy_tool_name =
+        crate::tools::canonical_action::canonical_action_alias(tool_name, tool_input);
+    if policy_tool_name != "exec_shell" {
         return None;
     }
     let command = tool_input.get("command").and_then(Value::as_str)?;
-    tool_ask_rule_decision_for_context(config, tool_name, command, None, workspace, approval_mode)
+    tool_ask_rule_decision_for_context(
+        config,
+        policy_tool_name,
+        command,
+        None,
+        workspace,
+        approval_mode,
+    )
 }
 
 pub(super) fn file_tool_ask_rule_decision(
@@ -4776,11 +4785,13 @@ pub(super) fn file_tool_ask_rule_decision(
     workspace: &Path,
     approval_mode: crate::tui::approval::ApprovalMode,
 ) -> Option<ToolAskRuleDecision> {
-    let paths = file_tool_permission_paths(tool_name, tool_input)?;
+    let policy_tool_name =
+        crate::tools::canonical_action::canonical_action_alias(tool_name, tool_input);
+    let paths = file_tool_permission_paths(policy_tool_name, tool_input)?;
     if paths.is_empty() {
         return tool_ask_rule_decision_for_context(
             config,
-            tool_name,
+            policy_tool_name,
             "",
             None,
             workspace,
@@ -4792,7 +4803,7 @@ pub(super) fn file_tool_ask_rule_decision(
     for path in paths {
         match tool_ask_rule_decision_for_context(
             config,
-            tool_name,
+            policy_tool_name,
             "",
             Some(&path),
             workspace,

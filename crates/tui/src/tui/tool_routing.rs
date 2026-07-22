@@ -6,6 +6,7 @@ use std::time::Instant;
 use crate::hooks::HookEvent;
 use crate::tools::ReviewOutput;
 use crate::tools::apply_patch::{NormalizedApplyPatchInput, normalize_apply_patch_input};
+use crate::tools::canonical_action::canonical_action_alias;
 use crate::tools::plan::PlanSnapshot;
 use crate::tools::spec::{ToolError, ToolResult};
 use crate::tui::active_cell::ActiveCell;
@@ -32,6 +33,7 @@ pub(super) fn handle_tool_call_started(
     // the turn-loop gate — it processes the denial (exit code 2).
 
     let id = id.to_string();
+    let semantic_name = canonical_action_alias(name, input);
 
     // All in-flight tool work for the current turn lives in `app.active_cell`
     // until the turn completes. This mirrors Codex's contract: ONE active cell
@@ -42,8 +44,8 @@ pub(super) fn handle_tool_call_started(
         app.active_cell = Some(ActiveCell::new());
     }
 
-    if is_exploring_tool(name) {
-        let label = exploring_label(name, input);
+    if is_exploring_tool(semantic_name) {
+        let label = exploring_label(semantic_name, input);
         // ensure_exploring + append_to_exploring keeps all parallel exploring
         // starts in a single ExploringCell entry.
         let active = app.active_cell.as_mut().expect("active_cell just ensured");
@@ -72,10 +74,10 @@ pub(super) fn handle_tool_call_started(
     // hold both an exploring aggregate AND independent tool entries
     // simultaneously, which is exactly the case CX#7 fixes.
 
-    if is_exec_tool(name) {
+    if is_exec_tool(semantic_name) {
         let command = exec_target_from_input(input);
         let source = exec_source_from_input(input);
-        let interaction = exec_interaction_summary(name, input);
+        let interaction = exec_interaction_summary(semantic_name, input);
         let mut is_wait = false;
 
         if let Some((summary, wait)) = interaction.as_ref() {
@@ -152,7 +154,7 @@ pub(super) fn handle_tool_call_started(
         return;
     }
 
-    if name == "update_plan" {
+    if semantic_name == "update_plan" {
         let snapshot = parse_plan_input(input);
         push_active_tool_cell(
             app,
@@ -167,7 +169,7 @@ pub(super) fn handle_tool_call_started(
         return;
     }
 
-    if name == "apply_patch" {
+    if semantic_name == "apply_patch" {
         let (path, summary) = parse_patch_summary(input);
         push_active_tool_cell(
             app,
@@ -184,7 +186,7 @@ pub(super) fn handle_tool_call_started(
         return;
     }
 
-    if name == "review" {
+    if semantic_name == "review" {
         let target = review_target_label(input);
         push_active_tool_cell(
             app,
@@ -201,7 +203,7 @@ pub(super) fn handle_tool_call_started(
         return;
     }
 
-    if is_mcp_tool(name) {
+    if is_mcp_tool(semantic_name) {
         push_active_tool_cell(
             app,
             &id,
@@ -217,7 +219,7 @@ pub(super) fn handle_tool_call_started(
         return;
     }
 
-    if is_view_image_tool(name) {
+    if is_view_image_tool(semantic_name) {
         if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
             let raw_path = PathBuf::from(path);
             let display_path = raw_path
@@ -235,7 +237,7 @@ pub(super) fn handle_tool_call_started(
         return;
     }
 
-    if is_web_search_tool(name) {
+    if is_web_search_tool(semantic_name) {
         let query = web_search_query(input);
         push_active_tool_cell(
             app,
@@ -284,7 +286,7 @@ pub(super) fn handle_tool_call_started(
         name,
         input,
         HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
-            name: name.to_string(),
+            name: semantic_name.to_string(),
             status: ToolStatus::Running,
             input_summary,
             output: None,
@@ -559,6 +561,20 @@ pub(super) fn handle_tool_call_complete(
     if app.ignored_tool_calls.remove(id) {
         return;
     }
+    // Preserve the execution/audit name while recovering the action-qualified
+    // semantic name from the registered call input. Active entries and
+    // already-flushed history use separate detail stores.
+    let semantic_name = app
+        .active_tool_details
+        .get(id)
+        .or_else(|| {
+            app.tool_cells
+                .get(id)
+                .and_then(|cell_index| app.tool_details_by_cell.get(cell_index))
+        })
+        .map_or(name, |detail| canonical_action_alias(name, &detail.input))
+        .to_string();
+
     // Roll any child-LLM token usage the tool reports into the
     // session-cost counter. Runs unconditionally so future tools that
     // spawn their own LLM calls (RLM, summarizers, retrieval helpers)
@@ -803,7 +819,7 @@ pub(super) fn handle_tool_call_complete(
         refresh_active_tool_completion_timestamp(app, cell_index);
     }
 
-    if refreshes_workspace_context_on_completion(name) && status != ToolStatus::Running {
+    if refreshes_workspace_context_on_completion(&semantic_name) && status != ToolStatus::Running {
         workspace_context::refresh_now(app, Instant::now());
     }
 
@@ -1354,7 +1370,12 @@ fn is_exploring_tool(name: &str) -> bool {
 fn is_exec_tool(name: &str) -> bool {
     matches!(
         name,
-        "exec_shell" | "exec_shell_wait" | "exec_shell_interact" | "exec_wait" | "exec_interact"
+        "exec_shell"
+            | "exec_shell_wait"
+            | "exec_shell_interact"
+            | "exec_shell_cancel"
+            | "exec_wait"
+            | "exec_interact"
     )
 }
 
@@ -1364,10 +1385,14 @@ pub(super) fn refreshes_workspace_context_on_completion(name: &str) -> bool {
         "exec_shell"
             | "exec_shell_wait"
             | "exec_shell_interact"
+            | "exec_shell_cancel"
             | "exec_wait"
             | "exec_interact"
             | "task_shell_start"
             | "task_shell_wait"
+            | "write_file"
+            | "edit_file"
+            | "apply_patch"
     )
 }
 
@@ -1647,6 +1672,22 @@ fn exec_interaction_summary(name: &str, input: &serde_json::Value) -> Option<(St
 
     let is_wait_tool = matches!(name, "exec_shell_wait" | "exec_wait");
     let is_interact_tool = matches!(name, "exec_shell_interact" | "exec_interact");
+    let is_cancel_tool = name == "exec_shell_cancel";
+
+    if is_cancel_tool {
+        let summary = if input.get("all").and_then(serde_json::Value::as_bool) == Some(true) {
+            "Cancelled all background commands".to_string()
+        } else if let Some(task_id) = input
+            .get("task_id")
+            .or_else(|| input.get("id"))
+            .and_then(serde_json::Value::as_str)
+        {
+            format!("Cancelled command {task_id}")
+        } else {
+            "Cancelled background command".to_string()
+        };
+        return Some((summary, false));
+    }
 
     if is_interact_tool || interaction_input.is_some() {
         let preview = interaction_input.map(summarize_interaction_input);

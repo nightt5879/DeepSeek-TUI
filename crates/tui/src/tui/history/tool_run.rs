@@ -187,8 +187,8 @@ fn classify_tool_run_activity(tool: &ToolCell) -> ToolRunActivity {
 fn classify_tool_name_activity(name: &str) -> ToolRunActivity {
     let normalized = name.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "read_file" | "list_dir" | "view_image" | "explore" | "git_log" | "git_show"
-        | "git_blame" => ToolRunActivity::File,
+        "read_file" | "list_dir" | "view_image" | "explore" | "git_status" | "git_diff"
+        | "git_log" | "git_show" | "git_blame" => ToolRunActivity::File,
         "grep_files" | "file_search" | "web_search" | "fetch_url" => ToolRunActivity::Search,
         "shell"
         | "exec_shell"
@@ -336,4 +336,52 @@ fn sentence_case_activity(text: String) -> String {
     out.extend(first.to_uppercase());
     out.push_str(chars.as_str());
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::canonical_action::canonical_action_alias;
+    use serde_json::json;
+
+    #[test]
+    fn canonical_file_mutations_never_collapse_behind_summary_rows() {
+        for action in ["write", "edit", "patch"] {
+            let input = json!({"action": action});
+            let semantic_name = canonical_action_alias("File", &input);
+            assert!(
+                generic_tool_name_is_collapse_guard(semantic_name),
+                "File.{action}"
+            );
+        }
+
+        for action in ["read", "list", "search_name", "search_content"] {
+            let input = json!({"action": action});
+            let semantic_name = canonical_action_alias("File", &input);
+            assert!(
+                !generic_tool_name_is_collapse_guard(semantic_name),
+                "File.{action}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_git_and_run_actions_keep_truthful_activity_buckets() {
+        for action in ["status", "diff", "log", "show", "blame"] {
+            let input = json!({"action": action});
+            assert_eq!(
+                classify_tool_name_activity(canonical_action_alias("Git", &input)),
+                ToolRunActivity::File,
+                "Git.{action}"
+            );
+        }
+        for action in ["tests", "verifiers"] {
+            let input = json!({"action": action});
+            assert_eq!(
+                classify_tool_name_activity(canonical_action_alias("Run", &input)),
+                ToolRunActivity::Command,
+                "Run.{action}"
+            );
+        }
+    }
 }

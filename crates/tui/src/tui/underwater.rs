@@ -286,8 +286,9 @@ fn verification_run_active(app: &App) -> bool {
                 exec_is_verification(&exec.command)
             }
             ToolCell::Generic(generic) if generic.status == ToolStatus::Running => {
-                let name = generic.name.to_ascii_lowercase();
-                name.contains("verif") || name == "read_lints"
+                crate::tui::widgets::tool_card::tool_family_for_name(&generic.name)
+                    == crate::tui::widgets::tool_card::ToolFamily::Verify
+                    || generic.name == "read_lints"
             }
             _ => false,
         }

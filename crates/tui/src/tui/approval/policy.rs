@@ -5,6 +5,7 @@
 //! policy itself.
 
 use crate::command_safety::is_parallel_readonly_command;
+use crate::tools::canonical_action::canonical_action_alias;
 use serde_json::Value;
 
 /// Categorizes tools by cost/risk level.
@@ -83,6 +84,7 @@ pub fn get_tool_category(name: &str) -> ToolCategory {
             | "task_shell_wait"
             | "exec_shell_wait"
             | "exec_shell_interact"
+            | "exec_shell_cancel"
             | "exec_wait"
             | "exec_interact"
     ) {
@@ -106,6 +108,12 @@ pub fn get_tool_category(name: &str) -> ToolCategory {
             | "update_plan"
             | "search"
             | "file_search"
+            | "grep_files"
+            | "git_status"
+            | "git_diff"
+            | "git_log"
+            | "git_show"
+            | "git_blame"
             | "project"
             | "diagnostics"
     ) || name.starts_with("read_")
@@ -123,6 +131,12 @@ pub fn get_tool_category(name: &str) -> ToolCategory {
     }
 }
 
+/// Categorize a concrete call after resolving an action-based canonical tool.
+#[must_use]
+pub fn get_tool_category_for_call(name: &str, params: &Value) -> ToolCategory {
+    get_tool_category(canonical_action_alias(name, params))
+}
+
 #[must_use]
 pub fn classify_stakes(
     tool_name: &str,
@@ -133,7 +147,8 @@ pub fn classify_stakes(
     if matches!(risk, RiskLevel::Benign) {
         return ApprovalStakes::Routine;
     }
-    match crate::tui::auto_review::ToolActionKind::from_tool_call(tool_name, params, category) {
+    let semantic_name = canonical_action_alias(tool_name, params);
+    match crate::tui::auto_review::ToolActionKind::from_tool_call(semantic_name, params, category) {
         crate::tui::auto_review::ToolActionKind::Publish
         | crate::tui::auto_review::ToolActionKind::Destructive
         | crate::tui::auto_review::ToolActionKind::Secret => ApprovalStakes::Critical,
@@ -150,6 +165,7 @@ pub fn classify_stakes(
 /// copy on anything that can touch state outside this turn.
 #[must_use]
 pub fn classify_risk(tool_name: &str, category: ToolCategory, params: &Value) -> RiskLevel {
+    let tool_name = canonical_action_alias(tool_name, params);
     match category {
         // Read paths and discovery.
         ToolCategory::Safe | ToolCategory::McpRead => RiskLevel::Benign,
@@ -314,5 +330,88 @@ mod tests {
             ),
             RiskLevel::Destructive
         );
+    }
+
+    #[test]
+    fn canonical_actions_keep_legacy_approval_categories_and_risk() {
+        let cases = [
+            ("Bash", "run", ToolCategory::Shell, RiskLevel::Destructive),
+            ("Bash", "wait", ToolCategory::Shell, RiskLevel::Destructive),
+            (
+                "Bash",
+                "interact",
+                ToolCategory::Shell,
+                RiskLevel::Destructive,
+            ),
+            (
+                "Bash",
+                "cancel",
+                ToolCategory::Shell,
+                RiskLevel::Destructive,
+            ),
+            ("File", "read", ToolCategory::Safe, RiskLevel::Benign),
+            ("File", "list", ToolCategory::Safe, RiskLevel::Benign),
+            ("File", "search_name", ToolCategory::Safe, RiskLevel::Benign),
+            (
+                "File",
+                "search_content",
+                ToolCategory::Safe,
+                RiskLevel::Benign,
+            ),
+            (
+                "File",
+                "write",
+                ToolCategory::FileWrite,
+                RiskLevel::Destructive,
+            ),
+            (
+                "File",
+                "edit",
+                ToolCategory::FileWrite,
+                RiskLevel::Destructive,
+            ),
+            (
+                "File",
+                "patch",
+                ToolCategory::FileWrite,
+                RiskLevel::Destructive,
+            ),
+            ("Git", "status", ToolCategory::Safe, RiskLevel::Benign),
+            ("Git", "diff", ToolCategory::Safe, RiskLevel::Benign),
+            ("Git", "log", ToolCategory::Safe, RiskLevel::Benign),
+            ("Git", "show", ToolCategory::Safe, RiskLevel::Benign),
+            ("Git", "blame", ToolCategory::Safe, RiskLevel::Benign),
+            (
+                "Run",
+                "tests",
+                ToolCategory::Unknown,
+                RiskLevel::Destructive,
+            ),
+            (
+                "Run",
+                "verifiers",
+                ToolCategory::Unknown,
+                RiskLevel::Destructive,
+            ),
+            ("Web", "search", ToolCategory::Network, RiskLevel::Benign),
+            (
+                "Web",
+                "fetch",
+                ToolCategory::Network,
+                RiskLevel::Destructive,
+            ),
+            ("Web", "wait", ToolCategory::Network, RiskLevel::Benign),
+        ];
+
+        for (family, action, expected_category, expected_risk) in cases {
+            let params = json!({"action": action});
+            let category = get_tool_category_for_call(family, &params);
+            assert_eq!(category, expected_category, "{family}.{action}");
+            assert_eq!(
+                classify_risk(family, category, &params),
+                expected_risk,
+                "{family}.{action}"
+            );
+        }
     }
 }

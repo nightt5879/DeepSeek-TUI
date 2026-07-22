@@ -7,7 +7,7 @@
 #![allow(dead_code)]
 
 use crate::tui::approval::{
-    ApprovalMode, RiskLevel, ToolCategory, classify_risk, get_tool_category,
+    ApprovalMode, RiskLevel, ToolCategory, classify_risk, get_tool_category_for_call,
 };
 use serde_json::{Value, json};
 
@@ -97,7 +97,9 @@ impl ToolActionKind {
 
     #[must_use]
     pub fn from_tool_call(tool_name: &str, params: &Value, category: ToolCategory) -> Self {
-        let normalized = tool_name.to_ascii_lowercase();
+        let semantic_tool_name =
+            crate::tools::canonical_action::canonical_action_alias(tool_name, params);
+        let normalized = semantic_tool_name.to_ascii_lowercase();
 
         // Unified action-parameterized tools (piagent phase B): classify on
         // the action-qualified name so a destructive action keeps the stakes
@@ -199,7 +201,7 @@ impl<'a> AutoReviewContext<'a> {
         workspace_trusted: bool,
         dirty_worktree: bool,
     ) -> Self {
-        let category = get_tool_category(tool_name);
+        let category = get_tool_category_for_call(tool_name, params);
         let risk = classify_risk(tool_name, category, params);
         let action_kind = ToolActionKind::from_tool_call(tool_name, params, category);
         Self {
@@ -1407,5 +1409,56 @@ mod tests {
         assert_eq!(event["reason"], "read-only action is allowed");
         assert_eq!(event["policy_has_guidance"], true);
         assert_eq!(event["dirty_worktree"], true);
+    }
+
+    #[test]
+    fn canonical_actions_use_semantic_auto_review_without_losing_audit_name() {
+        let cases = [
+            (
+                "Bash",
+                json!({"action": "run", "command": "cargo test"}),
+                ToolCategory::Shell,
+                ToolActionKind::Shell,
+            ),
+            (
+                "File",
+                json!({"action": "edit", "path": "src/lib.rs"}),
+                ToolCategory::FileWrite,
+                ToolActionKind::Write,
+            ),
+            (
+                "Git",
+                json!({"action": "status"}),
+                ToolCategory::Safe,
+                ToolActionKind::Git,
+            ),
+            (
+                "Run",
+                json!({"action": "tests"}),
+                ToolCategory::Unknown,
+                ToolActionKind::Unknown,
+            ),
+            (
+                "Web",
+                json!({"action": "search", "query": "Codewhale"}),
+                ToolCategory::Network,
+                ToolActionKind::Network,
+            ),
+        ];
+
+        for (tool_name, params, category, action_kind) in cases {
+            let context = AutoReviewContext::from_tool_call(
+                tool_name,
+                &params,
+                RunOrigin::Interactive,
+                ApprovalMode::Auto,
+                None,
+                true,
+                false,
+            );
+            assert_eq!(context.tool_name, tool_name);
+            assert_eq!(context.category, category, "{tool_name}");
+            assert_eq!(context.action_kind, action_kind, "{tool_name}");
+        }
     }
 }

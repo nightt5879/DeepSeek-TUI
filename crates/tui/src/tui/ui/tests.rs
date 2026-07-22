@@ -110,6 +110,256 @@ fn underwater_motion_keeps_its_smoother_cadence_during_live_status() {
 }
 
 #[test]
+fn canonical_bash_actions_use_exec_cells_without_rewriting_detail_identity() {
+    let cases = [
+        (
+            "run",
+            serde_json::json!({"action": "run", "command": "pwd"}),
+        ),
+        (
+            "wait",
+            serde_json::json!({"action": "wait", "task_id": "shell-1"}),
+        ),
+        (
+            "interact",
+            serde_json::json!({"action": "interact", "task_id": "shell-1", "stdin": "y\n"}),
+        ),
+        (
+            "cancel",
+            serde_json::json!({"action": "cancel", "task_id": "shell-1"}),
+        ),
+    ];
+
+    for (action, input) in cases {
+        let mut app = create_test_app();
+        let id = format!("bash-{action}");
+        handle_tool_call_started(&mut app, &id, "Bash", &input);
+        let active = app.active_cell.as_ref().expect("active cell");
+        let HistoryCell::Tool(ToolCell::Exec(exec)) = &active.entries()[0] else {
+            panic!("Bash.{action} must use ExecCell")
+        };
+        assert_eq!(exec.interaction.is_some(), action != "run", "Bash.{action}");
+        assert_eq!(app.active_tool_details[&id].tool_name, "Bash");
+        assert_eq!(app.active_tool_details[&id].input, input);
+    }
+
+    let mut legacy = create_test_app();
+    handle_tool_call_started(
+        &mut legacy,
+        "legacy-cancel",
+        "exec_shell_cancel",
+        &serde_json::json!({"task_id": "shell-legacy"}),
+    );
+    let active = legacy.active_cell.as_ref().expect("active cell");
+    assert!(matches!(
+        active.entries()[0],
+        HistoryCell::Tool(ToolCell::Exec(_))
+    ));
+    assert_eq!(
+        legacy.active_tool_details["legacy-cancel"].tool_name,
+        "exec_shell_cancel"
+    );
+}
+
+#[test]
+fn canonical_background_bash_keeps_live_task_identity_for_follow_up_actions() {
+    let mut app = create_test_app();
+    handle_tool_call_started(
+        &mut app,
+        "bash-background",
+        "Bash",
+        &serde_json::json!({
+            "action": "run",
+            "command": "cargo test --workspace",
+            "background": true
+        }),
+    );
+    let running = Ok(
+        crate::tools::spec::ToolResult::success("Background task started: shell-42").with_metadata(
+            serde_json::json!({
+                "status": "Running",
+                "task_id": "shell-42",
+                "command": "cargo test --workspace",
+                "duration_ms": 25_u64
+            }),
+        ),
+    );
+    handle_tool_call_complete(&mut app, "bash-background", "Bash", &running);
+
+    let active = app.active_cell.as_ref().expect("active cell");
+    let HistoryCell::Tool(ToolCell::Exec(exec)) = &active.entries()[0] else {
+        panic!("canonical background Bash must remain an ExecCell")
+    };
+    assert_eq!(exec.status, ToolStatus::Running);
+    assert_eq!(exec.shell_task_id.as_deref(), Some("shell-42"));
+    assert_eq!(exec.command, "cargo test --workspace");
+    assert!(exec.output.is_none());
+    assert!(
+        exec.live_output
+            .as_deref()
+            .is_some_and(|output| { output.contains("Background task started: shell-42") })
+    );
+}
+
+#[test]
+fn canonical_file_actions_split_reads_searches_and_mutations_truthfully() {
+    let cases = [
+        ("read", "exploring"),
+        ("list", "exploring"),
+        ("search_name", "file_search"),
+        ("search_content", "exploring"),
+        ("write", "write_file"),
+        ("edit", "edit_file"),
+        ("patch", "patch_summary"),
+    ];
+
+    for (action, expected) in cases {
+        let mut app = create_test_app();
+        let id = format!("file-{action}");
+        let input = match action {
+            "read" | "list" => serde_json::json!({"action": action, "path": "src"}),
+            "search_name" => serde_json::json!({"action": action, "query": "lib.rs"}),
+            "search_content" => {
+                serde_json::json!({"action": action, "pattern": "whale", "path": "src"})
+            }
+            "write" => serde_json::json!({
+                "action": action,
+                "path": "src/new.rs",
+                "content": "pub fn new() {}\n"
+            }),
+            "edit" => serde_json::json!({
+                "action": action,
+                "path": "src/lib.rs",
+                "search": "old",
+                "replace": "new"
+            }),
+            "patch" => serde_json::json!({
+                "action": action,
+                "patch": "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+            }),
+            _ => unreachable!(),
+        };
+        handle_tool_call_started(&mut app, &id, "File", &input);
+        let active = app.active_cell.as_ref().expect("active cell");
+        let tool = match &active.entries()[0] {
+            HistoryCell::Tool(tool) => tool,
+            other => panic!("expected tool cell, got {other:?}"),
+        };
+        match expected {
+            "exploring" => assert!(matches!(tool, ToolCell::Exploring(_)), "File.{action}"),
+            "patch_summary" => {
+                assert!(matches!(tool, ToolCell::PatchSummary(_)), "File.{action}")
+            }
+            semantic_name => {
+                let ToolCell::Generic(generic) = tool else {
+                    panic!("File.{action} must use GenericToolCell")
+                };
+                assert_eq!(generic.name, semantic_name, "File.{action}");
+            }
+        }
+        assert_eq!(app.active_tool_details[&id].tool_name, "File");
+    }
+}
+
+#[test]
+fn canonical_git_run_and_web_actions_use_semantic_history_cells() {
+    for (family, action, expected) in [
+        ("Git", "status", "git_status"),
+        ("Git", "diff", "git_diff"),
+        ("Git", "log", "git_log"),
+        ("Git", "show", "git_show"),
+        ("Git", "blame", "git_blame"),
+        ("Run", "tests", "run_tests"),
+        ("Run", "verifiers", "run_verifiers"),
+        ("Web", "fetch", "fetch_url"),
+        ("Web", "wait", "wait_for_dev_server"),
+    ] {
+        let mut app = create_test_app();
+        let id = format!("{family}-{action}");
+        handle_tool_call_started(
+            &mut app,
+            &id,
+            family,
+            &serde_json::json!({"action": action}),
+        );
+        let active = app.active_cell.as_ref().expect("active cell");
+        let HistoryCell::Tool(ToolCell::Generic(generic)) = &active.entries()[0] else {
+            panic!("{family}.{action} must use GenericToolCell")
+        };
+        assert_eq!(generic.name, expected, "{family}.{action}");
+        assert_eq!(app.active_tool_details[&id].tool_name, family);
+    }
+
+    let mut app = create_test_app();
+    handle_tool_call_started(
+        &mut app,
+        "Web-search",
+        "Web",
+        &serde_json::json!({"action": "search", "query": "Codewhale"}),
+    );
+    let active = app.active_cell.as_ref().expect("active cell");
+    assert!(matches!(
+        active.entries()[0],
+        HistoryCell::Tool(ToolCell::WebSearch(_))
+    ));
+    assert_eq!(app.active_tool_details["Web-search"].tool_name, "Web");
+}
+
+#[test]
+fn canonical_completion_refreshes_workspace_only_for_semantic_mutations() {
+    let stale = Instant::now() - Duration::from_secs(60);
+
+    let mut reading = create_test_app();
+    reading.workspace_context_refreshed_at = Some(stale);
+    handle_tool_call_started(
+        &mut reading,
+        "file-read",
+        "File",
+        &serde_json::json!({"action": "read", "path": "src/lib.rs"}),
+    );
+    handle_tool_call_complete(&mut reading, "file-read", "File", &ok_result("contents"));
+    assert_eq!(reading.workspace_context_refreshed_at, Some(stale));
+
+    for (action, input) in [
+        (
+            "write",
+            serde_json::json!({
+                "action": "write",
+                "path": "src/new.rs",
+                "content": "new\n"
+            }),
+        ),
+        (
+            "edit",
+            serde_json::json!({
+                "action": "edit",
+                "path": "src/lib.rs",
+                "search": "old",
+                "replace": "new"
+            }),
+        ),
+        (
+            "patch",
+            serde_json::json!({
+                "action": "patch",
+                "patch": "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+            }),
+        ),
+    ] {
+        let mut app = create_test_app();
+        app.workspace_context_refreshed_at = Some(stale);
+        let id = format!("file-{action}");
+        handle_tool_call_started(&mut app, &id, "File", &input);
+        handle_tool_call_complete(&mut app, &id, "File", &ok_result("ok"));
+        assert!(
+            app.workspace_context_refreshed_at
+                .is_some_and(|when| when > stale),
+            "File.{action} must refresh the workspace badge"
+        );
+    }
+}
+
+#[test]
 fn underwater_motion_ticks_only_for_visible_unobscured_owners() {
     assert!(!underwater_motion_surface_visible(None, true, true, false));
     assert!(!underwater_motion_surface_visible(

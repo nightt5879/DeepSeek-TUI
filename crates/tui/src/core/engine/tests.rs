@@ -3996,6 +3996,29 @@ fn exec_shell_ask_rule_decision_prompts_for_matching_auto_command() {
 }
 
 #[test]
+fn canonical_bash_run_honors_legacy_typed_ask_rules() {
+    let config = EngineConfig {
+        exec_policy_engine: ask_rule_engine("cargo test"),
+        ..EngineConfig::default()
+    };
+
+    let decision = exec_shell_ask_rule_decision(
+        &config,
+        "Bash",
+        &json!({"action": "run", "command": "cargo test --workspace"}),
+        Path::new("/repo"),
+        crate::tui::approval::ApprovalMode::Auto,
+    );
+
+    assert_eq!(
+        decision,
+        Some(ToolAskRuleDecision::Prompt(
+            "Typed ask rule 'tool=exec_shell command=cargo test' requires approval.".to_string()
+        ))
+    );
+}
+
+#[test]
 fn exec_shell_ask_rule_decision_blocks_matching_never_command() {
     let config = EngineConfig {
         exec_policy_engine: ask_rule_engine("cargo test"),
@@ -4056,6 +4079,29 @@ fn file_ask_rule_decision_prompts_for_matching_read_path() {
         Some(ToolAskRuleDecision::Prompt(
             "Typed ask rule 'tool=read_file path=secrets/api_key.txt' requires approval."
                 .to_string()
+        ))
+    );
+}
+
+#[test]
+fn canonical_file_action_honors_legacy_path_ask_rules() {
+    let config = EngineConfig {
+        exec_policy_engine: file_ask_rule_engine("write_file", "src/lib.rs"),
+        ..EngineConfig::default()
+    };
+
+    let decision = file_tool_ask_rule_decision(
+        &config,
+        "File",
+        &json!({"action": "write", "path": "src/lib.rs", "content": "new\n"}),
+        Path::new("/repo"),
+        crate::tui::approval::ApprovalMode::Auto,
+    );
+
+    assert_eq!(
+        decision,
+        Some(ToolAskRuleDecision::Prompt(
+            "Typed ask rule 'tool=write_file path=src/lib.rs' requires approval.".to_string()
         ))
     );
 }

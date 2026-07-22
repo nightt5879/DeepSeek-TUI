@@ -13666,7 +13666,9 @@ fn push_approval_request_view(
     approval_key: &str,
     intent_summary: Option<&str>,
 ) {
-    if tool_name == "apply_patch" {
+    if crate::tools::canonical_action::canonical_action_alias(tool_name, tool_input)
+        == "apply_patch"
+    {
         maybe_add_patch_preview(app, tool_input);
     }
 

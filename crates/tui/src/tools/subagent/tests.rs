@@ -441,6 +441,10 @@ fn subagent_progress_displays_shell_tools_as_bash() {
     assert_eq!(subagent_progress_tool_display_name("exec_shell"), "Bash");
     assert_eq!(subagent_progress_tool_display_name("exec_wait"), "Bash");
     assert_eq!(
+        subagent_progress_tool_display_name("exec_shell_cancel"),
+        "Bash"
+    );
+    assert_eq!(
         subagent_progress_tool_display_name("task_shell_wait"),
         "Bash"
     );

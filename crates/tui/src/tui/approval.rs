@@ -30,6 +30,7 @@
 use crate::localization::{Locale, MessageId, tr};
 use crate::sandbox::SandboxPolicy;
 use crate::tools::apply_patch::{NormalizedApplyPatchInput, normalize_apply_patch_input};
+use crate::tools::canonical_action::canonical_action_alias;
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
 use crate::tui::widgets::{ApprovalWidget, ElevationWidget, Renderable};
 use codewhale_config::ToolAskRule;
@@ -44,7 +45,8 @@ use std::time::{Duration, Instant};
 pub mod policy;
 
 pub use policy::{
-    ApprovalStakes, RiskLevel, ToolCategory, classify_risk, classify_stakes, get_tool_category,
+    ApprovalStakes, RiskLevel, ToolCategory, classify_risk, classify_stakes,
+    get_tool_category_for_call,
 };
 
 /// Determines when tool executions require user approval
@@ -227,7 +229,8 @@ impl ApprovalRequest {
         intent_summary: Option<&str>,
         workspace: &Path,
     ) -> Self {
-        let category = get_tool_category(tool_name);
+        let semantic_tool_name = canonical_action_alias(tool_name, params);
+        let category = get_tool_category_for_call(tool_name, params);
         let risk = classify_risk(tool_name, category, params);
         let approval_grouping_key =
             crate::tools::approval_cache::build_approval_grouping_key(tool_name, params).0;
@@ -238,7 +241,7 @@ impl ApprovalRequest {
             description: description.to_string(),
             category,
             risk,
-            impacts: build_impact_summary(tool_name, category, params),
+            impacts: build_impact_summary(semantic_tool_name, category, params),
             params: params.clone(),
             approval_key: approval_key.to_string(),
             approval_grouping_key,
@@ -250,7 +253,7 @@ impl ApprovalRequest {
                     Some(summary.to_string())
                 }
             }),
-            persistent_ask_rules: build_persistent_ask_rules(tool_name, params, workspace),
+            persistent_ask_rules: build_persistent_ask_rules(semantic_tool_name, params, workspace),
         }
     }
 
@@ -271,9 +274,10 @@ impl ApprovalRequest {
     }
 
     pub fn impacts_for_locale(&self, locale: Locale) -> Vec<String> {
+        let semantic_tool_name = canonical_action_alias(&self.tool_name, &self.params);
         match locale {
             Locale::ZhHans => {
-                build_impact_summary_zh_hans(&self.tool_name, self.category, &self.params)
+                build_impact_summary_zh_hans(semantic_tool_name, self.category, &self.params)
             }
             _ => self.impacts.clone(),
         }
@@ -307,15 +311,16 @@ impl ApprovalRequest {
     /// Extract the most important params for the approval card.
     #[must_use]
     pub fn prominent_detail_items(&self, locale: Locale) -> Vec<ApprovalDetail> {
-        build_prominent_details(&self.tool_name, self.category, &self.params)
+        let semantic_tool_name = canonical_action_alias(&self.tool_name, &self.params);
+        build_prominent_details(semantic_tool_name, self.category, &self.params)
             .into_iter()
             .map(|mut detail| {
                 let is_preview = detail.label == "Preview";
                 detail.label = localize_detail_label(&detail.label, locale).to_string();
                 if is_preview && let Some(lines) = detail.shell_lines.as_mut() {
                     for line in lines.iter_mut() {
-                        *line =
-                            localize_preview_shell_line(&self.tool_name, line, locale).to_string();
+                        *line = localize_preview_shell_line(semantic_tool_name, line, locale)
+                            .to_string();
                     }
                     detail.value = lines.join("\n");
                 }
@@ -1755,6 +1760,7 @@ impl ModalView for ElevationView {
 
 #[cfg(test)]
 mod tests {
+    use super::policy::get_tool_category;
     use super::*;
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend};
@@ -3973,5 +3979,100 @@ diff --git a/src/b.rs b/src/b.rs
             Some(ApprovalMode::Never)
         );
         assert_eq!(ApprovalMode::from_config_value("unknown"), None);
+    }
+
+    #[test]
+    fn canonical_bash_keeps_original_name_but_uses_shell_approval_semantics() {
+        let request = ApprovalRequest::new_with_intent(
+            "bash-1",
+            "Bash",
+            "Run command",
+            &json!({"action": "run", "command": "cargo test", "cwd": "/workspace"}),
+            "tool:Bash",
+            None,
+            Path::new("/workspace"),
+        );
+
+        assert_eq!(request.tool_name, "Bash");
+        assert_eq!(request.category, ToolCategory::Shell);
+        assert_eq!(request.risk, RiskLevel::Destructive);
+        assert_eq!(
+            request.persistent_ask_rules,
+            vec![ToolAskRule::exec_shell("cargo test")]
+        );
+        let details = request.prominent_detail_items(Locale::En);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.label == "Command" && detail.value == "cargo test")
+        );
+    }
+
+    #[test]
+    fn canonical_file_mutations_get_legacy_previews_and_scoped_ask_rules() {
+        let cases = [
+            (
+                "write",
+                json!({
+                    "action": "write",
+                    "path": "/workspace/src/lib.rs",
+                    "content": "pub fn whale() {}\n"
+                }),
+                "write_file",
+                "+ pub fn whale() {}",
+            ),
+            (
+                "edit",
+                json!({
+                    "action": "edit",
+                    "path": "/workspace/src/lib.rs",
+                    "search": "old",
+                    "replace": "new"
+                }),
+                "edit_file",
+                "- old",
+            ),
+            (
+                "patch",
+                json!({
+                    "action": "patch",
+                    "patch": "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+                }),
+                "apply_patch",
+                "-old",
+            ),
+        ];
+
+        for (action, params, rule_tool, preview_fragment) in cases {
+            let request = ApprovalRequest::new_with_intent(
+                action,
+                "File",
+                "Mutate file",
+                &params,
+                "tool:File",
+                None,
+                Path::new("/workspace"),
+            );
+            assert_eq!(request.tool_name, "File", "{action}");
+            assert_eq!(request.category, ToolCategory::FileWrite, "{action}");
+            assert_eq!(request.risk, RiskLevel::Destructive, "{action}");
+            assert!(
+                request
+                    .persistent_ask_rules
+                    .iter()
+                    .any(|rule| rule.tool == rule_tool),
+                "{action}: {:?}",
+                request.persistent_ask_rules
+            );
+            let preview = request
+                .prominent_detail_items(Locale::En)
+                .into_iter()
+                .find(|detail| detail.label == "Preview")
+                .expect("canonical file mutation must show a preview");
+            assert!(
+                preview.value.contains(preview_fragment),
+                "{action}: {preview:?}"
+            );
+        }
     }
 }

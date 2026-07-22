@@ -885,6 +885,54 @@ mod tests {
     }
 
     #[test]
+    fn canonical_child_file_activity_counts_only_successful_mutations() {
+        let mut app = App::new(test_options(), &Config::default());
+
+        for (step, tool_name) in ["read_file", "list_dir", "file_search", "grep_files"]
+            .into_iter()
+            .enumerate()
+        {
+            record_agent_tool_activity(
+                &mut app,
+                &MailboxMessage::ToolCallCompleted {
+                    agent_id: "agent_files".to_string(),
+                    tool_name: tool_name.to_string(),
+                    step: step as u32,
+                    ok: true,
+                },
+            );
+        }
+        assert_eq!(app.agent_progress_meta["agent_files"].files_touched, 0);
+
+        for (step, tool_name) in ["write_file", "edit_file", "apply_patch"]
+            .into_iter()
+            .enumerate()
+        {
+            record_agent_tool_activity(
+                &mut app,
+                &MailboxMessage::ToolCallCompleted {
+                    agent_id: "agent_files".to_string(),
+                    tool_name: tool_name.to_string(),
+                    step: (step + 10) as u32,
+                    ok: true,
+                },
+            );
+        }
+        assert_eq!(app.agent_progress_meta["agent_files"].files_touched, 3);
+
+        record_agent_tool_activity(
+            &mut app,
+            &MailboxMessage::ToolCallCompleted {
+                agent_id: "agent_files".to_string(),
+                tool_name: "write_file".to_string(),
+                step: 20,
+                ok: false,
+            },
+        );
+        assert_eq!(app.agent_progress_meta["agent_files"].files_touched, 3);
+    }
+
+    #[test]
     fn reconcile_keeps_progress_only_rows_until_cache_knows_the_agent() {
         let mut app = App::new(test_options(), &Config::default());
 
