@@ -783,12 +783,9 @@ fn file_write_preview_lines(tool_name: &str, params: &Value) -> Option<Vec<Strin
             ))
         }
         "edit_file" => {
-            let search = param_text(params, &["search"])?;
-            let replace = param_text(params, &["replace"])?;
-            let mut lines = Vec::new();
-            lines.extend(prefixed_preview_lines("replace this", "- ", &search, 3));
-            lines.extend(prefixed_preview_lines("with this", "+ ", &replace, 3));
-            Some(lines)
+            // Keep the per-frame card preview bounded. The details pager builds the
+            // complete version lazily when the reviewer asks for it.
+            edit_file_preview_lines(params, 3)
         }
         "apply_patch" => match normalize_apply_patch_input(params) {
             Ok(NormalizedApplyPatchInput::Patch(patch)) => apply_patch_preview_lines(patch),
@@ -800,6 +797,25 @@ fn file_write_preview_lines(tool_name: &str, params: &Value) -> Option<Vec<Strin
         _ => None,
     }
     .filter(|lines| !lines.is_empty())
+}
+
+fn edit_file_preview_lines(params: &Value, max_lines: usize) -> Option<Vec<String>> {
+    let search = param_text(params, &["search"])?;
+    let replace = param_text(params, &["replace"])?;
+    let mut lines = Vec::new();
+    lines.extend(prefixed_preview_lines(
+        "replace this",
+        "- ",
+        &search,
+        max_lines,
+    ));
+    lines.extend(prefixed_preview_lines(
+        "with this",
+        "+ ",
+        &replace,
+        max_lines,
+    ));
+    Some(lines)
 }
 
 fn prefixed_preview_lines(
@@ -1342,6 +1358,17 @@ impl ApprovalView {
             content.push('\n');
         }
         content.push('\n');
+        if canonical_action_alias(&self.request.tool_name, &self.request.params) == "edit_file"
+            && let Some(preview_lines) = edit_file_preview_lines(&self.request.params, usize::MAX)
+        {
+            content.push_str(&localize_detail_label("Preview", locale));
+            content.push_str(":\n");
+            for line in preview_lines {
+                content.push_str(&localize_preview_shell_line("edit_file", &line, locale));
+                content.push('\n');
+            }
+            content.push('\n');
+        }
         content.push_str(
             &serde_json::to_string_pretty(&self.request.params)
                 .unwrap_or_else(|_| self.request.params.to_string()),
@@ -3015,6 +3042,45 @@ diff --git a/src/b.rs b/src/b.rs
             action,
             ViewAction::Emit(ViewEvent::OpenTextPager { .. })
         ));
+    }
+
+    #[test]
+    fn edit_file_details_pager_includes_complete_search_replace_preview() {
+        let request = ApprovalRequest::new(
+            "test-id",
+            "edit_file",
+            "Edit a file on disk",
+            &json!({
+                "path": "src/lib.rs",
+                "search": "old_1();\nold_2();\nold_3();\nold_4();\nold_5();",
+                "replace": "new_1();\nnew_2();\nnew_3();\nnew_4();\nnew_5();"
+            }),
+            "tool:edit_file",
+        );
+        let mut view = ApprovalView::new(request);
+
+        let action = view.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+        let ViewAction::Emit(ViewEvent::OpenTextPager { content, .. }) = action else {
+            panic!("Alt+V should open the edit details pager");
+        };
+
+        let expected_preview = "Preview:\n\
+replace this\n\
+- old_1();\n\
+- old_2();\n\
+- old_3();\n\
+- old_4();\n\
+- old_5();\n\
+with this\n\
++ new_1();\n\
++ new_2();\n\
++ new_3();\n\
++ new_4();\n\
++ new_5();";
+        assert!(
+            content.contains(expected_preview),
+            "details pager omitted part of the edit preview:\n{content}"
+        );
     }
 
     #[test]
