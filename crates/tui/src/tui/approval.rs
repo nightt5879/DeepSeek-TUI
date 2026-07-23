@@ -818,6 +818,56 @@ fn edit_file_preview_lines(params: &Value, max_lines: usize) -> Option<Vec<Strin
     Some(lines)
 }
 
+fn exact_edit_file_preview_lines(params: &Value) -> Option<Vec<String>> {
+    let search = param_text(params, &["search"])?;
+    let replace = param_text(params, &["replace"])?;
+    let mut lines = vec!["replace this".to_string()];
+    lines.extend(exact_preview_body_lines("- ", &search));
+    lines.push("with this".to_string());
+    lines.extend(exact_preview_body_lines("+ ", &replace));
+    Some(lines)
+}
+
+fn exact_preview_body_lines(prefix: &str, content: &str) -> Vec<String> {
+    if content.is_empty() {
+        return vec![format!("{prefix}\"\"")];
+    }
+
+    content
+        .split_inclusive('\n')
+        .map(|chunk| {
+            let (body, ending) = if let Some(body) = chunk.strip_suffix("\r\n") {
+                (body, "\\r\\n")
+            } else if let Some(body) = chunk.strip_suffix('\n') {
+                (body, "\\n")
+            } else {
+                (chunk, "")
+            };
+            exact_preview_body_line(prefix, body, ending)
+        })
+        .collect()
+}
+
+fn exact_preview_body_line(prefix: &str, body: &str, ending: &str) -> String {
+    let mut line = String::with_capacity(prefix.len() + body.len() + ending.len() + 2);
+    line.push_str(prefix);
+    line.push('"');
+    for ch in body.chars() {
+        match ch {
+            '\\' => line.push_str("\\\\"),
+            '"' => line.push_str("\\\""),
+            ' ' => line.push_str("\\x20"),
+            '\t' => line.push_str("\\t"),
+            '\r' => line.push_str("\\r"),
+            ch if ch.is_whitespace() || ch.is_control() => line.extend(ch.escape_unicode()),
+            ch => line.push(ch),
+        }
+    }
+    line.push_str(ending);
+    line.push('"');
+    line
+}
+
 fn prefixed_preview_lines(
     header: &str,
     prefix: &str,
@@ -1359,7 +1409,7 @@ impl ApprovalView {
         }
         content.push('\n');
         if canonical_action_alias(&self.request.tool_name, &self.request.params) == "edit_file"
-            && let Some(preview_lines) = edit_file_preview_lines(&self.request.params, usize::MAX)
+            && let Some(preview_lines) = exact_edit_file_preview_lines(&self.request.params)
         {
             content.push_str(&localize_detail_label("Preview", locale));
             content.push_str(":\n");
@@ -3052,8 +3102,8 @@ diff --git a/src/b.rs b/src/b.rs
             "Edit a file on disk",
             &json!({
                 "path": "src/lib.rs",
-                "search": "old_1();\nold_2();\nold_3();\nold_4();\nold_5();",
-                "replace": "new_1();\nnew_2();\nnew_3();\nnew_4();\nnew_5();"
+                "search": "  old_1();\r\n\told_2();\nold  3();\nold_4();\nold_5();\n",
+                "replace": "\tnew_1();\nnew  2();\r\nnew_3();\nnew_4();\nnew_5();"
             }),
             "tool:edit_file",
         );
@@ -3064,22 +3114,32 @@ diff --git a/src/b.rs b/src/b.rs
             panic!("Alt+V should open the edit details pager");
         };
 
-        let expected_preview = "Preview:\n\
-replace this\n\
-- old_1();\n\
-- old_2();\n\
-- old_3();\n\
-- old_4();\n\
-- old_5();\n\
-with this\n\
-+ new_1();\n\
-+ new_2();\n\
-+ new_3();\n\
-+ new_4();\n\
-+ new_5();";
+        let expected_preview = [
+            "Preview:",
+            "replace this",
+            "- \"\\x20\\x20old_1();\\r\\n\"",
+            "- \"\\told_2();\\n\"",
+            "- \"old\\x20\\x203();\\n\"",
+            "- \"old_4();\\n\"",
+            "- \"old_5();\\n\"",
+            "with this",
+            "+ \"\\tnew_1();\\n\"",
+            "+ \"new\\x20\\x202();\\r\\n\"",
+            "+ \"new_3();\\n\"",
+            "+ \"new_4();\\n\"",
+            "+ \"new_5();\"",
+        ]
+        .join("\n");
         assert!(
-            content.contains(expected_preview),
+            content.contains(&expected_preview),
             "details pager omitted part of the edit preview:\n{content}"
+        );
+
+        let pager = crate::tui::pager::PagerView::from_text("Tool Params", &content, 200);
+        let displayed = pager.body_text();
+        assert!(
+            displayed.contains(&expected_preview),
+            "details pager display changed exact whitespace or line endings:\n{displayed}"
         );
     }
 
